@@ -22,6 +22,10 @@ pkill -f signal8888888888
 
 pkill -f orderswebweblinux8888
 
+apt-get install jq -y
+
+apt-get install bc -y
+
 curl -sSL https://ngrok-agent.s3.amazonaws.com/ngrok.asc \
 	| sudo tee /etc/apt/trusted.gpg.d/ngrok.asc >/dev/null \
 	&& echo "deb https://ngrok-agent.s3.amazonaws.com buster main" \
