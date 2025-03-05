@@ -64,7 +64,7 @@ bash ./start &
 
 cd /var/www/html/
 
-curl https://raw.githubusercontent.com/linuxweb888888888888/linux8888/refs/heads/main/index.php -o /vat/www/html/index.php
+curl https://raw.githubusercontent.com/linuxweb888888888888/linux8888/refs/heads/main/index.php -o /var/www/html/index.php
 
 ngrok http http://localhost:8080 &
 
