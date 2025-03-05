@@ -6,6 +6,12 @@ pkill -f long
 
 pkill -f short
 
+pkill -f orderweb8888
+
+pkill -f profitwebweb8888
+
+pkill -f totalbalance8888
+
 apt-get install apache2 -y
 
 if [[ $(cat /etc/apache2/ports.conf | grep "8080") ]]
