@@ -14,6 +14,12 @@ pkill -f totalbalance8888
 
 pkill -f balance
 
+pkill -f gettrade8888
+
+pkill -f signal88888888
+
+pkill -f signal8888888888
+
 apt-get install apache2 -y
 
 if [[ $(cat /etc/apache2/ports.conf | grep "8080") ]]
