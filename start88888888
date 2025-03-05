@@ -1,0 +1,14 @@
+service apache2 start
+
+cd /bot8888/
+
+bash ./start &
+
+ngrok http http://localhost:8080 &
+
+while true
+do
+
+sleep 32000
+
+done
