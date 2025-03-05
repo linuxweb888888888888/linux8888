@@ -1,3 +1,23 @@
+pkill -f profitshortlongweb8888
+
+pkill -f orderweb8888
+
+pkill -f trade88888888
+
+pkill -f trade8888888888
+
+pkill -f long
+
+pkill -f short
+
+pkill -f profitwebweb8888
+
+pkill -f totalbalance8888
+
+pkill -f balance
+
+pkill -f start
+
 apt-get install apache2 -y
 
 if [[ $(cat /etc/apache2/ports.conf | grep "8080") ]]
