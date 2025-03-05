@@ -1,0 +1,11 @@
+export profit="0.2"
+
+export profitquantity="on"
+
+export sleep="140"
+
+export sleepstart="80"
+
+export usdt="80"
+
+export apikeys="on"
