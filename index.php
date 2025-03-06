@@ -372,6 +372,22 @@ $linuxweb88748874 = shell_exec("cat /bot8888/profitprofitlinuxlinux" . $linuxweb
 
 $target8888888888 = shell_exec("cat /bot8888/profitprofitprofitprofitlinuxlinux" . $linuxwebweblinux8888 . " | tail -n1 | cut -d'.' -f1");
 
+if ($target8888888888 == "0")
+
+{
+
+$target888888888 == "";
+
+}
+
+else
+
+{
+
+$target8888888888 == "$targe8888888888";
+
+}
+
 $positions = "";
 
 //if ($position88888888 > 2)
