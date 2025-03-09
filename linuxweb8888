@@ -9,5 +9,3 @@ export sleepstart="32"
 export usdt="80"
 
 export apikeys="on"
-
-export coin="KNC"
