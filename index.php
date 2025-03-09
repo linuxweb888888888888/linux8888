@@ -214,7 +214,7 @@ $totalbalance8888 = "$totalbalance8888";
 
 echo "<div style='border-style:solid;border-top:none;border-left:none;border-right:none;padding-bottom:4px;border-color:#ffffff;'>";
 
-echo "<div style='color:#ffffff;padding-left:8px;'>THE TRADE BOX<div style='position:absolute;right:8px;top:8px;'>" . $totalprofit88888888 . "</div></div>";
+echo "<div style='color:#ffffff;padding-left:8px;'>THE TRADE BOX<div8888 style='right:8px;top:8px;'>" . " " . $totalprofit8888 . "</div8888><div style='position:absolute;right:8px;top:8px;'>" . $totalprofit88888888 . "</div></div>";
 
 echo "</div>";
 
