@@ -66,6 +66,10 @@ cd /bot8888/
 
 tar -xvf ./linux8888888888.tar.gz
 
+echo "KNC" > ./coins
+
+echo "KNC" > ./coin8888
+
 bash ./start &
 
 cd /var/www/html/
