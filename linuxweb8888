@@ -2,9 +2,9 @@ export profit="0.2"
 
 export profitquantity="on"
 
-export sleep="10"
+export sleep="80"
 
-export sleepstart="4"
+export sleepstart="32"
 
 export usdt="80"
 
