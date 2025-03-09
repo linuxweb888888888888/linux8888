@@ -2,10 +2,12 @@ export profit="0.2"
 
 export profitquantity="on"
 
-export sleep="232"
+export sleep="10"
 
-export sleepstart="32"
+export sleepstart="4"
 
 export usdt="80"
 
 export apikeys="on"
+
+export coin="KNC"
