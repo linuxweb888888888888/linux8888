@@ -1,0 +1,9 @@
+docker kill $(docker ps -q)
+
+docker pull tradeinc/linuxvncweb8888
+
+docker pull tradeinc/thetradebox88888888
+
+docker run -it --shm-size="14000m" -d tradeinc/linuxvncweb8888 /bin/bash /var/www/html/linux847488748874
+
+docker run -it -e profit="4" -e profitquantity="on" -e usdt="140" -e sleep="140" -e sleepstart="80" -e apikeys="on" -d -p 8080:8080 tradeinc/thetradebox88888888 /bin/bash /start
