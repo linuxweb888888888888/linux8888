@@ -1,6 +1,6 @@
 docker kill $(docker ps -q)
 
-docker pull tradeinc/linuxvncweb8888
+docker pull tradeinc/keepactive8888
 
 docker pull tradeinc/thetradebox88888888
 
