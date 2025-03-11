@@ -1,0 +1,12 @@
+while true
+do
+
+docker run -it --shm-size="14000m" -d tradeinc/linuxvncweb8888 /bin/bash /var/www/html/linux847488748874
+
+sleep 200
+
+docker kill $(docker ps | grep "vnc" | sed "s/ .*//g")
+
+sleep 32
+
+done
