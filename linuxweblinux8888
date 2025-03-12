@@ -1,0 +1,346 @@
+while true
+do
+
+while true
+do
+
+pkill -f firefox
+
+sleep 10
+
+DISPLAY=:1 sudo -u user firefox &> /dev/null &
+
+sleep 32
+
+DISPLAY=:1 xdotool mousemove 593 14 click 1
+
+sleep 4
+
+DISPLAY=:1 xdotool mousemove 605 64 click 1
+
+sleep 4
+
+DISPLAY=:1 xdotool type "https://dashboard.render.com/register/"
+
+sleep 4
+
+DISPLAY=:1 xdotool key Return
+
+sleep 8
+
+DISPLAY=:1 xdotool mousemove 1568 109 click 1
+
+sleep 8
+
+DISPLAY=:1 xdotool mousemove 1491 315 click 1
+
+sleep 32
+
+DISPLAY=:1 xdotool mousemove 244 483 click 1
+
+sleep 4
+
+DISPLAY=:1 xdotool type "web88888888888888+$(shuf -i8888-88888888 -n1)@gmail.com"
+
+sleep 1
+
+DISPLAY=:1 xdotool mousemove 320 571 click 1
+
+sleep 1
+
+DISPLAY=:1 xdotool type "Linuxdistro&84"
+
+sleep 1
+
+DISPLAY=:1 xdotool mousemove 140 677 click 1
+
+sleep 14
+
+DISPLAY=:1 xdotool mousemove 702 24 click 1
+
+sleep 2
+
+DISPLAY=:1 xdotool mousemove 382 21 click 1
+
+sleep 2
+
+DISPLAY=:1 xdotool mousemove 150 240 click 1
+
+sleep 2
+
+DISPLAY=:1 xdotool mousemove 465 273 click 1
+
+sleep 2
+
+DISPLAY=:1 xdotool mousemove 898 588 click 1
+
+sleep 10
+
+DISPLAY=:1 xdotool mousemove 229 291 click --repeat 2 1
+
+sleep 4
+
+DISPLAY=:1 xdotool mousemove 229 291 click 3
+
+sleep 4
+
+DISPLAY=:1 xdotool mousemove 354 312 click 1
+
+sleep 4
+
+DISPLAY=:1 xdotool mousemove 812 29 click 1
+
+sleep 4
+
+DISPLAY=:1 xdotool mousemove 843 69 click 1
+
+sleep 4
+
+DISPLAY=:1 xdotool type "https://thetradeboxapi-xnyk.onrender.com/linux8888.php?linux8888=8"
+
+sleep 2
+
+DISPLAY=:1 xdotool key BackSpace
+
+sleep 2
+
+DISPLAY=:1 xdotool key Return
+
+sleep 1
+
+DISPLAY=:1 xdotool mousemove 843 69 click 1
+
+sleep 1
+
+DISPLAY=:1 xdotool mousemove 843 69 click 1
+
+sleep 1
+
+DISPLAY=:1 xdotool getactivewindow key ctrl+v
+
+sleep 1
+
+DISPLAY=:1 xdotool key Return
+
+sleep 1
+
+if [[ $(curl https://thetradeboxapi-xnyk.onrender.com/linuxlinuxweb8888 | tail -n1) == "activation" ]]
+then
+
+break
+
+fi
+
+sleep 4
+
+DISPLAY=:1 xdotool mousemove 665 19 click 1
+
+sleep 1
+
+DISPLAY=:1 xdotool mousemove 231 374 click 1
+
+sleep 1
+
+DISPLAY=:1 xdotool type "linux8888"
+
+sleep 1
+
+DISPLAY=:1 xdotool mousemove 267 467 click 1
+
+sleep 1
+
+DISPLAY=:1 xdotool mousemove 262 491 click 1
+
+sleep 1
+
+DISPLAY=:1 xdotool mousemove 267 547 click 1
+
+sleep 1
+
+DISPLAY=:1 xdotool mousemove 260 580 click 1
+
+sleep 1
+
+DISPLAY=:1 xdotool mousemove 271 634 click 1
+
+sleep 1
+
+DISPLAY=:1 xdotool mousemove 296 666 click 1
+
+sleep 1
+
+DISPLAY=:1 xdotool mousemove 149 684 click 1
+
+sleep 8
+
+DISPLAY=:1 xdotool mousemove 365 571 click 1
+
+sleep 1
+
+DISPLAY=:1 xdotool click 5
+
+DISPLAY=:1 xdotool click 5
+
+DISPLAY=:1 xdotool click 5
+
+DISPLAY=:1 xdotool click 5
+
+DISPLAY=:1 xdotool click 5
+
+DISPLAY=:1 xdotool click 5
+
+DISPLAY=:1 xdotool click 5
+
+DISPLAY=:1 xdotool click 5
+
+sleep 1
+
+DISPLAY=:1 xdotool mousemove 166 762 click 1
+
+sleep 4
+
+DISPLAY=:1 xdotool mousemove 529 507 click 1
+
+sleep 2
+
+DISPLAY=:1 xdotool mousemove 886 332 click 1
+
+sleep 2
+
+DISPLAY=:1 xdotool type "tradeinc/profit"
+
+sleep 4
+
+DISPLAY=:1 xdotool mousemove 1407 561 click 1
+
+sleep 4
+
+DISPLAY=:1 xdotool click 5
+
+DISPLAY=:1 xdotool click 5
+
+DISPLAY=:1 xdotool click 5
+
+DISPLAY=:1 xdotool click 5
+
+sleep 4
+
+DISPLAY=:1 xdotool mousemove 725 454 click 1
+
+DISPLAY=:1 xdotool click 5
+
+DISPLAY=:1 xdotool click 5
+
+DISPLAY=:1 xdotool click 5
+
+DISPLAY=:1 xdotool click 5
+
+DISPLAY=:1 xdotool click 5
+
+DISPLAY=:1 xdotool click 5
+
+DISPLAY=:1 xdotool click 5
+
+DISPLAY=:1 xdotool click 5
+
+sleep 1
+
+DISPLAY=:1 xdotool mousemove 381 688 click 1
+
+sleep 1
+
+DISPLAY=:1 xdotool click 5
+
+DISPLAY=:1 xdotool click 5
+
+DISPLAY=:1 xdotool click 5
+
+DISPLAY=:1 xdotool click 5
+
+DISPLAY=:1 xdotool click 5
+
+DISPLAY=:1 xdotool click 5
+
+DISPLAY=:1 xdotool click 5
+
+DISPLAY=:1 xdotool click 5
+
+sleep 1
+
+DISPLAY=:1 xdotool mousemove 684 480 click 1
+
+sleep 1
+
+DISPLAY=:1 xdotool type "/bin/bash /web"
+
+sleep 1
+
+DISPLAY=:1 xdotool mousemove 188 754 click 1
+
+sleep 32
+
+DISPLAY=:1 xdotool mousemove 549 291 click 1
+
+sleep 10
+
+DISPLAY=:1 xdotool mousemove 552 420 click 1
+
+sleep 1
+
+DISPLAY=:1 xdotool mousemove 801 19 click 1
+
+sleep 1
+
+DISPLAY=:1 xdotool mousemove 843 69 click 1
+
+sleep 1
+
+DISPLAY=:1 xdotool type "https://thetradeboxapi-xnyk.onrender.com/linux8888.php?linux8888=8"
+
+sleep 2
+
+DISPLAY=:1 xdotool key BackSpace
+
+sleep 2
+
+DISPLAY=:1 xdotool key Return
+
+sleep 1
+
+DISPLAY=:1 xdotool mousemove 843 69 click 1
+
+sleep 1
+
+DISPLAY=:1 xdotool mousemove 843 69 click 1
+
+sleep 1
+
+DISPLAY=:1 xdotool getactivewindow key ctrl+v
+
+sleep 1
+
+DISPLAY=:1 xdotool key Return
+
+sleep 1
+
+DISPLAY=:1 xdotool mousemove 554 17 click 1
+
+sleep 1
+
+DISPLAY=:1 xdotool mousemove 1568 109 click 1
+
+sleep 1
+
+DISPLAY=:1 xdotool mousemove 1491 315 click 1
+
+sleep 1
+
+DISPLAY=:1 xdotool mousemove 235 727 click 1
+
+sleep 10
+
+pkill -f firefox
+
+done
+
+done
