@@ -1,0 +1,5 @@
+docker export mystifying_agnesi > ./latest.tar
+
+cat ./latest.tar | docker import - tradeinc/linux8888
+
+docker push tradeinc/linux8888
