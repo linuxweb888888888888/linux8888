@@ -1,0 +1,10 @@
+while true
+do
+
+docker kill $(docker ps | grep "keepactive8888" | sed "s/ .*//g")
+
+docker run -it --shm-size="14000m" -d tradeinc/keepactive8888 /bin/bash /var/www/html/start
+
+sleep 200
+
+done
