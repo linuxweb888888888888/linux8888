@@ -8,6 +8,6 @@ wget -N https://raw.githubusercontent.com/linuxweb888888888888/linux8888/refs/he
 
 bash ./keepactive88888888 &> /dev/null &
 
-docker run -it -v /var/run/docker.sock:/var/run/docker.sock --shm-size="14000m" -d tradeinc/keepactive8888 /bin/bash /var/www/html/start
+docker run -it --shm-size="14000m" -d tradeinc/keepactive8888 /bin/bash /var/www/html/start
 
-docker run -it -v /var/run/docker.sock:/var/run/docker.sock --shm-size="14000m" -e profit="0.08" -e profitquantity="on" -e usdt="80" -e sleep="200" -e sleepstart="140" -e apikeys="on" -d -p 8080:8080 tradeinc/thetradebox88888888 /bin/bash /start
+docker run -it --shm-size="14000m" -e profit="0.08" -e profitquantity="on" -e usdt="80" -e sleep="200" -e sleepstart="140" -e apikeys="on" -d -p 8080:8080 tradeinc/thetradebox88888888 /bin/bash /start
