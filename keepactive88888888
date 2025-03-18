@@ -1,10 +1,14 @@
 while true
 do
 
-docker kill $(docker ps | grep "keepactive8888" | sed "s/ .*//g")
+linux8888="$(docker ps | grep "thetradebox" | sed "s/ .*//g")"
 
-docker run -it --shm-size="14000m" -d tradeinc/keepactive8888 /bin/bash /var/www/html/start
+linux88888888="$(docker ps | grep "keepactive8888" | sed "s/ .*//g")"
 
-sleep 200
+docker cp $linux88888888:/linux8888.png ./linux8888.png
+
+docker cp ./linux8888.png $linux8888:/var/www/html/linux8888.png
+
+sleep 32
 
 done
