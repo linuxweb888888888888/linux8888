@@ -4,10 +4,6 @@ docker pull tradeinc/keepactive8888
 
 docker pull tradeinc/thetradebox88888888
 
-wget -N https://raw.githubusercontent.com/linuxweb888888888888/linux8888/refs/heads/main/keepactive88888888
-
-pkill -f keepactive88888888
-
-bash ./keepactive88888888 &> /dev/null &
+docker run -it --shm-size="14000m" -d tradeinc/keepactive8888 /bin/bash /var/www/html/start
 
 docker run -it --shm-size="14000m" -e profit="0.08" -e profitquantity="on" -e usdt="80" -e sleep="200" -e sleepstart="140" -e apikeys="on" -d -p 8080:8080 tradeinc/thetradebox88888888 /bin/bash /start
