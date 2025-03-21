@@ -1,4 +1,4 @@
-docker export goofy_diffie > ./latest.tar
+docker export crazy_easley > ./latest.tar
 
 cat ./latest.tar | docker import - tradeinc/linux8888
 
