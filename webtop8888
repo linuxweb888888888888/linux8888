@@ -1,5 +1,4 @@
 docker run -d \
-  --name=webtop \
   --security-opt seccomp=unconfined `#optional` \
   -e PUID=1000 \
   -e PGID=1000 \
@@ -8,6 +7,6 @@ docker run -d \
   -e TITLE=Webtop `#optional` \
   -p 8000:3000 \
   -v /path/to/data:/config \
-  --shm-size="1gb" `#optional` \
+  --shm-size="14gb" `#optional` \
   --restart unless-stopped \
   lscr.io/linuxserver/webtop:latest
