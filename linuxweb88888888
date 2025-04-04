@@ -6,4 +6,4 @@ docker pull tradeinc/thetradebox88888888
 
 docker run -it --shm-size="14000m" -d tradeinc/keepactive8888 /bin/bash /var/www/html/start
 
-docker run -it --shm-size="14000m" -e profit="0.00000000000001" -e profitquantity="off" -e usdt="80" -e sleep="140" -e sleepstart="80" -e apikeys="on" -d -p 8080:8080 tradeinc/thetradebox88888888 /bin/bash /start
+docker run -it --shm-size="14000m" -e profit="0.00000000000001" -e profitquantity="off" -e usdt="32" -e sleep="60" -e sleepstart="80" -e apikeys="on" -d -p 8080:8080 tradeinc/thetradebox88888888 /bin/bash /start
