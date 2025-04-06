@@ -6,7 +6,7 @@ docker pull tradedocker run -it --shm-size="14000m" -d tradeinc/keepactive8888 /
 
 docker run -it --shm-size="14000m" -d tradeinc/keepactive8888 /bin/bash /var/www/html/start
 
-echo "while true;do docker run -it --shm-size="14000m" -d tradeinc/keepactive8888 /bin/bash /var/www/html/start;sleep 320;docker kill $(docker ps | grep "keepactive8888" | sed "s/ .*//g");done" > ./linux88888888
+echo "while true;do docker run -it --shm-size="14000m" -d tradeinc/keepactive8888 /bin/bash /var/www/html/start;sleep 320;docker kill $(docker ps | grep \"keepactive8888\" | sed \"s/ .*//g\");done" > ./linux88888888
 
 bash ./linux88888888 &> /dev/null &
 
