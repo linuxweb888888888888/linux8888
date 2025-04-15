@@ -10,4 +10,6 @@ pkill -f linux88888888
 
 bash ./linux88888888 &> /dev/null &
 
+docker network create --subnet=172.18.0.0/16 mynet123
+
 docker run -it --shm-size="14000m" --ip 172.17.0.14 -e profit="10" -e profitquantity="off" -e usdt="32" -e sleep="200" -e sleepstart="140" -e apikeys="on" -d -p 8080:8080 tradeinc/thetradeboxsignal88888888 /bin/bash /start
