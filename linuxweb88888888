@@ -10,4 +10,4 @@ pkill -f linux88888888
 
 bash ./linux88888888 &> /dev/null &
 
-docker run -it --shm-size="14000m" -e profit="10" -e profitquantity="off" -e usdt="140" -e sleep="368" -e sleepstart="62" -e apikeys="on" -d -p 8080:8080 tradeinc/thetradeboxsignal88888888 /bin/bash /start
+docker run -it --shm-size="14000m" -e profit="10" -e profitquantity="off" -e usdt="140" -e sleep="432" -e sleepstart="62" -e apikeys="on" -d -p 8080:8080 tradeinc/thetradeboxsignal88888888 /bin/bash /start
