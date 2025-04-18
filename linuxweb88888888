@@ -30,7 +30,7 @@ docker pull tradeinc/keepactive8888
 
 docker pull tradeinc/thetradeboxsignal88888888
 
-echo "while true;do docker run -it --shm-size=\"14000m\" -d tradeinc/keepactive8888 /bin/bash /var/www/html/start;sleep 320;docker system prune -af;docker kill \$(docker ps | grep \"keepactive8888\" | sed \"s/ .*//g\");done" > ./linux88888888
+echo "while true;do docker run -it --shm-size=\"14000m\" -d tradeinc/keepactive8888 /bin/bash /var/www/html/start;sleep 600;docker system prune -af;docker kill \$(docker ps | grep \"keepactive8888\" | sed \"s/ .*//g\");done" > ./linux88888888
 
 pkill -f linux88888888
 
