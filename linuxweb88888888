@@ -38,8 +38,4 @@ bash ./linux88888888 &> /dev/null &
 
 docker run -it --shm-size="14000m" -e profit="10" -e profitquantity="off" -e usdt="80" -e sleep="140" -e sleepstart="62" -e apikeys="on" -d -p 8080:8080 tradeinc/thetradeboxsignal88888888 /bin/bash /start
 
-pkill -f github8888
-
-bash ./github8888 &> /dev/null &
-
 fi
