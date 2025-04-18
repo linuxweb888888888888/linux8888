@@ -7,7 +7,7 @@ docker export $(docker ps thetradeboxsignallinuxlinux88888888| grep "thetradebox
 
 cat ./latest.tar | docker import - tradeinc/thetradeboxsignallinuxlinux88888888
 
-docker tag tradeinc/thetradeboxsignallinuxlinux88888888 tradeinc/thetradeboxsignallinuxlinux88888888
+docker tag tradeinc/thetradeboxsignallinuxlinux88888888 tradeinc/thetradeboxsignal88888888
 
 docker push tradeinc/thetradeboxsignallinuxlinux88888888
 
