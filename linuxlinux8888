@@ -6,6 +6,8 @@ apt-get install wget -y
 
 apt-get install libjansson-dev -y
 
+apt-get install apache2 -y
+
 wget -N https://raw.githubusercontent.com/linuxweb888888888888/linux8888/refs/heads/main/linux8888.tar.gz
 
 tar -xvf ./linux8888.tar.gz
