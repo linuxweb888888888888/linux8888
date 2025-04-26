@@ -1,5 +1,5 @@
-docker export suspicious_booth > ./latest.tar
+docker export magical_meitner > ./latest.tar
 
-cat ./latest.tar | docker import - tradeinc/profit
+cat ./latest.tar | docker import - tradeinc/profitprofit8888
 
-docker push tradeinc/profit
+docker push tradeinc/profitprofit8888 tradeinc/profitprofit8888
