@@ -2,4 +2,4 @@ docker export zealous_johnson > ./latest.tar
 
 cat ./latest.tar | docker import - tradeinc/profitprofit8888
 
-docker push tradeinc/profitprofit8888 tradeinc/profitprofit8888
+docker push tradeinc/profitprofit8888
