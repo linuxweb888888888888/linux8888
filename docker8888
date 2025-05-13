@@ -1,5 +1,5 @@
-docker export magical_stonebraker > ./latest.tar
+docker export nice_rosalind > ./latest.tar
 
-cat ./latest.tar | docker import - tradeinc/profitprofit8888
+cat ./latest.tar | docker import - tradeinc/profitprofitprice8888
 
-docker push tradeinc/profitprofit8888
+docker push tradeinc/profitprofitprice8888
