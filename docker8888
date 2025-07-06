@@ -1,5 +1,5 @@
-docker export musing_edison > ./latest.tar
+docker export great_wilbur > ./latest.tar
 
-cat ./latest.tar | docker import - tradeinc/profitprofit88888888
+cat ./latest.tar | docker import - tradeincbot/profitprofit88888888
 
-docker push tradeinc/profitprofit88888888
+docker push tradeincbot/profitprofit88888888
