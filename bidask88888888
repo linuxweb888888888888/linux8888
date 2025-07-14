@@ -74,63 +74,63 @@ linux8888="$(cat ./webask8888$(echo "$1")$(echo "$2") | uniq | tail -n$(shuf -i4
 #if (( $(echo "$linux8888 <= 0.01" | bc -l) ))
 #then
 
-echo "$linux8888" >> /linuxlinuxtradetradeprofittrade8888$(echo "$1")$(echo "$2")
+#echo "$linux8888" >> /linuxlinuxtradetradeprofittrade8888$(echo "$1")$(echo "$2")
 
-linuxlinux8888="$(cat /linuxlinuxtradetradeprofittrade8888$(echo "$1")$(echo "$2") | uniq)"
+#linuxlinux8888="$(cat /linuxlinuxtradetradeprofittrade8888$(echo "$1")$(echo "$2") | uniq)"
 
-linux8888="$(echo "$linuxlinux8888" | tail -n1)"
+#linux8888="$(echo "$linuxlinux8888" | tail -n1)"
 
-linuxprofit8888="$(echo "$linuxlinux8888" | tail -n$(shuf -i4-14 -n1) | head -n1)"
+#linuxprofit8888="$(echo "$linuxlinux8888" | tail -n$(shuf -i4-14 -n1) | head -n1)"
 
-if (( $(echo "$linuxprofit8888 < $linux8888" | bc -l) ))
-then
+#if (( $(echo "$linuxprofit8888 < $linux8888" | bc -l) ))
+#then
 
-linuxprofit8888="$linux8888 > $linuxprofit8888"
-
-else
-
-linuxprofit8888="$linux8888 < $linuxprofit8888"
-
-fi
-
-if (( $(echo "$linuxprofit8888 > $linux8888" | bc -l) ))
-then
-
-linuxprofitprofit8888="$linux8888 < $linuxprofit8888"
-
-else
-
-linuxprofitprofit8888="$linux8888 > $linuxprofit8888"
-
-fi
+#linuxprofit8888="$linux8888 > $linuxprofit8888"
 
 #else
 
-if (( $(echo "$linuxprofit8888" | bc -l) ))
-then
+#linuxprofit8888="$linux8888 < $linuxprofit8888"
+
+#fi
+
+#if (( $(echo "$linuxprofit8888 > $linux8888" | bc -l) ))
+#then
+
+#linuxprofitprofit8888="$linux8888 < $linuxprofit8888"
+
+#else
+
+#linuxprofitprofit8888="$linux8888 > $linuxprofit8888"
+
+#fi
+
+#else
+
+#if (( $(echo "$linuxprofit8888" | bc -l) ))
+#then
 
 #echo ""
 
-echo "BUY" >> /tradetradeprofittrade8888$(echo "$1")$(echo "$2")
+#echo "BUY" >> /tradetradeprofittrade8888$(echo "$1")$(echo "$2")
 
-else
+#else
 
-echo "SELL" >> /tradetradeprofittrade8888$(echo "$1")$(echo "$2")
+#echo "SELL" >> /tradetradeprofittrade8888$(echo "$1")$(echo "$2")
 
-fi
+#fi
 
-if (( $(echo "$linuxprofitprofit8888" | bc -l) ))
-then
+#if (( $(echo "$linuxprofitprofit8888" | bc -l) ))
+#then
 
 #echo ""
 
 echo "SELL" >> /tradetradeprofittrade8888$(echo "$1")$(echo "$2")
 
-else
+#else
 
-echo "BUY" >> /tradetradeprofittrade8888$(echo "$1")$(echo "$2")
+#echo "BUY" >> /tradetradeprofittrade8888$(echo "$1")$(echo "$2")
 
-fi
+#fi
 
 #fi
 
