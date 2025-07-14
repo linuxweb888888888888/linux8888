@@ -69,7 +69,7 @@ bid="$(python3 /price8888.py $(echo "$1") bid | tail -n1)"
 
 #echo "$linux8888"
 
-linux8888="$(cat ./webask8888$(echo "$1")$(echo "$2") | uniq | tail -n6 | awk '{sum+=$1} END { print sum/NR}')"
+linux8888="$(cat ./webask8888$(echo "$1")$(echo "$2") | uniq | tail -n14 | awk '{sum+=$1} END { print sum/NR}')"
 
 #if (( $(echo "$linux8888 <= 0.01" | bc -l) ))
 #then
