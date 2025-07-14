@@ -104,6 +104,8 @@ fi
 
 #fi
 
+echo ""
+
 echo "$ask" >> ./webask8888$(echo "$1")$(echo "$2")
 
 echo "$bid" >> ./webbid8888$(echo "$1")$(echo "$2")
