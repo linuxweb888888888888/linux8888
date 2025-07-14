@@ -80,7 +80,7 @@ linuxlinux8888="$(cat /linuxlinuxtradetradeprofittrade8888$(echo "$1")$(echo "$2
 
 linux8888="$(echo "$linuxlinux8888" | tail -n1)"
 
-linuxprofit8888="$(echo "$linuxlinux8888" | tail -n4 | head -n1)"
+linuxprofit8888="$(echo "$linuxlinux8888" | tail -n8 | head -n1)"
 
 #else
 
