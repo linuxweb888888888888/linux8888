@@ -111,7 +111,7 @@ then
 
 #echo ""
 
-echo "SELL" >> /tradetradeprofittrade8888$(echo "$1")$(echo "$2")
+echo "BUY" >> /tradetradeprofittrade8888$(echo "$1")$(echo "$2")
 
 fi
 
@@ -120,7 +120,7 @@ then
 
 #echo ""
 
-echo "BUY" >> /tradetradeprofittrade8888$(echo "$1")$(echo "$2")
+echo "SELL" >> /tradetradeprofittrade8888$(echo "$1")$(echo "$2")
 
 fi
 
