@@ -82,9 +82,31 @@ linux8888="$(echo "$linuxlinux8888" | tail -n1)"
 
 linuxprofit8888="$(echo "$linuxlinux8888" | tail -n$(shuf -i4-14 -n1) | head -n1)"
 
+if (( $(echo "$linuxprofit8888 < $linux8888" | bc -l) ))
+then
+
+linuxprofit8888="$linux8888 > $linuxprofit8888"
+
+else
+
+linuxprofit8888="$linux8888 < $linuxprofit8888"
+
+fi
+
+if (( $(echo "$linuxprofit8888 > $linux8888" | bc -l) ))
+then
+
+linuxprofit8888="$linux8888 > $linuxprofit8888"
+
+else
+
+linuxprofit8888="$linux8888 < $linuxprofit8888"
+
+fi
+
 #else
 
-if (( $(echo "$linux8888 > $linuxprofit8888" | bc -l) ))
+if (( $(echo "$linuxprofit8888" | bc -l) ))
 then
 
 #echo ""
@@ -93,7 +115,7 @@ echo "SELL" >> /tradetradeprofittrade8888$(echo "$1")$(echo "$2")
 
 fi
 
-if (( $(echo "$linux8888 < $linuxprofit8888" | bc -l) ))
+if (( $(echo "$linuxprofit8888" | bc -l) ))
 then
 
 #echo ""
