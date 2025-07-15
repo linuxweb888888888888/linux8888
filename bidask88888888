@@ -7,9 +7,9 @@ ask="$(python3 /price8888.py $(echo "$1") ask | tail -n1)"
 
 bid="$(python3 /price8888.py $(echo "$1") bid | tail -n1)"
 
-askask8888="$(cat /webask8888$(echo "$1")$(echo "$2") | uniq | tail -n80 | head -n1)"
+askask8888="$(cat /webask8888$(echo "$1")$(echo "$2") | uniq | tail -n152 | head -n1)"
 
-bidbid8888="$(cat /webbid8888$(echo "$1")$(echo "$2") | uniq | tail -n80 | head -n1)"
+bidbid8888="$(cat /webbid8888$(echo "$1")$(echo "$2") | uniq | tail -n152 | head -n1)"
 
 #bid="$(echo "$linuxlinux8888" | jq | jq .bid | sed 's/"//g')"
 
