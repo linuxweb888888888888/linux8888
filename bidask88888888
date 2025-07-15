@@ -7,6 +7,10 @@ ask="$(python3 /price8888.py $(echo "$1") ask | tail -n1)"
 
 bid="$(python3 /price8888.py $(echo "$1") bid | tail -n1)"
 
+askask8888="$(cat /webask8888$(echo "$1")$(echo "$2") | tail -n80 | head -n1)"
+
+bidbid8888="$(cat /webbid8888$(echo "$1")$(echo "$2") | tail -n80 | head -n1)"
+
 #bid="$(echo "$linuxlinux8888" | jq | jq .bid | sed 's/"//g')"
 
 #ask="$(echo "$linuxlinux8888" | jq | jq .ask | sed 's/"//g')"
@@ -124,7 +128,19 @@ linux8888="$(cat ./webask8888$(echo "$1")$(echo "$2") | uniq | tail -n$(shuf -i4
 
 #echo ""
 
+if (( $(echo "$askask8888 > $ask" | bc -l) ))
+then
+
+echo "SELL" >> /tradetradeprofittrade8888$(echo "$1")$(echo "$2")
+
+fi
+
+if (( $(echo "$askask8888 < $ask" | bc -l) ))
+then
+
 echo "BUY" >> /tradetradeprofittrade8888$(echo "$1")$(echo "$2")
+
+fi
 
 #else
 
