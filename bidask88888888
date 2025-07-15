@@ -138,6 +138,8 @@ sed -i "/^$/d" /emaema8888$(echo "$1")$(echo "$2")
 
 bash /ema8888 $(echo "$1") $(echo "$2") 8 10 > /emaema8888$(echo "$1")$(echo "$2")
 
+sed -i "/^$/d" /emaema8888$(echo "$1")$(echo "$2")
+
 ema8888="$(cat /emaema8888$(echo "$1")$(echo "$2"))"
 
 emaema8888="$(echo "$ema8888" | head -n1)"
