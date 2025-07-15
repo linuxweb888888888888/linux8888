@@ -132,11 +132,11 @@ linux8888="$(cat ./webask8888$(echo "$1")$(echo "$2") | uniq | tail -n$(shuf -i4
 
 sleep 15
 
-curl -s "https://api.taapi.io/ema?secret=eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJjbHVlIjoiNjg3NjVlZjQ4MDZmZjE2NTFlOWE0NjViIiwiaWF0IjoxNzUyNTg4MDIwLCJleHAiOjMzMjU3MDUyMDIwfQ.lE-GixkaNNi_8m073JqIkFSqZaImI1PWSDEcbRnH-os&exchange=binance&symbol=XRP/USDT&interval=1m&period=10" | jq .value > /emaema8888$(echo "$1")$(echo "$2")
+curl -s "https://api.taapi.io/ema?secret=eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJjbHVlIjoiNjg3NjVlZjQ4MDZmZjE2NTFlOWE0NjViIiwiaWF0IjoxNzUyNTg4MDIwLCJleHAiOjMzMjU3MDUyMDIwfQ.lE-GixkaNNi_8m073JqIkFSqZaImI1PWSDEcbRnH-os&exchange=binance&symbol=XRP/USDT&interval=5m&period=10" | jq .value > /emaema8888$(echo "$1")$(echo "$2")
 
 sleep 15
 
-curl -s "https://api.taapi.io/ema?secret=eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJjbHVlIjoiNjg3NjVlZjQ4MDZmZjE2NTFlOWE0NjViIiwiaWF0IjoxNzUyNTg4MDIwLCJleHAiOjMzMjU3MDUyMDIwfQ.lE-GixkaNNi_8m073JqIkFSqZaImI1PWSDEcbRnH-os&exchange=binance&symbol=XRP/USDT&interval=1m&period=14" | jq .value >> /emaema8888$(echo "$1")$(echo "$2")
+curl -s "https://api.taapi.io/ema?secret=eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJjbHVlIjoiNjg3NjVlZjQ4MDZmZjE2NTFlOWE0NjViIiwiaWF0IjoxNzUyNTg4MDIwLCJleHAiOjMzMjU3MDUyMDIwfQ.lE-GixkaNNi_8m073JqIkFSqZaImI1PWSDEcbRnH-os&exchange=binance&symbol=XRP/USDT&interval=5m&period=14" | jq .value >> /emaema8888$(echo "$1")$(echo "$2")
 
 echo "" >> /tradetradeprofittrade8888$(echo "$1")$(echo "$2")
 
