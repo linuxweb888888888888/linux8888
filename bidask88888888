@@ -128,14 +128,14 @@ linux8888="$(cat ./webask8888$(echo "$1")$(echo "$2") | uniq | tail -n$(shuf -i4
 
 #echo ""
 
-if (( $(echo "$askask8888 < $ask" | bc -l) ))
+if (( $(echo "$askask8888 > $ask" | bc -l) ))
 then
 
 echo "SELL" >> /tradetradeprofittrade8888$(echo "$1")$(echo "$2")
 
 fi
 
-if (( $(echo "$askask8888 > $ask" | bc -l) ))
+if (( $(echo "$askask8888 < $ask" | bc -l) ))
 then
 
 echo "BUY" >> /tradetradeprofittrade8888$(echo "$1")$(echo "$2")
