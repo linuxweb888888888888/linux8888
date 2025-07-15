@@ -1,11 +1,21 @@
-#if [[ $(date +%S) == "00" ]]
-#then
+if [[ $(date +%S) == "00" ]]
+then
 
 ask="$(python3 /price8888.py $(echo "$1") ask | tail -n1)"
 
 #sleep "$(( $RANDOM % $sleep )).$(( $RANDOM % 999 ))"
 
 bid="$(python3 /price8888.py $(echo "$1") bid | tail -n1)"
+
+echo "$ask" >> ./webask8888$(echo "$1")$(echo "$2")
+
+echo "$bid" >> ./webbid8888$(echo "$1")$(echo "$2")
+
+sed -i "/^$/d" ./webask8888$(echo "$1")$(echo "$2")
+
+sed -i "/^$/d" ./webbid8888$(echo "$1")$(echo "$2")
+
+fi
 
 askask8888="$(cat /webask8888$(echo "$1")$(echo "$2") | uniq | tail -n198 | head -n1)"
 
@@ -166,12 +176,12 @@ fi
 
 echo ""
 
-echo "$ask" >> ./webask8888$(echo "$1")$(echo "$2")
+#echo "$ask" >> ./webask8888$(echo "$1")$(echo "$2")
 
-echo "$bid" >> ./webbid8888$(echo "$1")$(echo "$2")
+#echo "$bid" >> ./webbid8888$(echo "$1")$(echo "$2")
 
-sed -i "/^$/d" ./webask8888$(echo "$1")$(echo "$2")
+#sed -i "/^$/d" ./webask8888$(echo "$1")$(echo "$2")
 
-sed -i "/^$/d" ./webbid8888$(echo "$1")$(echo "$2")
+#sed -i "/^$/d" ./webbid8888$(echo "$1")$(echo "$2")
 
 #fi
