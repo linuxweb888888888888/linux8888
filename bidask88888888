@@ -1,7 +1,5 @@
 ask="$(python3 /price8888.py $(echo "$1") ask | tail -n1)"
 
-#sleep "$(( $RANDOM % $sleep )).$(( $RANDOM % 999 ))"
-
 bid="$(python3 /price8888.py $(echo "$1") bid | tail -n1)"
 
 echo "$ask" >> ./webask8888$(echo "$1")$(echo "$2")
@@ -16,130 +14,7 @@ askask8888="$(cat /webask8888$(echo "$1")$(echo "$2") | uniq | tail -n198 | head
 
 bidbid8888="$(cat /webbid8888$(echo "$1")$(echo "$2") | uniq | tail -n198 | head -n1)"
 
-#bid="$(echo "$linuxlinux8888" | jq | jq .bid | sed 's/"//g')"
-
-#ask="$(echo "$linuxlinux8888" | jq | jq .ask | sed 's/"//g')"
-
-#bid="$(echo "$linuxlinux8888" | jq | jq .bid | sed 's/"//g')"
-
-#ask="$(echo "$linuxlinux8888" | jq | jq .ask | sed 's/"//g')"
-
-#if (( $(echo "$(cat ./longwebask8888$(echo "$1")$(echo "$2") | head -n1) > $ask" | bc -l) ))
-#then
-
-#echo "$ask" >> ./longwebask8888$(echo "$1")$(echo "$2")
-
-#echo "$bid" >> ./longwebbid8888$(echo "$1")$(echo "$2")
-
-#echo "LONG" >> /tradebuybuy8888$(echo "$1")$(echo "$2")
-
-#fi
-
-#if (( $(echo "$(cat ./longwebbid8888$(echo "$1")$(echo "$2") | head -n1) > $bid" | bc -l) ))
-#then
-
-#echo "$ask" >> ./longwebask8888$(echo "$1")$(echo "$2")
-
-#echo "$bid" >> ./longwebbid8888$(echo "$1")$(echo "$2")
-
-#echo "LONG" >> /tradebuybuy8888$(echo "$1")$(echo "$2")
-
-#fi
-
-#echo "$ask"
-
-#echo "$(cat ./webask8888$(echo "$1")$(echo "$2") | tail -n10 | head -n1)"
-
-#if (( $(echo "$(cat ./webask8888$(echo "$1")$(echo "$2") | tail -n10 | head -n1) < $ask" | bc -l) ))
-#then
-
-#echo "$ask" >> ./shortwebask8888$(echo "$1")$(echo "$2")
-
-#echo "$bid" >> ./longwebbid8888$(echo "$1")$(echo "$2")
-
-#echo "BUY" >> /tradebuybuy8888$(echo "$1")$(echo "$2")
-
-#fi
-
-#if (( $(echo "$(cat ./webask8888$(echo "$1")$(echo "$2") | tail -n10 | head -n1) > $bid" | bc -l) ))
-#then
-
-#echo "$ask" >> ./longwebask8888$(echo "$1")$(echo "$2")
-
-#echo "$bid" >> ./shortwebbid8888$(echo "$1")$(echo "$2")
-
-#echo "SELL" >> /tradetradeprofittrade8888$(echo "$1")$(echo "$2")
-
-#fi
-
-#linux8888="$(echo "$(cat ./webask8888$(echo "$1")$(echo "$2") | tail -n1) $(cat ./webask8888$(echo "$1")$(echo "$2") | tail -n2 | head -n1)" | awk '{print $1-$2}' | bc -l | awk -F"E" 'BEGIN{OFMT="%10.10f"} {print $1 * (10 ^ $2)}')"
-
-#linux8888="$(echo "$linux8888" | sed "s/-//g")"
-
-#echo "$linux8888"
-
-linux8888="$(cat ./webask8888$(echo "$1")$(echo "$2") | uniq | tail -n$(shuf -i4-32 -n1) | awk '{sum+=$1} END { print sum/NR}')"
-
-#if (( $(echo "$linux8888 <= 0.01" | bc -l) ))
-#then
-
-#echo "$linux8888" >> /linuxlinuxtradetradeprofittrade8888$(echo "$1")$(echo "$2")
-
-#linuxlinux8888="$(cat /linuxlinuxtradetradeprofittrade8888$(echo "$1")$(echo "$2") | uniq)"
-
-#linux8888="$(echo "$linuxlinux8888" | tail -n1)"
-
-#linuxprofit8888="$(echo "$linuxlinux8888" | tail -n$(shuf -i4-14 -n1) | head -n1)"
-
-#if (( $(echo "$linuxprofit8888 < $linux8888" | bc -l) ))
-#then
-
-#linuxprofit8888="$linux8888 > $linuxprofit8888"
-
-#else
-
-#linuxprofit8888="$linux8888 < $linuxprofit8888"
-
-#fi
-
-#if (( $(echo "$linuxprofit8888 > $linux8888" | bc -l) ))
-#then
-
-#linuxprofitprofit8888="$linux8888 < $linuxprofit8888"
-
-#else
-
-#linuxprofitprofit8888="$linux8888 > $linuxprofit8888"
-
-#fi
-
-#else
-
-#if (( $(echo "$linuxprofit8888" | bc -l) ))
-#then
-
-#echo ""
-
-#echo "BUY" >> /tradetradeprofittrade8888$(echo "$1")$(echo "$2")
-
-#else
-
-#echo "SELL" >> /tradetradeprofittrade8888$(echo "$1")$(echo "$2")
-
-#fi
-
-#if (( $(echo "$linuxprofitprofit8888" | bc -l) ))
-#then
-
-#echo ""
-
-#sleep 10
-
-#echo "" >> /tradetradeprofittrade8888$(echo "$1")$(echo "$2")
-
 sed -i "/^$/d" /emaema8888$(echo "$1")$(echo "$2")
-
-#else
 
 bash /ema8888 $(echo "$1") $(echo "$2") 62 68 > /emaema8888$(echo "$1")$(echo "$2")
 
@@ -150,8 +25,6 @@ ema8888="$(cat /emaema8888$(echo "$1")$(echo "$2"))"
 emaema8888="$(echo "$ema8888" | head -n1)"
 
 emaemaprofit8888="$(echo "$ema8888" | tail -n1)"
-
-#echo "BUY" >> /tradetradeprofittrade8888$(echo "$1")$(echo "$2")
 
 if (( $(echo "$emaema8888 < $emaemaprofit8888" | bc -l) ))
 then
@@ -171,18 +44,6 @@ sed -i "/^$/d" /tradetradeprofittrade8888$(echo "$1")$(echo "$2")
 
 fi
 
-#fi
+sed -i "/^$/d" ./webask8888$(echo "$1")$(echo "$2")
 
-#fi
-
-echo ""
-
-#echo "$ask" >> ./webask8888$(echo "$1")$(echo "$2")
-
-#echo "$bid" >> ./webbid8888$(echo "$1")$(echo "$2")
-
-#sed -i "/^$/d" ./webask8888$(echo "$1")$(echo "$2")
-
-#sed -i "/^$/d" ./webbid8888$(echo "$1")$(echo "$2")
-
-#fi
+sed -i "/^$/d" ./webbid8888$(echo "$1")$(echo "$2")
