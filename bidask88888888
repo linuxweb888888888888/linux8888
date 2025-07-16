@@ -154,16 +154,7 @@ emaemaprofit8888="$(echo "$ema8888" | tail -n1)"
 if [[ $emaema8888 == "BUY" ]]
 then
 
-if [[ $(python3 /pythonprofit8888.py $(echo "$1") $(echo "$2") | tail -n1) == "BUY" ]]
-then
-
 echo "BUY" >> /tradetradeprofittrade8888$(echo "$1")$(echo "$2")
-
-else
-
-echo "SELL" >> /tradetradeprofittrade8888$(echo "$1")$(echo "$2")
-
-fi
 
 fi
 
@@ -179,16 +170,7 @@ fi
 if [[ $emaema8888 == "SELL" ]]
 then
 
-if [[ $(python3 /pythonprofit8888.py $(echo "$1") $(echo "$2") | tail -n1) == "SELL" ]]
-then
-
 echo "SELL" >> /tradetradeprofittrade8888$(echo "$1")$(echo "$2")
-
-else
-
-echo "BUY" >> /tradetradeprofittrade8888$(echo "$1")$(echo "$2")
-
-fi
 
 fi
 
