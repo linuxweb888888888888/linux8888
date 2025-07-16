@@ -36,7 +36,7 @@ echo ""
 
 else
 
-echo "SELL" >> /tradetradeprofittrade8888$(echo "$1")$(echo "$2")
+echo "SELL" > /tradetradeprofittrade8888$(echo "$1")$(echo "$2")
 
 fi
 
@@ -54,7 +54,7 @@ echo ""
 
 else
 
-echo "BUY" >> /tradetradeprofittrade8888$(echo "$1")$(echo "$2")
+echo "BUY" > /tradetradeprofittrade8888$(echo "$1")$(echo "$2")
 
 fi
 
