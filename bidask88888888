@@ -16,17 +16,17 @@ bidbid8888="$(cat /webbid8888$(echo "$1")$(echo "$2") | uniq | tail -n198 | head
 
 sed -i "/^$/d" /emaema8888$(echo "$1")$(echo "$2")
 
-bash /ema8888 $(echo "$1") $(echo "$2") 62 68 > /emaema8888$(echo "$1")$(echo "$2")
+#bash /ema8888 $(echo "$1") $(echo "$2") 62 68 > /emaema8888$(echo "$1")$(echo "$2")
 
 sed -i "/^$/d" /emaema8888$(echo "$1")$(echo "$2")
 
-ema8888="$(cat /emaema8888$(echo "$1")$(echo "$2"))"
+ema8888="$(cat /var/www/html/emaall8888$(echo "$1")$(echo "$2"))"
 
-emaema8888="$(echo "$ema8888" | head -n1)"
+emaema8888="$(echo "$ema8888" | tail -n2 | head -n1)"
 
 emaemaprofit8888="$(echo "$ema8888" | tail -n1)"
 
-if (( $(echo "$emaema8888 < $emaemaprofit8888" | bc -l) ))
+if (( $(echo "$emaema8888 > $emaemaprofit8888" | bc -l) ))
 then
 
 if [[ $(cat /tradetradeprofittrade8888$(echo "$1")$(echo "$2") | tail -n1) == "SELL" ]]
@@ -44,7 +44,7 @@ sed -i "/^$/d" /tradetradeprofittrade8888$(echo "$1")$(echo "$2")
 
 fi
 
-if (( $(echo "$emaema8888 > $emaemaprofit8888" | bc -l) ))
+if (( $(echo "$emaema8888 < $emaemaprofit8888" | bc -l) ))
 then
 
 if [[ $(cat /tradetradeprofittrade8888$(echo "$1")$(echo "$2") | tail -n1) == "BUY" ]]
