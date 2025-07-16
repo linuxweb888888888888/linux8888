@@ -2,10 +2,6 @@ sed -i "/^$/d" ./webask8888$(echo "$1")$(echo "$2")
 
 sed -i "/^$/d" ./webbid8888$(echo "$1")$(echo "$2")
 
-askask8888="$(cat /webask8888$(echo "$1")$(echo "$2") | uniq | tail -n198 | head -n1)"
-
-bidbid8888="$(cat /webbid8888$(echo "$1")$(echo "$2") | uniq | tail -n198 | head -n1)"
-
 sed -i "/^$/d" /emaema8888$(echo "$1")$(echo "$2")
 
 #bash /ema8888 $(echo "$1") $(echo "$2") 62 68 > /emaema8888$(echo "$1")$(echo "$2")
