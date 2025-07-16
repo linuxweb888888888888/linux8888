@@ -158,12 +158,16 @@ then
 
 echo "SELL" >> /tradetradeprofittrade8888$(echo "$1")$(echo "$2")
 
+sed -i "/^$/d" /tradetradeprofittrade8888$(echo "$1")$(echo "$2")
+
 fi
 
 if (( $(echo "$emaema8888 > $emaemaprofit8888" | bc -l) ))
 then
 
 echo "BUY" >> /tradetradeprofittrade8888$(echo "$1")$(echo "$2")
+
+sed -i "/^$/d" /tradetradeprofittrade8888$(echo "$1")$(echo "$2")
 
 fi
 
