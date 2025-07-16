@@ -154,23 +154,23 @@ emaemaprofit8888="$(echo "$ema8888" | tail -n1)"
 if [[ $emaema8888 == "BUY" ]]
 then
 
-echo "BUY" >> /tradetradeprofittrade8888$(echo "$1")$(echo "$2")
+echo "SELL" >> /tradetradeprofittrade8888$(echo "$1")$(echo "$2")
 
 fi
 
 if [[ $emaema8888 == "NEUTRAL" ]]
 then
 
-#echo "NEUTRAL" >> /tradetradeprofittrade8888$(echo "$1")$(echo "$2")
+echo "NEUTRAL" >> /tradetradeprofittrade8888$(echo "$1")$(echo "$2")
 
-echo ""
+#echo ""
 
 fi
 
 if [[ $emaema8888 == "SELL" ]]
 then
 
-echo "SELL" >> /tradetradeprofittrade8888$(echo "$1")$(echo "$2")
+echo "BUY" >> /tradetradeprofittrade8888$(echo "$1")$(echo "$2")
 
 fi
 
