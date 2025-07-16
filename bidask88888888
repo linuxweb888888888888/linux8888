@@ -161,7 +161,9 @@ fi
 if [[ $emaema8888 == "NEUTRAL" ]]
 then
 
-echo "NEUTRAL" >> /tradetradeprofittrade8888$(echo "$1")$(echo "$2")
+#echo "NEUTRAL" >> /tradetradeprofittrade8888$(echo "$1")$(echo "$2")
+
+echo ""
 
 fi
 
