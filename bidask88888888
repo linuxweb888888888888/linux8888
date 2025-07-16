@@ -135,7 +135,7 @@ linux8888="$(cat ./webask8888$(echo "$1")$(echo "$2") | uniq | tail -n$(shuf -i4
 
 #sleep 10
 
-echo "" >> /tradetradeprofittrade8888$(echo "$1")$(echo "$2")
+#echo "" >> /tradetradeprofittrade8888$(echo "$1")$(echo "$2")
 
 sed -i "/^$/d" /emaema8888$(echo "$1")$(echo "$2")
 
