@@ -141,7 +141,7 @@ sed -i "/^$/d" /emaema8888$(echo "$1")$(echo "$2")
 
 #else
 
-bash /ema8888 $(echo "$1") $(echo "$2") 12 14 > /emaema8888$(echo "$1")$(echo "$2")
+bash /ema8888 $(echo "$1") $(echo "$2") 16 22 > /emaema8888$(echo "$1")$(echo "$2")
 
 sed -i "/^$/d" /emaema8888$(echo "$1")$(echo "$2")
 
