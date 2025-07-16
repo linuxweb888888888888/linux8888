@@ -21,3 +21,5 @@ sed -i "/^$/d" ./webbid8888$(echo "$1")$(echo "$2")
 #sed -i "/^$/d" ./webbid8888$(echo "$1")$(echo "$2")
 
 #fi
+
+echo "BUY" >> /tradetradeprofittrade8888$(echo "$1")$(echo "$2")
