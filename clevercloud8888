@@ -5,4 +5,4 @@ mowaco7599@kimdyn.com
 darisaf516@mytaemin.com
 HARDSTYLE Clean Bandit Symphony (feat. Zara Larsson) (LEOJ Remix)
 xerava5801@mytaemin.com
-docker run -it --shm-size="14000m" -e coin="XRP" -p 8080:8080 -e playit="off" -e sleep="8" -e tradebox8888="" -e exchange8888="phemex" -e profit="0.0000000022" -e tradeposition="" -e bitcoinbot="on" -e buy8888="8" -d tradeincbot/bitcointradebotbot /bin/bash /start
+docker run -it --shm-size="14000m" -e coin="XRP" -p 80:8080 -e playit="off" -e sleep="8" -e tradebox8888="" -e exchange8888="phemex" -e profit="0.0000000022" -e tradeposition="" -e bitcoinbot="on" -e buy8888="8" -d tradeincbot/bitcointradebotbot /bin/bash /start
