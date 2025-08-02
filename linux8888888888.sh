@@ -1,3 +1,4 @@
+otpauth://totp/Google:linuxdistro84%40gmail.com?secret=btzyjbfijhti55tcjp6atq5xumphgzla&issuer=Google
 otpauth://totp/HitBTC:web88888888888888%40gmail.com-1699165436?secret=4UY3JAD2KE24KFGZH5KX54FOGLCP2LQZ&issuer=HitBTC
 otpauth://totp/linuxdistro84@gmail.com?secret=VO4WPM5BM3UAUFDJ&issuer=exbitron.com
 otpauth://totp/HitBTC:web88888888888888%2Blinux8888%40gmail.com-1723644745?secret=52JUA7THOBLUIRD4&issuer=HitBTC
