@@ -131,6 +131,7 @@ otpauth://totp/SafeTrade:linuxdistro84%40gmail.com?secret=MKAJ3GXJZHUBP2ATWRCXJI
 otpauth://totp/Surfshark?secret=IBH2WDQR2SCNHV4PKDC3GIU77Y
 otpauth://totp/Luno:debug%40linuxbusiness.xyz?secret=5HAGO5ALFZR6PSDUQQR6ICWU4XN7QFIV&issuer=Luno
 otpauth://totp/Altmarkets:linuxmail8474%40gmail.com?secret=2I5W6SL3WT7TWT3V54NSJ3LRIGOFL5QT&issuer=Altmarkets
+otpauth://totp/nestex.com:?secret=KC6TF5J5Y7ZWNOCFAIWSAVUVIOHDPTAT&issuer=nestex.com
 otpauth://totp/graviex.net:linuxdistro84%40gmail.com?secret=rnpkaqpf65govbzy&issuer=graviex.net
 otpauth://totp/Altmarkets:lunomail8474%40gmail.com?secret=WHD7WJY4POINFENYCHJLH3YYJQN3VBBD&issuer=Altmarkets
 otpauth://totp/lunomail8474%40gmail.com:?secret=YHMZ2OUHNLQWF5ZWQP424TZS5YLA7H6K&issuer=lunomail8474%40gmail.com
