@@ -13,3 +13,4 @@ docker run -it --shm-size="14000m" -e apikey="495bdac3-f3d1-46e2-8652-46c3c341da
 docker run -it --shm-size="14000m" -e apikey="ae012186-8f85-4c65-b350-c1c9d4b16e96" -e apisecret="Pvyzg_XUq3r_otje0BXRMM4DPpK1PW-MK42aWNKZ2c9kMjdjMTJjOS0zMDFmLTQwNGItOWQ3OC0yOWYxMWQwZjI2NDA" -e coin="" -p 82:8080 -e sleep="10" -e tradeposition="" -e walletquantity="" -e tradebot="on" -d tradeincbot/bitcointradebot /bin/bash /start
 docker run -it -e sleep="62" -e apache2="on" -e wallet="14" -e apikey="495bdac3-f3d1-46e2-8652-46c3c341da24" -e apisecret="s-8chagaTjufZG6V_fZbCRQtHOOwwmdfW9mlUwtdPOFkZGY2ZDBlYy1hYjcxLTRiM2UtOGMzMi00NWM3M2Q0MjZlYzg" -d tradeincbot/bitcointradebot /bin/bash /start
 Purple-Visual-22741
+tovat91973@aravites.com
