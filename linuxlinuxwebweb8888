@@ -2,11 +2,11 @@ docker kill $(docker ps -q)
 
 docker pull tradeincbot/bitcointradebot
 
-for linux8888 in $(cat /coincoin8888)
-do
+#for linux8888 in $(cat /coincoin8888)
+#do
 
-docker run -it -e sleep="1" -e apache2="on" -e coin="$linux8888" -e apikey="92fc0ef2-baa9-4a5b-98ae-5382c68993b7" -e apisecret="QEYKNA1cv_LhRTdLDz3wG0DPhKjKXuht1Qio-_lSYbczNzJhNzMwOS05YjBjLTRkOTQtOWZmNS00ZWQwNmQ2YTk5NDA" -d -p $2:8080 tradeincbot/bitcointradebot /bin/bash /start
+docker run -it -e sleep="1" -e apache2="on" -e coin="$1" -e apikey="61edfe0b-3b22-4a05-9f93-3b1281562b27" -e apisecret="rCqp_g826tE65qQTJVlzjBvzmjBhN42qRFIQSo_CfGU2ZGRkYjM0Zi0yZWZmLTQ1MzktYjdlMy1mMzBjYTRiNTcxOWI" -d -p $2:8080 tradeincbot/bitcointradebot /bin/bash /start
 
 #docker run -it -e coin="ADA" -e sleep="1" -e apache2="on" -e wallet="10" -e apikey="8c5720d6-31d0-41f8-8bf3-33a2895d6adf" -e apisecret="vrLDlJPzc7gUJNghNniJ1SgxGb_C2u1xKNBNOoE1bqBjYTVlZWY5Yy0wYWI2LTRhZTUtOWRmMy02NjQxOWI3ZGZkZmE" -d -p 82:8080 tradeincbot/bitcointradebot /bin/bash /start
 
-done
+#done
