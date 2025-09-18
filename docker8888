@@ -1,5 +1,5 @@
 docker export priceless_shaw > ./latest.tar
 
-cat ./latest.tar | docker import - tradeincbot/profitprofit88888888
+cat ./latest.tar | docker import - phemextradebot/profitprofit88888888
 
-docker push tradeincbot/profitprofit88888888
+docker push phemextradebot/profitprofit88888888
