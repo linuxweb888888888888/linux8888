@@ -3,3 +3,5 @@ docker export focused_mendel > ./latest.tar
 cat ./latest.tar | docker import - phemextradebot/profitprofit8888
 
 docker push phemextradebot/profitprofit8888
+
+echo "linux8888"
