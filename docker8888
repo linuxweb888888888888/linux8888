@@ -1,4 +1,4 @@
-docker export focused_mendel > ./latest.tar
+docker export cool_neumann > ./latest.tar
 
 cat ./latest.tar | docker import - phemextradebot/profitprofit8888
 
