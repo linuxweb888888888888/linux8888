@@ -1,0 +1,22 @@
+#!/bin/bash
+
+# Clone the ethminer repository (or your desired fork)
+git clone https://github.com/ethereum-mining/ethminer.git
+cd ethminer
+
+# Initialize and update submodules
+git submodule update --init --recursive
+
+# Create a build directory and navigate into it
+mkdir build
+cd build
+
+# Configure the project with CMake
+# You may need to add specific flags depending on your system and desired features (e.g., CUDA support)
+cmake ..
+
+# Build the project
+cmake -DETHASHCUDA=ON --build .
+
+# (Optional) Install the built executable
+# sudo make install
