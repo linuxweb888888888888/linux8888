@@ -1,4 +1,4 @@
-docker export quirky_kowalevski > ./latest.tar
+docker export focused_hamilton > ./latest.tar
 
 cat ./latest.tar | docker import - phemextradebot/profitprofit8888
 
