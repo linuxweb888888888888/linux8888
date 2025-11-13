@@ -1,0 +1,395 @@
+"""
+Ultra-Fast Adaptive ATOM/USDT Bot v13
+--------------------------------------
+- First-tick guaranteed trade
+- Adaptive position sizing & predictive closing
+- PnL-aware learning
+- Live Rich console & Material Design HTML dashboard (no charts)
+"""
+
+import ccxt, time, subprocess, threading, numpy as np
+from collections import deque
+from rich.live import Live
+from rich.console import Console
+from rich.table import Table
+from sklearn.preprocessing import StandardScaler
+from sklearn.linear_model import SGDClassifier
+import warnings
+
+warnings.filterwarnings("ignore")
+console = Console()
+
+# ---------------- CONFIG ----------------
+SYMBOL = "ATOM/USDT"
+BASE_AMOUNT_MIN = 0.001
+MAX_POS_SIZE = 0.01
+WINDOW = 3
+ROLLING_HISTORY = 50
+VOL_WINDOW = 3
+MIN_CONFIDENCE_TO_TRADE = 0.05
+DASHBOARD_FPS = 20
+PRICE_FETCH_INTERVAL = 0.05
+MIN_ALLOCATION = 0.1
+MAX_ALLOCATION = 0.9
+MAX_DIRECTION_POSITIONS = 5
+TRADE_LEARNING_WINDOW = 10
+MAX_DISPLAY_POSITIONS = 10
+HTML_FILE = "bot_dashboard.html"
+
+# ---------------- HISTORY ----------------
+price_history = deque(maxlen=ROLLING_HISTORY)
+bid_history = deque(maxlen=ROLLING_HISTORY)
+ask_history = deque(maxlen=ROLLING_HISTORY)
+trade_history = deque(maxlen=ROLLING_HISTORY)
+positions = []
+positions_lock = threading.Lock()
+direction_locked = None
+confidence_display = 0.5
+wallet_allocation = 0.5
+direction_profit_memory = {"buy": deque(maxlen=TRADE_LEARNING_WINDOW),
+                           "sell": deque(maxlen=TRADE_LEARNING_WINDOW)}
+direction_positions_count = {"buy": 1, "sell": 1}
+signal_success_memory = {"buy": deque(maxlen=TRADE_LEARNING_WINDOW),
+                         "sell": deque(maxlen=TRADE_LEARNING_WINDOW)}
+
+scaler = StandardScaler()
+model = SGDClassifier(loss="log_loss", learning_rate="constant", eta0=0.5,
+                      max_iter=5, warm_start=True)
+trained = False
+
+# ---------------- EXCHANGE ----------------
+exchange = ccxt.hitbtc({'enableRateLimit': True})
+
+# ---------------- WALLET ----------------
+def get_wallet_balance_real():
+    try:
+        out = subprocess.run(['bash', 'wallet.sh'], capture_output=True, text=True)
+        return max(float(out.stdout.strip()), 0)
+    except:
+        return 100.0
+
+def get_locked_usdt_real():
+    with positions_lock:
+        return sum([p['size']*p['entry'] for p in positions])
+
+def update_wallet_allocation():
+    global wallet_allocation
+    if not trade_history: return
+    recent_avg_pnl = np.mean(list(trade_history)[-WINDOW:])
+    streak_multiplier = 1 + max(recent_avg_pnl*10, 0)
+    wallet_allocation = np.clip(wallet_allocation*streak_multiplier, MIN_ALLOCATION, MAX_ALLOCATION)
+
+# ---------------- MARKET DATA ----------------
+latest_prices = {'price':0, 'bid':0, 'ask':0, 'mid':0, 'ts':0}
+
+def price_fetch_loop():
+    global latest_prices
+    while True:
+        try:
+            ticker = exchange.fetch_ticker(SYMBOL)
+            bid = float(ticker['bid'])
+            ask = float(ticker['ask'])
+            price = float(ticker['last'])
+            mid = (bid+ask)/2
+            ts = time.time()
+            latest_prices.update({'price': price, 'bid': bid, 'ask': ask, 'mid': mid, 'ts': ts})
+            price_history.append(price)
+            bid_history.append(bid)
+            ask_history.append(ask)
+        except Exception as e:
+            console.log(f"[red]Price Fetch Error:[/red] {e}")
+        time.sleep(PRICE_FETCH_INTERVAL)
+
+# ---------------- INDICATORS ----------------
+def compute_cci(prices):
+    if len(prices)<2: return 0
+    prices = np.array(prices)
+    ma = np.mean(prices)
+    md = np.mean(np.abs(prices-ma)) + 1e-8
+    return (prices[-1]-ma)/(0.015*md)
+
+def get_volatility_scale(prices):
+    if len(prices)<VOL_WINDOW: return 1
+    std = np.std(prices[-VOL_WINDOW:])
+    mean = np.mean(prices[-VOL_WINDOW:]) + 1e-8
+    return min(1, max(0, 1-std/(mean*0.02)))
+
+def boost_confidence_for_momentum(conf, prices):
+    if len(prices)<3: return conf
+    momentum = prices[-1]-prices[-2]
+    boost = min(max(momentum*100,0),0.5)
+    return min(conf+boost,1.0)
+
+# ---------------- PNL SIMULATION ----------------
+def simulate_directional_pnl(direction, price, size=None):
+    if not price_history: return 0
+    if size is None: size = BASE_AMOUNT_MIN
+    momentum = price_history[-1]-price_history[-3] if len(price_history)>=3 else 0
+    vol_scale = get_volatility_scale(list(price_history))
+    predicted_move = momentum*vol_scale*2
+    return predicted_move*size if direction=='buy' else -predicted_move*size
+
+# ---------------- FEATURES & SIGNALS ----------------
+def calculate_pnl(entry, price, side, size):
+    return (price-entry)/entry*size if side=='buy' else (entry-price)/entry*size
+
+def fast_features_tick(prices,bids,asks):
+    n=min(len(prices),WINDOW)
+    mid = np.array([(b+a)/2 for b,a in zip(bids[-n:],asks[-n:])])
+    returns = np.diff(mid,prepend=mid[0])
+    spread = np.array(asks[-n:])-np.array(bids[-n:])
+    cci = np.array([compute_cci(prices[-(n-i):]) for i in range(n)])
+    avg_unrealized = np.mean([calculate_pnl(p['entry'],mid[-1],p['side'],p['size']) for p in positions]) if positions else 0
+    avg_realized = np.mean(list(trade_history)[-WINDOW:]) if trade_history else 0
+    wallet_real = get_wallet_balance_real()
+    buy_success = np.mean(signal_success_memory['buy']) if signal_success_memory['buy'] else 0
+    sell_success = np.mean(signal_success_memory['sell']) if signal_success_memory['sell'] else 0
+    momentum = mid[-1]-mid[0]
+    volatility = np.std(mid)+1e-8
+    extra_features = np.full((len(mid),7),[avg_unrealized,avg_realized,wallet_real,momentum,volatility,buy_success,sell_success])
+    return np.column_stack((mid,returns,spread,cci,extra_features))
+
+def predict_entry_signal(prices,bids,asks):
+    if len(prices)<2: return None,0.5
+    X=fast_features_tick(prices,bids,asks)
+    X_scaled=scaler.fit_transform(X)
+    prob=model.predict_proba(X_scaled)[:,1][-1] if trained else 0.5
+    signal='buy' if prob>0.55 else 'sell' if prob<0.45 else None
+    return signal,prob
+
+def initial_model_training():
+    global trained
+    if len(price_history) < WINDOW: return
+    try:
+        X_init = fast_features_tick(list(price_history), list(bid_history), list(ask_history))
+        y_init = np.array([1 if price_history[i] < price_history[i+1] else 0 for i in range(len(price_history)-1)])
+        X_init = X_init[:len(y_init)]
+        X_scaled = scaler.fit_transform(X_init)
+        model.fit(X_scaled, y_init)
+        trained = True
+        console.log("[green]Initial model training complete.[/green]")
+    except Exception as e:
+        console.log(f"[red]Initial training error:[/red] {e}")
+
+# ---------------- POSITION SIZING ----------------
+def adaptive_position_size(price,conf,direction):
+    wallet = get_wallet_balance_real()
+    locked = get_locked_usdt_real()
+    available = max(wallet-locked,0)
+    if available<BASE_AMOUNT_MIN: return BASE_AMOUNT_MIN
+    base_size=(available*wallet_allocation/price)*conf
+    predicted_gain=simulate_directional_pnl(direction, latest_prices['mid'], BASE_AMOUNT_MIN)
+    gain_multiplier=1+max(predicted_gain,0)
+    base_size*=gain_multiplier
+    recent_pnl=np.mean(list(trade_history)[-TRADE_LEARNING_WINDOW:]) if trade_history else 0
+    pnl_multiplier=1+max(recent_pnl*5,0)
+    base_size*=pnl_multiplier
+    vol_scale=get_volatility_scale(list(price_history))
+    base_size*=max(0.5,vol_scale)
+    max_positions = min(MAX_DIRECTION_POSITIONS*2,max(1,int(1+pnl_multiplier*3+gain_multiplier*2)))
+    direction_positions_count[direction]=max_positions
+    with positions_lock:
+        total_size=sum([p['size'] for p in positions if p['side']==direction])
+    remaining=max(0,MAX_POS_SIZE*max_positions-total_size)
+    size=min(base_size,remaining)
+    return max(BASE_AMOUNT_MIN,size)
+
+def adaptive_stop_take(conf):
+    vol_scale=get_volatility_scale(list(price_history))
+    base_sl,base_tp=0.002,0.002
+    sl=base_sl*(1-conf*0.5)*vol_scale
+    tp=base_tp*(0.5+conf)*vol_scale
+    tp=max(tp,0.0005)
+    return sl,tp
+
+# ---------------- TRADE EXECUTION ----------------
+def try_open_positions(signal,conf,force=False):
+    global direction_locked
+    if not signal or (conf<MIN_CONFIDENCE_TO_TRADE and not force): return None
+    if direction_locked and direction_locked!=signal: return None
+    opened=[]
+    max_positions=direction_positions_count.get(signal,1)
+    for _ in range(max_positions):
+        size=adaptive_position_size(latest_prices['price'],conf,signal)
+        if size<BASE_AMOUNT_MIN: break
+        try:
+            subprocess.run(['bash','placeorder.sh',SYMBOL.split("/")[0],str(size),signal],check=False)
+            with positions_lock:
+                positions.append({'side':signal,'entry':latest_prices['price'],'size':size,'confidence':conf})
+            opened.append(f"{signal.upper()} ({size:.6f})")
+        except Exception as e:
+            console.log(f"[red]Order Error:[/red] {e}")
+            break
+    if opened: direction_locked=signal
+    return ", ".join(opened) if opened else None
+
+def update_positions_tick(price):
+    active=[]
+    with positions_lock:
+        for pos in positions:
+            sl,tp=adaptive_stop_take(pos['confidence'])
+            pnl_val=calculate_pnl(pos['entry'],price,pos['side'],pos['size'])
+            predicted_gain_same=simulate_directional_pnl(pos['side'],price,pos['size'])
+            opposite='sell' if pos['side']=='buy' else 'buy'
+            predicted_gain_opposite=simulate_directional_pnl(opposite,price,pos['size'])
+            if pnl_val<=-sl or pnl_val>=tp or predicted_gain_opposite>predicted_gain_same:
+                side_to_close=opposite
+                try: subprocess.run(['bash','placeorder.sh',SYMBOL.split("/")[0],str(pos['size']),side_to_close],check=False)
+                except: pass
+                trade_history.append(pnl_val)
+                direction_profit_memory[pos['side']].append(pnl_val)
+                signal_success_memory[pos['side']].append(1 if pnl_val>0 else 0)
+            else:
+                active.append(pos)
+        positions[:] = active
+        if not positions: global direction_locked; direction_locked=None
+
+def instant_safe_close(price):
+    active=[]
+    with positions_lock:
+        for pos in positions:
+            pnl_val=calculate_pnl(pos['entry'],price,pos['side'],pos['size'])
+            if pnl_val>=0.0005:
+                side_to_close='sell' if pos['side']=='buy' else 'buy'
+                try: subprocess.run(['bash','placeorder.sh',SYMBOL.split("/")[0],str(pos['size']),side_to_close],check=False)
+                except: pass
+                trade_history.append(pnl_val)
+                direction_profit_memory[pos['side']].append(pnl_val)
+                signal_success_memory[pos['side']].append(1)
+            else: active.append(pos)
+        positions[:] = active
+        if not positions: global direction_locked; direction_locked=None
+
+# ---------------- DASHBOARDS ----------------
+def render_dashboard():
+    table = Table(title=f"{SYMBOL} Ultra-Fast Adaptive Bot v13")
+    table.add_column("Metric", justify="left", style="cyan")
+    table.add_column("Value", justify="right", style="magenta")
+    table.add_row("Current Price", f"{latest_prices['price']:.6f}")
+    table.add_row("Bid / Ask", f"{latest_prices['bid']:.6f} / {latest_prices['ask']:.6f}")
+    table.add_row("Wallet Balance", f"{get_wallet_balance_real():.2f} USDT")
+    table.add_row("Wallet Allocation", f"{wallet_allocation*100:.1f}%")
+    table.add_row("Confidence", f"{confidence_display:.2f}")
+    trend = "⬆️ Buy Momentum" if len(price_history)>=2 and price_history[-1]>price_history[-2] else "⬇️ Sell Momentum"
+    table.add_row("Market Trend", trend)
+    with positions_lock:
+        active_count = len(positions)
+        table.add_row("Open Positions", str(active_count))
+        for pos in positions[:MAX_DISPLAY_POSITIONS]:
+            pnl = calculate_pnl(pos['entry'], latest_prices['price'], pos['side'], pos['size'])
+            pnl_bar_len = 20
+            proportion = min(max(pnl/0.01, -1),1)
+            fill_len = int(pnl_bar_len*abs(proportion))
+            empty_len = pnl_bar_len-fill_len
+            color = "green" if pnl>0 else "red"
+            bar = f"[{color}]{'█'*fill_len}[white]{'░'*empty_len}[/white]"
+            table.add_row(f"{pos['side'].upper()} {pos['size']:.4f}@{pos['entry']:.4f}", f"{bar} {pnl:.4f}")
+    return table
+
+def render_dashboard_html_material():
+    with positions_lock:
+        positions_data = []
+        for pos in positions:
+            pnl = calculate_pnl(pos['entry'], latest_prices['price'], pos['side'], pos['size'])
+            positions_data.append({'side': pos['side'], 'size': pos['size'], 'entry': pos['entry'], 'pnl': pnl})
+    trend = "Buy ⬆️" if len(price_history)>=2 and price_history[-1]>price_history[-2] else "Sell ⬇️"
+
+    html_content = f"""
+    <!DOCTYPE html>
+    <html lang="en">
+    <head>
+        <meta charset="UTF-8">
+        <title>ATOM/USDT Bot Dashboard</title>
+        <link href="https://cdnjs.cloudflare.com/ajax/libs/materialize/1.0.0/css/materialize.min.css" rel="stylesheet">
+        <style>
+            body {{ padding: 20px; background-color: #f5f5f5; }}
+            .pnl-bar {{ height: 16px; border-radius: 4px; }}
+            .pnl-positive {{ background-color: #4caf50; }}
+            .pnl-negative {{ background-color: #f44336; }}
+        </style>
+        <meta http-equiv="refresh" content="10">
+    </head>
+    <body>
+        <h4>ATOM/USDT Ultra-Fast Bot Dashboard</h4>
+        <ul class="collection with-header">
+            <li class="collection-header"><h5>Market Info</h5></li>
+            <li class="collection-item">Current Price: {latest_prices['price']:.6f}</li>
+            <li class="collection-item">Bid / Ask: {latest_prices['bid']:.6f} / {latest_prices['ask']:.6f}</li>
+            <li class="collection-item">Wallet Balance: {get_wallet_balance_real():.2f} USDT</li>
+            <li class="collection-item">Wallet Allocation: {wallet_allocation*100:.1f}%</li>
+            <li class="collection-item">Confidence: {confidence_display:.2f}</li>
+            <li class="collection-item">Market Trend: {trend}</li>
+            <li class="collection-header"><h5>Open Positions ({len(positions_data)})</h5></li>
+    """
+
+    for pos in positions_data:
+        pnl_pct = pos['pnl'] * 100
+        color_class = "pnl-positive" if pnl_pct >= 0 else "pnl-negative"
+        fill_width = min(abs(pnl_pct*100), 100)
+        html_content += f"""
+            <li class="collection-item">
+                {pos['side'].upper()} {pos['size']:.6f} @ {pos['entry']:.6f}
+                <div class="progress">
+                    <div class="determinate {color_class}" style="width:{fill_width}%"></div>
+                </div>
+                PnL: {pos['pnl']:.6f}
+            </li>
+        """
+
+    html_content += """
+        </ul>
+    </body>
+    </html>
+    """
+
+    with open(HTML_FILE, "w") as f:
+        f.write(html_content)
+
+# ---------------- MAIN LOOP ----------------
+threading.Thread(target=price_fetch_loop, daemon=True).start()
+
+with Live(console=console, refresh_per_second=DASHBOARD_FPS) as live:
+    last_ts = None
+    last_html_update = 0
+    HTML_REFRESH_INTERVAL = 10  # seconds
+
+    while True:
+        try:
+            price = latest_prices['price']
+            ts = latest_prices['ts']
+            if price == 0 or ts == last_ts:
+                time.sleep(0.005)
+                continue
+            last_ts = ts
+
+            # First tick guaranteed trade
+            if not positions:
+                initial_model_training()
+                signal='buy' if price_history[-1]>=price_history[0] else 'sell'
+                try_open_positions(signal,1.0,force=True)
+
+            # Predictive trade
+            signal, predicted_conf = predict_entry_signal(list(price_history), list(bid_history), list(ask_history))
+            alpha = min(1, max(0.1, get_volatility_scale(list(price_history))))
+            confidence_display = (1-alpha)*confidence_display + alpha*predicted_conf
+            confidence_display = boost_confidence_for_momentum(confidence_display, list(price_history))
+            try_open_positions(signal, confidence_display)
+
+            # Update positions & wallet
+            update_positions_tick(price)
+            instant_safe_close(price)
+            update_wallet_allocation()
+
+            # Fast console update
+            live.update(render_dashboard())
+
+            # HTML dashboard every 10 seconds
+            now = time.time()
+            if now - last_html_update >= HTML_REFRESH_INTERVAL:
+                render_dashboard_html_material()
+                last_html_update = now
+
+            time.sleep(0.005)
+        except Exception as e:
+            console.log(f"[red]Main Loop Error:[/red] {e}")
+            time.sleep(0.01)
