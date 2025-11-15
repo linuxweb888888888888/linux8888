@@ -76,7 +76,6 @@ def get_coin_real_info():
         info = result.stdout.strip().split()
         if len(info) < 3: return None
 
-        # Safe conversion to float
         try:
             entry = float(info[0])
             qty   = float(info[1])
@@ -209,8 +208,23 @@ def simulate_background(signal, mid):
 # ============================
 # DASHBOARD
 # ============================
+last_wallet_delta = 0
+last_wallet_delta_percent = 0
+
 def render_dashboard(signal, pred, conf, bid, ask, mid, wallet, wallet_delta, wallet_delta_percent):
+    global last_wallet_delta, last_wallet_delta_percent, prev_wallet
     try:
+        # Update wallet delta values based on actual wallet changes
+        if prev_wallet is not None:
+            last_wallet_delta = wallet - prev_wallet
+            last_wallet_delta_percent = (last_wallet_delta / prev_wallet * 100) if prev_wallet else 0
+        else:
+            last_wallet_delta = 0
+            last_wallet_delta_percent = 0
+
+        display_wallet_delta = last_wallet_delta
+        display_wallet_delta_percent = last_wallet_delta_percent
+
         positions_html = ""
         for idx, pos in enumerate(open_positions):
             pnl = pos.get('realized_pnl', 0)
@@ -226,8 +240,9 @@ def render_dashboard(signal, pred, conf, bid, ask, mid, wallet, wallet_delta, wa
 
         sims_html = f"<p>Background Simulations: {len(background_sim_positions)}</p>"
 
-        wallet_color = "green" if wallet_delta >= 0 else "red"
-        wallet_sign = "+" if wallet_delta >= 0 else "-"
+        # Wallet change indicator: green if positive, red if negative, grey if no change
+        wallet_color = "green" if display_wallet_delta > 0 else "red" if display_wallet_delta < 0 else "grey"
+        wallet_sign = "+" if display_wallet_delta > 0 else "-" if display_wallet_delta < 0 else ""
 
         if pred > 0:
             pred_text = f"Price expected to rise ↑ ({pred:.8f})"
@@ -246,7 +261,7 @@ def render_dashboard(signal, pred, conf, bid, ask, mid, wallet, wallet_delta, wa
             <div class=\"card\"><h3>Mid Price</h3><p>{mid:.8f}</p></div>
             <div class=\"card\"><h3>Wallet (USDT)</h3>
                 <p style=\"color:{wallet_color};\">
-                    {wallet:.8f} ({wallet_sign}{abs(wallet_delta):.8f}, {wallet_sign}{abs(wallet_delta_percent):.2f}%)
+                    {wallet:.8f} ({wallet_sign}{abs(display_wallet_delta):.8f}, {wallet_sign}{abs(display_wallet_delta_percent):.2f}%)
                 </p>
             </div>
             <div class=\"card\"><h3>Open Positions</h3><p>{len(open_positions)}</p></div>
@@ -300,7 +315,7 @@ def render_dashboard(signal, pred, conf, bid, ask, mid, wallet, wallet_delta, wa
         table.add_row("Bid", f"{bid:.8f}")
         table.add_row("Ask", f"{ask:.8f}")
         table.add_row("Mid Price", f"{mid:.8f}")
-        table.add_row("Wallet (USDT)", f"{wallet:.8f} ({wallet_sign}{abs(wallet_delta):.8f}, {wallet_sign}{abs(wallet_delta_percent):.2f}%)")
+        table.add_row("Wallet (USDT)", f"{wallet:.8f} ({wallet_sign}{abs(display_wallet_delta):.8f}, {wallet_sign}{abs(display_wallet_delta_percent):.2f}%)")
         table.add_row("Open Positions", str(len(open_positions)))
         for idx, pos in enumerate(open_positions):
             table.add_row(f"Pos{idx+1} {pos['side']}", f"Qty={pos['qty']:.6f} Entry={pos['entry']:.6f} PnL={pos.get('realized_pnl',0):.8f}")
@@ -333,8 +348,6 @@ def main():
                 bid, ask, mid = get_bid_ask_mid()
                 wallet = get_wallet_balance()
                 if prev_wallet is None: prev_wallet = wallet
-                wallet_delta = wallet - prev_wallet
-                wallet_delta_percent = (wallet_delta / prev_wallet * 100) if prev_wallet else 0
                 pred, conf = predict_pnl_direction(df)
                 simulate_background(cci_signal, mid)
                 close_positions_if_profitable()
@@ -344,6 +357,8 @@ def main():
                     qty = calc_order_qty(wallet, entry_price, pred/mid)
                     if qty>=MIN_QTY and execute_real_order(cci_signal, qty):
                         add_position(cci_signal, qty, entry_price)
+                wallet_delta = wallet - prev_wallet
+                wallet_delta_percent = (wallet_delta / prev_wallet * 100) if prev_wallet else 0
                 panel = render_dashboard(cci_signal, pred, conf, bid, ask, mid, wallet, wallet_delta, wallet_delta_percent)
                 live.update(panel)
                 prev_wallet = wallet
