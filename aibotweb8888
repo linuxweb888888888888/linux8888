@@ -64,18 +64,20 @@ def get_wallet_balance():
     try:
         if not os.path.exists("/wallet.sh"):
             console.print("[red]ERROR: wallet.sh not found[/red]")
-            return 0,0,0
+            return 0, 0, 0
         result = subprocess.run(["bash", "/wallet.sh"], capture_output=True, text=True)
-        wallet = float(result.stdout.strip().split()[0])
+        wallet = float(result.stdout.strip())
         if previous_wallet is None:
-            previous_wallet = wallet
-        delta = wallet - previous_wallet
-        delta_percent = (delta / previous_wallet * 100) if previous_wallet != 0 else 0
+            delta = 0
+            delta_percent = 0
+        else:
+            delta = wallet - previous_wallet
+            delta_percent = (delta / previous_wallet * 100) if previous_wallet != 0 else 0
         previous_wallet = wallet
         return wallet, delta, delta_percent
     except Exception as e:
         console.print(f"[red]Wallet fetch error: {e}[/red]")
-        return 0,0,0
+        return 0, 0, 0
 
 def get_coin_real_info():
     try:
@@ -213,22 +215,15 @@ def close_positions_if_profitable(bid, ask, mid):
 
 def simulate_background(signal, mid):
     global background_sim_positions
-    if signal in ["buy","sell"]:
+    if signal in ["buy", "sell"]:
         background_sim_positions.append({"side": signal, "entry": mid})
-    new = []
-    for pos in background_sim_positions:
-        pnl = (mid - pos["entry"]) if pos["side"]=="buy" else (pos["entry"]-mid)
-        if pnl <= 0:
-            new.append(pos)
-    background_sim_positions = new
+    # keep all positions
 
 # ============================
 # DASHBOARD
 # ============================
 def render_dashboard(signal, pred, conf, bid, ask, mid, wallet, wallet_delta, wallet_delta_percent):
     try:
-        wallet_change_str = f"<span style='color:{'green' if wallet_delta>=0 else 'red'};'>{'+' if wallet_delta>=0 else ''}{wallet_delta:.8f} ({'+' if wallet_delta_percent>=0 else ''}{wallet_delta_percent:.2f}%)</span>"
-
         positions_html = ""
         for idx, pos in enumerate(open_positions):
             pnl = pos.get('realized_pnl', 0)
@@ -244,6 +239,8 @@ def render_dashboard(signal, pred, conf, bid, ask, mid, wallet, wallet_delta, wa
 
         sims_html = f"<p>Background Simulations: {len(background_sim_positions)}</p>"
 
+        wallet_color = "green" if wallet_delta >= 0 else "red"
+        wallet_sign = "+" if wallet_delta >= 0 else "-"
         metrics_html = f"""
         <div class="metrics">
             <div class="card"><h3>Signal</h3><p>{signal}</p></div>
@@ -252,7 +249,7 @@ def render_dashboard(signal, pred, conf, bid, ask, mid, wallet, wallet_delta, wa
             <div class="card"><h3>Bid</h3><p>{bid:.8f}</p></div>
             <div class="card"><h3>Ask</h3><p>{ask:.8f}</p></div>
             <div class="card"><h3>Mid Price</h3><p>{mid:.8f}</p></div>
-            <div class="card"><h3>Wallet (USDT)</h3><p>{wallet:.8f} {wallet_change_str}</p></div>
+            <div class="card"><h3>Wallet (USDT)</h3><p>{wallet:.8f} ({wallet_sign}{abs(wallet_delta):.8f}, {wallet_sign}{abs(wallet_delta_percent):.2f}%)</p></div>
             <div class="card"><h3>Open Positions</h3><p>{len(open_positions)}</p></div>
         </div>
         """
@@ -304,7 +301,7 @@ def render_dashboard(signal, pred, conf, bid, ask, mid, wallet, wallet_delta, wa
         table.add_row("Bid", f"{bid:.8f}")
         table.add_row("Ask", f"{ask:.8f}")
         table.add_row("Mid Price", f"{mid:.8f}")
-        table.add_row("Wallet (USDT)", f"{wallet:.8f} {'+' if wallet_delta>=0 else ''}{wallet_delta:.8f} ({'+' if wallet_delta_percent>=0 else ''}{wallet_delta_percent:.2f}%)")
+        table.add_row("Wallet (USDT)", f"{wallet:.8f} ({wallet_sign}{abs(wallet_delta):.8f}, {wallet_sign}{abs(wallet_delta_percent):.2f}%)")
         table.add_row("Open Positions", str(len(open_positions)))
         for idx, pos in enumerate(open_positions):
             table.add_row(f"Pos{idx+1} {pos['side']}", f"Qty={pos['qty']:.6f} Entry={pos['entry']:.6f} PnL={pos.get('realized_pnl',0):.8f}")
@@ -365,9 +362,9 @@ def main():
                 console.print(traceback.format_exc())
                 time.sleep(3)
 
-
 if __name__ == "__main__":
     main()
+
 
 
 
