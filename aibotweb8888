@@ -426,6 +426,7 @@ if __name__ == "__main__":
   # Blank dashboard.html in browser
   # Buy/sell loop not starting
   # Library errors/exceptions/warnings for numpy, pandas, sklearn
+  # wallet change feature show increased or decreased profit or loss in percentage not cumulating or decumalating
 # Make script ready to run
 # Always place real trades when profitable; never dry run
 # Enable multi-sizing and multi-positions
