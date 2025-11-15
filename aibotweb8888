@@ -75,7 +75,16 @@ def get_coin_real_info():
         result = subprocess.run(["bash", "/coinrealinfo.sh", BASE+QUOTE+"_PERP"], capture_output=True, text=True)
         info = result.stdout.strip().split()
         if len(info) < 3: return None
-        return {"entry": float(info[0]), "qty": float(info[1]), "pnl": float(info[2])}
+
+        # Safe conversion to float
+        try:
+            entry = float(info[0])
+            qty   = float(info[1])
+            pnl   = float(info[2])
+        except ValueError:
+            return None
+
+        return {"entry": entry, "qty": qty, "pnl": pnl}
     except Exception as e:
         console.print(f"[red]Coin info fetch error: {e}[/red]")
         return None
@@ -195,7 +204,6 @@ def simulate_background(signal, mid):
     global background_sim_positions
     if signal in ['buy','sell']:
         background_sim_positions.append({"side": signal, "entry": mid})
-    # Remove losing background positions
     background_sim_positions = [p for p in background_sim_positions if (mid - p['entry'] if p['side']=='buy' else p['entry'] - mid)<=0]
 
 # ============================
@@ -350,6 +358,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
 
