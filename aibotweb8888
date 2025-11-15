@@ -40,9 +40,7 @@ exchange = ccxt.hitbtc({"enableRateLimit": True})
 # ============================
 open_positions = []
 background_sim_positions = []
-signal_history = []
 profit_history = []
-accuracy_history = []
 model = SGDRegressor(max_iter=1, tol=None, learning_rate="invscaling", eta0=0.01, warm_start=True)
 model_initialized = False
 prev_wallet = None
@@ -169,11 +167,9 @@ def update_real_pnl():
     coin_info = get_coin_real_info()
     for pos in open_positions:
         if coin_info:
-            try:
-                pos['qty'] = coin_info['qty']
-                pos['entry'] = coin_info['entry']
-                pos['realized_pnl'] = coin_info['pnl']
-            except: continue
+            pos['qty'] = coin_info['qty']
+            pos['entry'] = coin_info['entry']
+            pos['realized_pnl'] = coin_info['pnl']
         else:
             bid, ask, mid = get_bid_ask_mid()
             pos['realized_pnl'] = ((bid - pos['entry'])*pos['qty'] - bid*pos['qty']*FEE_RATE) if pos['side']=='buy' else ((pos['entry'] - ask)*pos['qty'] - ask*pos['qty']*FEE_RATE)
@@ -338,7 +334,8 @@ def main():
                 if cci_signal in ['buy','sell'] and conf>CONF_THRESHOLD:
                     entry_price = bid if cci_signal=='buy' else ask
                     qty = calc_order_qty(wallet, entry_price, pred/mid)
-                    if qty>=MIN_QTY and execute_real_order(cci_signal, qty): add_position(cci_signal, qty, entry_price)
+                    if qty>=MIN_QTY and execute_real_order(cci_signal, qty):
+                        add_position(cci_signal, qty, entry_price)
                 panel = render_dashboard(cci_signal, pred, conf, bid, ask, mid, wallet, wallet_delta, wallet_delta_percent)
                 live.update(panel)
                 prev_wallet = wallet
@@ -353,6 +350,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
 
