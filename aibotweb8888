@@ -1,0 +1,467 @@
+#!/usr/bin/env python3
+import ccxt
+import time
+import numpy as np
+import pandas as pd
+from rich.console import Console
+from rich.table import Table
+from rich.panel import Panel
+from rich.live import Live
+from sklearn.linear_model import SGDRegressor
+import subprocess
+import traceback
+import os
+
+console = Console()
+
+# ============================
+# CONFIG
+# ============================
+SYMBOL = "ATOM/USDT"
+BASE = "ATOM"
+QUOTE = "USDT"
+MIN_QTY = 0.001
+MAX_POSITIONS = 10
+FEE_RATE = 0.001
+WALLET_RISK = 0.35
+UPDATE_INTERVAL = 5
+MODEL_WINDOW = 50
+CONF_THRESHOLD = 0.3
+MAX_CONFIDENCE = 1
+HTML_DASHBOARD_FILE = "/var/www/html/dashboard.html"
+
+# ============================
+# EXCHANGE INIT
+# ============================
+exchange = ccxt.hitbtc({"enableRateLimit": True})
+
+# ============================
+# STATE
+# ============================
+open_positions = []
+background_sim_positions = []
+signal_history = []
+profit_history = []
+accuracy_history = []
+model = SGDRegressor(max_iter=1, tol=None, learning_rate="invscaling", eta0=0.01, warm_start=True)
+model_initialized = False
+previous_wallet = None
+
+# ============================
+# DATA FUNCTIONS
+# ============================
+def get_ohlcv():
+    try:
+        data = exchange.fetch_ohlcv(SYMBOL, timeframe="1m", limit=MODEL_WINDOW)
+        df = pd.DataFrame(data, columns=["time","open","high","low","close","volume"])
+        return df
+    except Exception as e:
+        console.print(f"[red]OHLCV Error: {e}[/red]")
+        return None
+
+def get_wallet_balance():
+    global previous_wallet
+    try:
+        if not os.path.exists("/wallet.sh"):
+            console.print("[red]ERROR: wallet.sh not found[/red]")
+            return 0,0,0
+        result = subprocess.run(["bash", "/wallet.sh"], capture_output=True, text=True)
+        wallet = float(result.stdout.strip().split()[0])
+        if previous_wallet is None:
+            previous_wallet = wallet
+        delta = wallet - previous_wallet
+        delta_percent = (delta / previous_wallet * 100) if previous_wallet != 0 else 0
+        previous_wallet = wallet
+        return wallet, delta, delta_percent
+    except Exception as e:
+        console.print(f"[red]Wallet fetch error: {e}[/red]")
+        return 0,0,0
+
+def get_coin_real_info():
+    try:
+        if not os.path.exists("/coinrealinfo.sh"):
+            return None
+        result = subprocess.run(["bash", "/coinrealinfo.sh", BASE+QUOTE+"_PERP"], capture_output=True, text=True)
+        info = result.stdout.strip().split()
+        if len(info) >= 3:
+            return {
+                "qty": float(info[0]),
+                "entry_price": float(info[1]),
+                "unrealized_pnl": float(info[2])
+            }
+        return None
+    except Exception as e:
+        console.print(f"[red]Coin info error: {e}[/red]")
+        return None
+
+def get_bid_ask_mid():
+    try:
+        ticker = exchange.fetch_ticker(SYMBOL)
+        bid = ticker['bid']
+        ask = ticker['ask']
+        if bid == ask:
+            ask += 0.0001
+        mid = (bid + ask) / 2
+        return bid, ask, mid
+    except Exception as e:
+        console.print(f"[red]Bid/Ask fetch error: {e}[/red]")
+        return 0,0,0
+
+# ============================
+# SIGNAL & MODEL
+# ============================
+def train_model_incremental(df):
+    global model_initialized
+    try:
+        df['mid'] = (df['high'] + df['low'])/2
+        X = np.arange(len(df)).reshape(-1,1)
+        y = df['mid'].values
+        if not model_initialized:
+            model.partial_fit(X, y)
+            model_initialized = True
+        else:
+            model.partial_fit(X[-5:], y[-5:])
+    except Exception as e:
+        console.print(f"[red]Model training error: {e}[/red]")
+
+def predict_pnl_direction(df):
+    if not model_initialized:
+        return 0, 0
+    try:
+        df['mid'] = (df['high'] + df['low'])/2
+        current = df['mid'].iloc[-1]
+        X_future = np.array([[len(df)]])
+        pred = model.predict(X_future)[0]
+        change = pred - current
+        confidence = min(MAX_CONFIDENCE, abs(change)/(current*0.01))
+        return change, confidence
+    except Exception as e:
+        console.print(f"[red]Prediction error: {e}[/red]")
+        return 0, 0
+
+def get_signal(df):
+    typical = (df['high'] + df['low'] + df['close'])/3
+    sma = typical.rolling(20).mean()
+    mad = typical.rolling(20).apply(lambda x: np.mean(np.abs(x - np.mean(x))), raw=True)
+    cci = (typical - sma)/(0.015 * mad)
+    last_cci = cci.iloc[-1]
+    if last_cci > 100:
+        return "buy"
+    elif last_cci < -100:
+        return "sell"
+    return "hold"
+
+# ============================
+# ORDER & POSITION FUNCTIONS
+# ============================
+def execute_real_order(side, qty):
+    qty_str = f"{qty:.6f}"
+    try:
+        if not os.path.exists("/placeorder.sh"):
+            console.print("[red]ERROR: placeorder.sh not found[/red]")
+            return False
+        result = subprocess.run(["bash", "/placeorder.sh", BASE, qty_str, side], capture_output=True, text=True)
+        out = result.stdout.strip()
+        if "SUCCESS" in out.upper():
+            return True
+        else:
+            console.print(f"[red]Order failed: {out}[/red]")
+            return False
+    except Exception as e:
+        console.print(f"[red]Execution error: {e}[/red]")
+        return False
+
+def calc_order_qty(wallet, price, predicted_profit=0):
+    use_usdt = wallet * WALLET_RISK
+    qty = use_usdt / price
+    qty *= (1 + predicted_profit*5)
+    qty = max(MIN_QTY, np.floor(qty*1000)/1000)
+    return qty
+
+def add_position(side, qty, price):
+    if len(open_positions) < MAX_POSITIONS:
+        open_positions.append({
+            "side": side,
+            "qty": qty,
+            "entry": price,
+            "time": time.time(),
+            "realized_pnl": 0
+        })
+
+def close_positions_if_profitable(bid, ask, mid):
+    global open_positions, profit_history
+    keep = []
+    cycle_pnl = 0
+    for pos in open_positions:
+        if pos["side"]=="buy":
+            pnl = (bid - pos["entry"])*pos["qty"]
+        else:
+            pnl = (pos["entry"]-ask)*pos["qty"]
+        pnl_after_fee = pnl - abs(mid*pos["qty"]*FEE_RATE)
+        pos['realized_pnl'] = pnl_after_fee
+        if pnl_after_fee > 0:
+            side = "sell" if pos["side"]=="buy" else "buy"
+            if execute_real_order(side, pos["qty"]):
+                console.print(f"[green]Closed profitable {side} qty={pos['qty']} pnl={pnl_after_fee:.8f}[/green]")
+                cycle_pnl += pnl_after_fee
+            else:
+                keep.append(pos)
+        else:
+            keep.append(pos)
+    open_positions = keep
+    profit_history.append(sum([p['realized_pnl'] for p in open_positions]) + cycle_pnl)
+
+def simulate_background(signal, mid):
+    global background_sim_positions
+    if signal in ["buy","sell"]:
+        background_sim_positions.append({"side": signal, "entry": mid})
+    new = []
+    for pos in background_sim_positions:
+        pnl = (mid - pos["entry"]) if pos["side"]=="buy" else (pos["entry"]-mid)
+        if pnl <= 0:
+            new.append(pos)
+    background_sim_positions = new
+
+# ============================
+# DASHBOARD
+# ============================
+def render_dashboard(signal, pred, conf, bid, ask, mid, wallet, wallet_delta, wallet_delta_percent):
+    try:
+        wallet_change_str = f"<span style='color:{'green' if wallet_delta>=0 else 'red'};'>{'+' if wallet_delta>=0 else ''}{wallet_delta:.8f} ({'+' if wallet_delta_percent>=0 else ''}{wallet_delta_percent:.2f}%)</span>"
+
+        positions_html = ""
+        for idx, pos in enumerate(open_positions):
+            pnl = pos.get('realized_pnl', 0)
+            pnl_color = "green" if pnl > 0 else "red" if pnl < 0 else "black"
+            positions_html += f"""
+            <div class=\"card\">
+                <h3>Position {idx+1} ({pos['side'].upper()})</h3>
+                <p>Qty: {pos['qty']:.6f}</p>
+                <p>Entry: {pos['entry']:.6f}</p>
+                <p>PnL: <span style=\"color:{pnl_color};\">{pnl:.8f}</span></p>
+            </div>
+            """
+
+        sims_html = f"<p>Background Simulations: {len(background_sim_positions)}</p>"
+
+        metrics_html = f"""
+        <div class="metrics">
+            <div class="card"><h3>Signal</h3><p>{signal}</p></div>
+            <div class="card"><h3>Prediction Δ</h3><p>{pred:.8f}</p></div>
+            <div class="card"><h3>Confidence</h3><p>{conf:.2f}</p></div>
+            <div class="card"><h3>Bid</h3><p>{bid:.8f}</p></div>
+            <div class="card"><h3>Ask</h3><p>{ask:.8f}</p></div>
+            <div class="card"><h3>Mid Price</h3><p>{mid:.8f}</p></div>
+            <div class="card"><h3>Wallet (USDT)</h3><p>{wallet:.8f} {wallet_change_str}</p></div>
+            <div class="card"><h3>Open Positions</h3><p>{len(open_positions)}</p></div>
+        </div>
+        """
+
+        profit_html = "<div class='card'><h3>Profit History</h3><ul>"
+        for idx, pnl in enumerate(profit_history[-10:]):
+            color = "green" if pnl >=0 else "red"
+            profit_html += f"<li style='color:{color};'>Cycle {len(profit_history)-10+idx+1}: {pnl:.8f}</li>"
+        profit_html += "</ul></div>"
+
+        html_content = f"""
+        <html>
+        <head>
+            <meta charset="utf-8">
+            <link href="https://fonts.googleapis.com/icon?family=Material+Icons" rel="stylesheet">
+            <link href="https://fonts.googleapis.com/css?family=Roboto:400,500,700" rel="stylesheet">
+            <style>
+                body {{ font-family: 'Roboto', sans-serif; background: #f5f5f5; margin:0; padding:0; }}
+                h1 {{ text-align:center; color:#3f51b5; margin-top:20px; }}
+                .metrics {{ display:flex; flex-wrap:wrap; justify-content:center; margin:20px; }}
+                .card {{ background:#fff; border-radius:8px; padding:15px; margin:10px; min-width:150px; box-shadow:0 4px 6px rgba(0,0,0,0.1); }}
+                .positions {{ display:flex; flex-wrap:wrap; justify-content:center; margin:20px; }}
+                .positions .card {{ min-width:200px; }}
+                ul {{ padding-left:20px; }}
+                p {{ margin:5px 0; font-size:14px; }}
+            </style>
+        </head>
+        <body>
+            <h1>ATOM Trading Bot Dashboard</h1>
+            {metrics_html}
+            {profit_html}
+            <div class="positions">
+                {positions_html}
+            </div>
+            <div class="footer" style="text-align:center; margin:20px;">{sims_html}</div>
+        </body>
+        </html>
+        """
+
+        with open(HTML_DASHBOARD_FILE, "w") as f:
+            f.write(html_content)
+
+        table = Table(title="ATOM Trading Bot Dashboard")
+        table.add_column("Metric")
+        table.add_column("Value")
+        table.add_row("Signal", signal)
+        table.add_row("Prediction Δ", f"{pred:.8f}")
+        table.add_row("Confidence", f"{conf:.2f}")
+        table.add_row("Bid", f"{bid:.8f}")
+        table.add_row("Ask", f"{ask:.8f}")
+        table.add_row("Mid Price", f"{mid:.8f}")
+        table.add_row("Wallet (USDT)", f"{wallet:.8f} {'+' if wallet_delta>=0 else ''}{wallet_delta:.8f} ({'+' if wallet_delta_percent>=0 else ''}{wallet_delta_percent:.2f}%)")
+        table.add_row("Open Positions", str(len(open_positions)))
+        for idx, pos in enumerate(open_positions):
+            table.add_row(f"Pos{idx+1} {pos['side']}", f"Qty={pos['qty']:.6f} Entry={pos['entry']:.6f} PnL={pos.get('realized_pnl',0):.8f}")
+        for idx, pnl in enumerate(profit_history[-10:]):
+            table.add_row(f"Profit Cycle {len(profit_history)-10+idx+1}", f"{pnl:.8f}")
+        return Panel(table, title="Status")
+
+    except Exception as e:
+        console.print(f"[red]Dashboard render error: {e}[/red]")
+        return Panel("[red]Dashboard Error[/red]")
+
+# ============================
+# MAIN LOOP
+# ============================
+def main():
+    console.print("[green]Starting ATOM/USDT bot...[/green]")
+    try:
+        if os.path.exists("/closepositions.sh"):
+            subprocess.run(["bash","/closepositions.sh"], check=True)
+    except:
+        pass
+
+    with Live(refresh_per_second=4) as live:
+        while True:
+            try:
+                df = get_ohlcv()
+                if df is None or len(df)<MODEL_WINDOW:
+                    time.sleep(2)
+                    continue
+
+                train_model_incremental(df)
+                cci_signal = get_signal(df)
+                bid, ask, mid = get_bid_ask_mid()
+                wallet, wallet_delta, wallet_delta_percent = get_wallet_balance()
+                pred, conf = predict_pnl_direction(df)
+
+                simulate_background(cci_signal, mid)
+                close_positions_if_profitable(bid, ask, mid)
+
+                if abs(pred) < mid*0.0003:
+                    cci_signal = "hold"
+
+                if cci_signal in ["buy","sell"] and conf > CONF_THRESHOLD:
+                    entry_price = ask if cci_signal=="buy" else bid
+                    qty = calc_order_qty(wallet, entry_price, predicted_profit=pred/mid)
+                    if qty >= MIN_QTY and execute_real_order(cci_signal, qty):
+                        add_position(cci_signal, qty, entry_price)
+
+                panel = render_dashboard(cci_signal, pred, conf, bid, ask, mid, wallet, wallet_delta, wallet_delta_percent)
+                live.update(panel)
+                time.sleep(UPDATE_INTERVAL)
+
+            except KeyboardInterrupt:
+                console.print("[yellow]Stopped by user[/yellow]")
+                break
+            except Exception as e:
+                console.print(f"[red]Error loop: {e}[/red]")
+                console.print(traceback.format_exc())
+                time.sleep(3)
+
+
+if __name__ == "__main__":
+    main()
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+####UPGRADE BOT WITH ALL FEATURES####
+
+# Use coin minimum quantity for scaling and when increasing/decreasing positions
+# Do not open real positions smaller than the minimum coin quantity of 0.001 for ATOM
+# Continuously learn and adapt
+# Generate trading signals faster
+# Scale order positions for maximum profit
+# Increase wallet gains according to predicted profit
+# Achieve fast USDT wallet growth
+# Place order quantity based on wallet usage; justify amounts and adapt dynamically
+# Improve wallet learning for maximum profit
+# Get wallet balance from wallet.sh in USDT
+# Learn for stacked positions in one direction
+# Improve open trade (opentrade) learning
+# Use only a terminal rich dashboard
+# Output order results via placeorder.sh – show SUCCESS if orders successful, ERROR if not
+# Learn wallet amount according to profit and adapt
+# Simulate background positions to improve learning and adapt to real PnL and profit
+# Place orders faster with signal updates
+# Write output to HTML dashboard at /var/www/html/dashboard.html using a static Material Design clean layout (no charts)
+# Open trades based on wallet amount and calculate for maximum profit
+# Add confidence and accuracy to predictions
+# Check calculations to ensure order placement within 1 minute
+# Calculate wallet threshold before placing orders; use only enough quantity to increase profit
+# Calculate and learn profitable trades; adapt using background simulated trades
+# Use wallet amount to calculate open trades and quantity with PnL prediction for maximum profit
+# Never use Plotly
+# Place real orders via placeorder.sh
+# Improve PnL learning and open trade performance
+# Take profit when PnL covers fees or predicted profit can be made; close positions accordingly
+# Material Design dashboard must be static, updated with information only
+# Focus on ATOM only (no multi-symbol trading)
+# Direction mapping: buy = long = uptrend, sell = short = downtrend
+# Learn and adapt minimum open position (0.001 ATOM)
+# Use bid and ask for mid and real prices; adapt and learn
+# Fix issues:
+  # Module 'sklearn' has no attribute 'SGDRegressor'
+  # KeyErrors
+  # Background simulations
+  # Dashboard not writing HTML data
+  # Blank dashboard.html in browser
+  # Buy/sell loop not starting
+  # Library errors/exceptions/warnings for numpy, pandas, sklearn
+# Make script ready to run
+# Always place real trades when profitable; never dry run
+# Enable multi-sizing and multi-positions
+# Increase learning to grow USDT wallet
+# When wallet usage is full, check where positions can be closed and opened for maximum profit; adapt accordingly
+# Continuously learn PnL
+# add real pnl for each entryprice trade
+# trade in smaller quantity but with more profitable predictions and profit
+# fix profit hitory trend make readable
+# make prediction human readable in dashboard
+# show signal accuracy in dashboard for prediction
+# close all trades with bash script closepositions.sh when start bot
+# calculate real accurate pnl for calculations
+# upgrade html dashboard make more advanced
+# upgrade bot make more advanced
+# quantity can only be in steps of 0.001 or minimum quantity of coin learn and adapt for increasing or decreasing positions
+# entryprice when order place is current bid or ask price calculate learn and adapt calculate according to direction
+# bid and ask should not be the same price ord mid price learn and adapt
+# when opening trade use current bid or ask for entryprice according to direction learn and adapt
+# display pnl in html dashboard in decimal stil use real prices and pnl and other real factors
+# while opening orders make the prices stil update while opening trades or orders
+#calculate learning and adaptiveness on the updated decimals and try to improve accuraccy and profit and wallet growth and pnl prediction stil use real prices and pnl and other real factors
+# if direction sell calculate pnl with bid price if direction buy calculate pnl with ask price learning accordingly and adapt
+# if open position direction sell entryprice should be ask price and if open position direction buy entryprice should be bid price calculate pnl according learn and adapt
+# use coinrealinfo.sh for accurate learning and accurate adapting real open trade can be calculated with quantity can also get real pnl and learn from that also the entryprice is in coinrealinfo.sh can run the bash script with bash /coinrealinfo.sh ATOMUSDT_PERP only need coin name to get info like ATOMUSDT_PERP use the info to adapt and learn to calculate accurate calculations fot profit and other metrics and factors learn and adapt acording all this is for all open position and almost like a summary
+# if coinrealinfo.sh pnl not available calculate with entryprice in coinrealinfo.sh should get accurate pnl then
+# use only coinrealinfo.sh entryprice for total pnl and profit calculate all other learning and adapt and all other profit methods and all other calculations according to making profit including everything else
