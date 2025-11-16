@@ -155,12 +155,10 @@ def predict_pnl_direction(df):
         pred = model.predict(X_future)[0]
         change = pred - mid
 
-        # =============================
-        # FIXED CONFIDENCE CALC
-        # =============================
+        # Confidence calculation
         confidence = min(MAX_CONFIDENCE, abs(change) / (mid * 0.002))  # 0.2% threshold
 
-        # background sim effect
+        # Background sim effect
         sim_effect = 0
         for pos in background_sim_positions:
             sim_effect += (mid - pos['entry']) if pos['side']=='buy' else (pos['entry'] - mid)
@@ -214,9 +212,16 @@ def calc_order_qty(wallet, price, predicted_profit=0):
     qty = max(MIN_QTY, np.floor(qty*1000)/1000)
     return qty
 
-def add_position(side, qty, entry_price):
+def add_position(side, qty, entry_price, predicted_pnl=0.0):
     if len(open_positions) < MAX_POSITIONS:
-        open_positions.append({"side": side, "qty": qty, "entry": entry_price, "time": time.time(), "realized_pnl": 0})
+        open_positions.append({
+            "side": side,
+            "qty": qty,
+            "entry": entry_price,
+            "time": time.time(),
+            "realized_pnl": 0,
+            "predicted_pnl": predicted_pnl
+        })
 
 def update_real_pnl():
     coin_info = get_coin_real_info()
@@ -227,7 +232,6 @@ def update_real_pnl():
             pos['entry'] = coin_info['entry']
             pos['realized_pnl'] = coin_info['pnl']
         else:
-            # If no open positions tracked, create one based on real info
             if coin_info['qty'] >= MIN_QTY:
                 side = 'buy' if coin_info['qty'] > 0 else 'sell'
                 add_position(side, abs(coin_info['qty']), coin_info['entry'])
@@ -244,7 +248,10 @@ def simulate_background(signal, mid, n_trades=3):
     for _ in range(n_trades):
         sim_side = signal if signal in ['buy','sell'] else random.choice(['buy','sell'])
         background_sim_positions.append({"side": sim_side, "entry": mid})
-    background_sim_positions = [p for p in background_sim_positions if (mid - p['entry'] if p['side']=='buy' else p['entry'] - mid) <= 0]
+    background_sim_positions = [
+        p for p in background_sim_positions
+        if (mid - p['entry'] if p['side']=='buy' else p['entry'] - mid) <= 0
+    ]
 
 # ============================
 # DASHBOARD
@@ -275,13 +282,58 @@ def render_dashboard(signal, pred, conf, bid, ask, mid, wallet, wallet_delta, wa
         wallet_sign = "+" if wallet_delta > 0 else "-" if wallet_delta < 0 else ""
         pred_text = f"Price expected ↑ {pred:.6f}" if pred>0 else f"Price expected ↓ {abs(pred):.6f}" if pred<0 else "No significant change → 0.0"
 
+        # Signal accuracy
+        accuracy = np.mean(signal_accuracy[-20:])*100 if signal_accuracy else 0.0
+        sim_count = len(background_sim_positions)
+
+        # --- Positions HTML ---
         if avg_entry == "NO INFO":
             positions_html = "<div class='card'><h3>Open Positions</h3><p>NO INFO</p></div>"
+        else:
+            positions_html = "<div class='card'><h3>Open Positions</h3><ul style='list-style:none; padding-left:0;'>"
+            for i, pos in enumerate(open_positions):
+                color = 'green' if pos['realized_pnl'] >= 0 else 'red'
+                symbol = '●'
+                positions_html += (
+                    f"<li style='color:{color}; font-size:14px; margin-bottom:6px;'>"
+                    f"{symbol} Pos {i+1} ({pos['side'].upper()}): "
+                    f"Qty={pos['qty']:.6f}, Entry={pos['entry']:.6f}, "
+                    f"PnL={pos['realized_pnl']:.8f}</li>"
+                )
+            positions_html += "</ul></div>"
+
+        # --- Profit History HTML ---
+        if avg_entry == "NO INFO":
             profit_html = "<div class='card'><h3>Profit History</h3><p>NO INFO</p></div>"
         else:
-            positions_html = "".join([f"<div class='card'><h3>Pos {i+1} ({pos['side'].upper()})</h3><p>Qty: {pos['qty']:.6f}</p><p>Entry: {pos['entry']:.6f}</p><p>PnL: <span style='color:{'green' if pos['realized_pnl']>0 else 'red'};'>{pos['realized_pnl']:.8f}</span></p></div>" for i,pos in enumerate(open_positions)])
-            profit_html = "<div class='card'><h3>Profit History</h3><ul>" + "".join([f"<li style='color:{'green' if p>=0 else 'red'};'>Cycle {len(profit_history)-len(profit_history[-10:])+i+1}: {p:.8f}</li>" for i,p in enumerate(profit_history[-10:])]) + "</ul></div>"
+            profit_html = "<div class='card'><h3>Profit History</h3><ul style='list-style:none; padding-left:0;'>"
+            recent_profits = profit_history[-10:]
+            for i, p in enumerate(recent_profits):
+                color = 'green' if p >= 0 else 'red'
+                symbol = '●'
+                profit_html += f"<li style='color:{color}; font-size:16px; margin-bottom:4px;'>{symbol} Cycle {len(profit_history)-len(recent_profits)+i+1}: {p:.8f}</li>"
+            cum_profit = sum(recent_profits) if recent_profits else 0
+            cum_color = 'green' if cum_profit >= 0 else 'red'
+            profit_html += f"<li style='color:{cum_color}; font-weight:bold; font-size:16px;'>{symbol} Cumulative Profit (last 10): {cum_profit:.8f}</li>"
+            profit_html += "</ul></div>"
 
+        # --- Predicted vs Actual PnL ---
+        pred_vs_actual_html = "<div class='card'><h3>Predicted vs Actual PnL</h3><ul style='list-style:none; padding-left:0;'>"
+        if open_positions:
+            for i, pos in enumerate(open_positions):
+                predicted = pos.get('predicted_pnl', 0.0)
+                actual = pos.get('realized_pnl', 0.0)
+                color = 'green' if actual >= 0 else 'red'
+                symbol = '●'
+                pred_vs_actual_html += (
+                    f"<li style='color:{color}; font-size:14px; margin-bottom:6px;'>"
+                    f"{symbol} Pos {i+1} ({pos['side'].upper()}): Predicted={predicted:.8f}, Actual={actual:.8f}</li>"
+                )
+        else:
+            pred_vs_actual_html += "<li>No open positions</li>"
+        pred_vs_actual_html += "</ul></div>"
+
+        # --- HTML Content ---
         html_content = f"""
         <html>
         <head>
@@ -305,6 +357,8 @@ def render_dashboard(signal, pred, conf, bid, ask, mid, wallet, wallet_delta, wa
                 <div class='card'><h3>Signal</h3><p>{signal}</p></div>
                 <div class='card'><h3>Prediction</h3><p>{pred_text}</p></div>
                 <div class='card'><h3>Confidence</h3><p>{conf:.2f}</p></div>
+                <div class='card'><h3>Signal Accuracy</h3><p>{accuracy:.2f}% (last 20)</p></div>
+                <div class='card'><h3>Background Sim</h3><p>{sim_count} positions</p></div>
                 <div class='card'><h3>Bid</h3><p>{bid:.6f}</p></div>
                 <div class='card'><h3>Ask</h3><p>{ask:.6f}</p></div>
                 <div class='card'><h3>Mid Price</h3><p>{mid:.6f}</p></div>
@@ -314,18 +368,23 @@ def render_dashboard(signal, pred, conf, bid, ask, mid, wallet, wallet_delta, wa
                 <div class='card'><h3>Wins / Losses</h3><p>{wins} / {losses}</p></div>
             </div>
             {profit_html}
-            <div class='positions'>{positions_html}</div>
+            {positions_html}
+            {pred_vs_actual_html}
         </body>
         </html>
         """
+
         with open(HTML_DASHBOARD_FILE,"w") as f:
             f.write(html_content)
 
+        # Terminal Table
         table = Table(title="ATOM Trading Bot Dashboard")
         table.add_column("Metric"); table.add_column("Value")
         table.add_row("Signal", signal)
         table.add_row("Prediction", pred_text)
         table.add_row("Confidence", f"{conf:.2f}")
+        table.add_row("Signal Accuracy", f"{accuracy:.2f}% (last 20)")
+        table.add_row("Background Sim", f"{sim_count} positions")
         table.add_row("Bid", f"{bid:.6f}")
         table.add_row("Ask", f"{ask:.6f}")
         table.add_row("Mid Price", f"{mid:.6f}")
@@ -333,9 +392,7 @@ def render_dashboard(signal, pred, conf, bid, ask, mid, wallet, wallet_delta, wa
         table.add_row("Open Positions", str(len(open_positions)))
         if avg_entry != "NO INFO":
             for idx,pos in enumerate(open_positions):
-                table.add_row(f"Pos {idx+1} ({pos['side']})", f"Qty={pos['qty']:.6f} Entry={pos['entry']:.6f} PnL={pos['realized_pnl']:.8f}")
-            for idx,pnl in enumerate(profit_history[-10:]):
-                table.add_row(f"Profit Cycle {len(profit_history)-10+idx+1}", f"{pnl:.8f}")
+                table.add_row(f"Pos {idx+1} ({pos['side']})", f"Qty={pos['qty']:.6f} Entry={pos['entry']:.6f} PnL={pos['realized_pnl']:.8f} Pred={pos.get('predicted_pnl',0):.8f}")
         else:
             table.add_row("Info", "NO INFO")
         return Panel(table, title="Status")
@@ -382,8 +439,9 @@ def main():
                         qty *= 1 + min(total_pnl/wallet,0.5)
 
                     qty = max(MIN_QTY, np.floor(qty*1000)/1000)
+                    predicted_pnl = pred * qty  # store predicted pnl per position
                     if qty>=MIN_QTY and execute_real_order(cci_signal, qty):
-                        add_position(cci_signal, qty, entry_price)
+                        add_position(cci_signal, qty, entry_price, predicted_pnl)
 
                 wallet_delta = wallet - starting_wallet
                 wallet_delta_percent = (wallet_delta / starting_wallet * 100) if starting_wallet else 0
@@ -401,6 +459,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
 
