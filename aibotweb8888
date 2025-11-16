@@ -111,8 +111,8 @@ def get_coin_real_info():
 def get_bid_ask_mid():
     try:
         ticker = exchange.fetch_ticker(SYMBOL)
-        bid = ticker['bid'] or 0
-        ask = ticker['ask'] or 0
+        bid = ticker.get('bid',0) or 0
+        ask = ticker.get('ask',0) or 0
         if bid == ask: ask += 0.0001
         return bid, ask, (bid + ask)/2
     except Exception as e:
@@ -178,14 +178,18 @@ def predict_pnl_direction(df):
 # SIGNAL
 # ============================
 def get_signal(df):
-    typical = (df['high'] + df['low'] + df['close'])/3
-    sma = typical.rolling(20).mean()
-    mad = typical.rolling(20).apply(lambda x: np.mean(np.abs(x - np.mean(x))), raw=True)
-    cci = (typical - sma)/(0.015 * mad.replace(0,1e-6))
-    last_cci = cci.iloc[-1] if not np.isnan(cci.iloc[-1]) else 0
-    if last_cci > 100: return "buy"
-    elif last_cci < -100: return "sell"
-    return "hold"
+    try:
+        typical = (df['high'] + df['low'] + df['close'])/3
+        sma = typical.rolling(20).mean()
+        mad = typical.rolling(20).apply(lambda x: np.mean(np.abs(x - np.mean(x))), raw=True)
+        cci = (typical - sma)/(0.015 * mad.replace(0,1e-6))
+        last_cci = cci.iloc[-1] if not np.isnan(cci.iloc[-1]) else 0
+        if last_cci > 100: return "buy"
+        elif last_cci < -100: return "sell"
+        return "hold"
+    except Exception as e:
+        console.print(f"[red]Signal calculation error: {e}[/red]")
+        return "hold"
 
 # ============================
 # ORDERS
@@ -207,11 +211,15 @@ def execute_real_order(side, qty):
         return False
 
 def calc_order_qty(wallet, price, predicted_profit=0):
-    use_usdt = wallet * WALLET_RISK
-    qty = use_usdt / price * (1 + predicted_profit*5)
-    qty = max(MIN_QTY, np.floor(qty*1000)/1000)
-    qty = min(qty, wallet*WALLET_RISK)  # safety cap
-    return qty
+    try:
+        use_usdt = wallet * WALLET_RISK
+        qty = use_usdt / price * (1 + predicted_profit*5)
+        qty = max(MIN_QTY, np.floor(qty*1000)/1000)
+        qty = min(qty, wallet*WALLET_RISK)
+        return qty
+    except Exception as e:
+        console.print(f"[red]Qty calc error: {e}[/red]")
+        return MIN_QTY
 
 def add_position(side, qty, entry_price, predicted_pnl=0.0):
     if len(open_positions) < MAX_POSITIONS:
@@ -242,17 +250,50 @@ def update_real_pnl():
             pos['realized_pnl'] = 0.0
 
 # ============================
-# BACKGROUND SIMULATION
+# SIMULATION & LEARNING
 # ============================
 def simulate_background(signal, mid, n_trades=3):
     global background_sim_positions
-    for _ in range(n_trades):
-        sim_side = signal if signal in ['buy','sell'] else random.choice(['buy','sell'])
-        background_sim_positions.append({"side": sim_side, "entry": mid})
-    background_sim_positions = [
-        p for p in background_sim_positions
-        if (mid - p['entry'] if p['side']=='buy' else p['entry'] - mid) <= 1000
-    ]
+    try:
+        for _ in range(n_trades):
+            sim_side = signal if signal in ['buy','sell'] else random.choice(['buy','sell'])
+            background_sim_positions.append({
+                "side": sim_side,
+                "entry": mid,
+                "sim_pnl": 0.0,
+                "qty": MIN_QTY
+            })
+        # Clean old simulations
+        background_sim_positions = [
+            p for p in background_sim_positions
+            if abs((mid - p['entry']) if p['side']=='buy' else (p['entry'] - mid)) <= 1000
+        ]
+    except Exception as e:
+        console.print(f"[red]Simulation error: {e}[/red]")
+
+def learn_from_simulations(mid):
+    try:
+        expected_buy, expected_sell = [], []
+        for pos in background_sim_positions:
+            pnl = (mid - pos['entry'])*pos['qty'] - mid*pos['qty']*FEE_RATE if pos['side']=='buy' else (pos['entry'] - mid)*pos['qty'] - mid*pos['qty']*FEE_RATE
+            if pos['side']=='buy':
+                expected_buy.append(pnl)
+            else:
+                expected_sell.append(pnl)
+        avg_buy = np.mean(expected_buy) if expected_buy else 0
+        avg_sell = np.mean(expected_sell) if expected_sell else 0
+        if avg_buy >= avg_sell:
+            best_side = 'buy'
+            best_entry = np.mean([p['entry'] for p in background_sim_positions if p['side']=='buy']) if expected_buy else mid
+            predicted_profit = avg_buy
+        else:
+            best_side = 'sell'
+            best_entry = np.mean([p['entry'] for p in background_sim_positions if p['side']=='sell']) if expected_sell else mid
+            predicted_profit = avg_sell
+        return best_side, best_entry, predicted_profit
+    except Exception as e:
+        console.print(f"[red]Learning error: {e}[/red]")
+        return "hold", mid, 0.0
 
 # ============================
 # DASHBOARD
@@ -285,10 +326,8 @@ def render_dashboard(signal, pred, conf, bid, ask, mid, wallet, wallet_delta, wa
         accuracy = np.mean(signal_accuracy[-20:])*100 if signal_accuracy else 0.0
         sim_count = len(background_sim_positions)
 
-        # HTML dashboard
         if avg_entry == "NO INFO":
             positions_html = "<div class='card'><h3>Open Positions</h3><p>NO INFO</p></div>"
-            profit_html = "<div class='card'><h3>Profit History</h3><p>NO INFO</p></div>"
         else:
             positions_html = "<div class='card'><h3>Open Positions</h3><ul style='list-style:none; padding-left:0;'>"
             for i, pos in enumerate(open_positions):
@@ -302,6 +341,9 @@ def render_dashboard(signal, pred, conf, bid, ask, mid, wallet, wallet_delta, wa
                 )
             positions_html += "</ul></div>"
 
+        if avg_entry == "NO INFO":
+            profit_html = "<div class='card'><h3>Profit History</h3><p>NO INFO</p></div>"
+        else:
             profit_html = "<div class='card'><h3>Profit History</h3><ul style='list-style:none; padding-left:0;'>"
             recent_profits = profit_history[-10:]
             for i, p in enumerate(recent_profits):
@@ -351,38 +393,23 @@ def render_dashboard(signal, pred, conf, bid, ask, mid, wallet, wallet_delta, wa
                 <div class='card'><h3>Signal</h3><p>{signal}</p></div>
                 <div class='card'><h3>Prediction</h3><p>{pred_text}</p></div>
                 <div class='card'><h3>Confidence</h3><p>{conf:.2f}</p></div>
-                <div class='card'><h3>Signal Accuracy</h3><p>{accuracy:.2f}% (last 20)</p></div>
-                <div class='card'><h3>Background Sim</h3><p>{sim_count} positions</p></div>
                 <div class='card'><h3>Bid</h3><p>{bid:.6f}</p></div>
                 <div class='card'><h3>Ask</h3><p>{ask:.6f}</p></div>
                 <div class='card'><h3>Mid Price</h3><p>{mid:.6f}</p></div>
-                <div class='card'><h3>Wallet</h3><p style='color:{wallet_color};'>{wallet:.6f} ({wallet_sign}{abs(wallet_delta):.6f}, {wallet_sign}{abs(wallet_delta_percent):.2f}%)</p></div>
-                <div class='card'><h3>Avg Entry</h3><p>{avg_entry if avg_entry != 'NO INFO' else 'NO INFO'}</p></div>
-                <div class='card'><h3>Total PnL</h3><p style='color:{'green' if total_pnl>0 else 'red'};'>{total_pnl:.6f}</p></div>
-                <div class='card'><h3>Wins / Losses</h3><p>{wins} / {losses}</p></div>
+                <div class='card'><h3>Wallet</h3><p style='color:{wallet_color};'>{wallet_sign}{wallet:.6f} USDT ({wallet_delta_percent:.2f}%)</p></div>
+                <div class='card'><h3>Signal Accuracy</h3><p>{accuracy:.2f}%</p></div>
+                <div class='card'><h3>Background Simulations</h3><p>{sim_count}</p></div>
             </div>
-            {profit_html}
-            {positions_html}
-            {pred_vs_actual_html}
+            <div class='positions'>
+                {positions_html}
+                {profit_html}
+                {pred_vs_actual_html}
+            </div>
         </body>
         </html>
         """
-
         with open(HTML_DASHBOARD_FILE,"w") as f:
             f.write(html_content)
-
-        # Terminal table
-        table = Table(title="ATOM Trading Bot Dashboard")
-        table.add_column("Metric"); table.add_column("Value")
-        table.add_row("Signal", signal)
-        table.add_row("Prediction", pred_text)
-        table.add_row("Confidence", f"{conf:.2f}")
-        table.add_row("Wallet", f"{wallet:.6f} ({wallet_sign}{abs(wallet_delta):.6f}, {wallet_sign}{abs(wallet_delta_percent):.2f}%)")
-        table.add_row("Total PnL", f"{total_pnl:.6f}")
-        table.add_row("Wins / Losses", f"{wins} / {losses}")
-        console.clear()
-        console.print(table)
-
     except Exception as e:
         console.print(f"[red]Dashboard render error: {e}[/red]")
 
@@ -402,23 +429,16 @@ def main():
             pred_change, confidence = predict_pnl_direction(df)
             signal = get_signal(df)
             bid, ask, mid = get_bid_ask_mid()
-
-            # Safety: skip trading if bid/ask invalid
-            if bid <= 0 or ask <= 0:
-                console.print("[yellow]Invalid bid/ask, skipping trade[/yellow]")
-                time.sleep(UPDATE_INTERVAL)
-                continue
-
             simulate_background(signal, mid)
 
             wallet = get_wallet_balance()
             if starting_wallet is None:
                 starting_wallet = wallet
-
             wallet_delta = wallet - starting_wallet
             wallet_delta_percent = ((wallet - starting_wallet)/starting_wallet*100) if starting_wallet else 0
 
-            # Execute trades
+            best_side, best_entry, predicted_profit = learn_from_simulations(mid)
+
             predicted_profit_ratio = pred_change / mid if mid>0 else 0
             if signal in ["buy","sell"] and confidence>CONF_THRESHOLD:
                 qty = calc_order_qty(wallet, mid, predicted_profit_ratio)
@@ -431,10 +451,7 @@ def main():
             update_real_pnl()
             total_pnl = sum([p.get('realized_pnl',0) for p in open_positions])
             profit_history.append(total_pnl)
-
-            # Only update signal accuracy for buy/sell
-            if signal in ['buy','sell']:
-                signal_accuracy.append(1 if pred_change*(1 if signal=="buy" else -1) >0 else 0)
+            signal_accuracy.append(1 if pred_change*(1 if signal=="buy" else -1) >0 else 0)
 
             render_dashboard(signal, pred_change, confidence, bid, ask, mid, wallet, wallet_delta, wallet_delta_percent)
             time.sleep(UPDATE_INTERVAL)
@@ -451,7 +468,6 @@ if __name__ == "__main__":
     except:
         pass
     main()
-
 
 
 
