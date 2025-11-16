@@ -114,8 +114,7 @@ def get_bid_ask_mid():
         bid = ticker['bid'] or 0
         ask = ticker['ask'] or 0
         if bid == ask: ask += 0.0001
-        mid = (bid + ask)/2
-        return bid, ask, mid
+        return bid, ask, (bid + ask)/2
     except Exception as e:
         console.print(f"[red]Bid/Ask fetch error: {e}[/red]")
         return 0,0,0
@@ -130,7 +129,6 @@ def train_model_incremental(df):
         X = np.arange(len(df)).reshape(-1,1)
         y = df['mid'].values
 
-        # Adaptive learning rate based on volatility
         recent_changes = np.diff(df['mid'].values[-SMOOTH_WINDOW:]) if len(df['mid'].values) >= SMOOTH_WINDOW else np.array([1e-6])
         volatility = max(np.mean(np.abs(recent_changes)), 1e-4)
         model.eta0 = min(0.05, 0.01 + volatility*0.5)
@@ -164,14 +162,13 @@ def predict_pnl_direction(df):
 
         recent_changes = np.diff(df['mid'].values[-SMOOTH_WINDOW:]) if len(df['mid'].values) >= SMOOTH_WINDOW else np.array([1e-6])
         volatility = max(np.mean(np.abs(recent_changes)), 1e-4)
-        smoothing_factor = max(1, int(SMOOTH_WINDOW / volatility))
+        smoothing_factor = min(max(1, int(SMOOTH_WINDOW / volatility)), 5)
         pred_history.append(change)
         if len(pred_history) > smoothing_factor:
             pred_history.pop(0)
         smoothed_change = sum(pred_history)/len(pred_history)
 
         confidence = min(MAX_CONFIDENCE, max(0.0, abs(smoothed_change)/volatility))
-
         return smoothed_change, confidence
     except Exception as e:
         console.print(f"[red]Prediction error: {e}[/red]")
@@ -213,6 +210,7 @@ def calc_order_qty(wallet, price, predicted_profit=0):
     use_usdt = wallet * WALLET_RISK
     qty = use_usdt / price * (1 + predicted_profit*5)
     qty = max(MIN_QTY, np.floor(qty*1000)/1000)
+    qty = min(qty, wallet*WALLET_RISK)  # safety cap
     return qty
 
 def add_position(side, qty, entry_price, predicted_pnl=0.0):
@@ -287,8 +285,10 @@ def render_dashboard(signal, pred, conf, bid, ask, mid, wallet, wallet_delta, wa
         accuracy = np.mean(signal_accuracy[-20:])*100 if signal_accuracy else 0.0
         sim_count = len(background_sim_positions)
 
+        # HTML dashboard
         if avg_entry == "NO INFO":
             positions_html = "<div class='card'><h3>Open Positions</h3><p>NO INFO</p></div>"
+            profit_html = "<div class='card'><h3>Profit History</h3><p>NO INFO</p></div>"
         else:
             positions_html = "<div class='card'><h3>Open Positions</h3><ul style='list-style:none; padding-left:0;'>"
             for i, pos in enumerate(open_positions):
@@ -302,9 +302,6 @@ def render_dashboard(signal, pred, conf, bid, ask, mid, wallet, wallet_delta, wa
                 )
             positions_html += "</ul></div>"
 
-        if avg_entry == "NO INFO":
-            profit_html = "<div class='card'><h3>Profit History</h3><p>NO INFO</p></div>"
-        else:
             profit_html = "<div class='card'><h3>Profit History</h3><ul style='list-style:none; padding-left:0;'>"
             recent_profits = profit_history[-10:]
             for i, p in enumerate(recent_profits):
@@ -405,6 +402,13 @@ def main():
             pred_change, confidence = predict_pnl_direction(df)
             signal = get_signal(df)
             bid, ask, mid = get_bid_ask_mid()
+
+            # Safety: skip trading if bid/ask invalid
+            if bid <= 0 or ask <= 0:
+                console.print("[yellow]Invalid bid/ask, skipping trade[/yellow]")
+                time.sleep(UPDATE_INTERVAL)
+                continue
+
             simulate_background(signal, mid)
 
             wallet = get_wallet_balance()
@@ -427,9 +431,11 @@ def main():
             update_real_pnl()
             total_pnl = sum([p.get('realized_pnl',0) for p in open_positions])
             profit_history.append(total_pnl)
-            signal_accuracy.append(1 if pred_change*(1 if signal=="buy" else -1) >0 else 0)
 
-            # Render dashboard
+            # Only update signal accuracy for buy/sell
+            if signal in ['buy','sell']:
+                signal_accuracy.append(1 if pred_change*(1 if signal=="buy" else -1) >0 else 0)
+
             render_dashboard(signal, pred_change, confidence, bid, ask, mid, wallet, wallet_delta, wallet_delta_percent)
             time.sleep(UPDATE_INTERVAL)
 
@@ -445,6 +451,7 @@ if __name__ == "__main__":
     except:
         pass
     main()
+
 
 
 
