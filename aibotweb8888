@@ -72,17 +72,41 @@ def get_wallet_balance():
         console.print(f"[red]Wallet fetch error: {e}[/red]")
         return 0
 
+# ============================
+# COIN REAL INFO
+# ============================
 def get_coin_real_info():
     try:
         if not os.path.exists("/coinrealinfo.sh"):
             return None
         result = subprocess.run(["bash", "/coinrealinfo.sh", BASE+QUOTE+"_PERP"], capture_output=True, text=True)
-        info = result.stdout.strip().split()
-        if len(info) < 3:
+        output = result.stdout.strip().splitlines()
+        data = {}
+        for line in output:
+            if ':' not in line:
+                continue
+            key, value = line.split(":", 1)
+            key = key.strip().lower()
+            value = value.strip()
+            data[key] = value
+
+        # Convert numeric fields
+        try:
+            qty = float(data.get("quantity", 0))
+        except:
+            qty = None
+        try:
+            entry = float(data.get("entry price", 0))
+        except:
+            entry = None
+        try:
+            pnl = float(data.get("pnl", 0))
+        except:
+            pnl = None
+
+        if entry is None and qty is None and pnl is None:
             return None
-        entry = float(info[0])
-        qty   = float(info[1])
-        pnl   = float(info[2])
+
         return {"entry": entry, "qty": qty, "pnl": pnl}
     except Exception as e:
         console.print(f"[red]Coin info fetch error: {e}[/red]")
@@ -188,12 +212,15 @@ def update_real_pnl():
     if coin_info:
         if open_positions:
             pos = open_positions[0]
-            pos['qty'] = coin_info['qty']
-            pos['entry'] = coin_info['entry']
-            pos['realized_pnl'] = coin_info['pnl']
+            if coin_info['qty'] is not None:
+                pos['qty'] = coin_info['qty']
+            if coin_info['entry'] is not None:
+                pos['entry'] = coin_info['entry']
+            if coin_info['pnl'] is not None:
+                pos['realized_pnl'] = coin_info['pnl']
     else:
         for pos in open_positions:
-            pos['realized_pnl'] = 0
+            pos['realized_pnl'] = "NO INFO"
 
 def close_positions_if_profitable():
     global open_positions, profit_history
@@ -203,14 +230,14 @@ def close_positions_if_profitable():
     for pos in open_positions:
         pnl = ((bid - pos['entry'])*pos['qty'] - bid*pos['qty']*FEE_RATE) if pos['side']=='buy' else ((pos['entry'] - ask)*pos['qty'] - ask*pos['qty']*FEE_RATE)
         exit_side = 'sell' if pos['side']=='buy' else 'buy'
-        if pnl>0 and execute_real_order(exit_side, pos['qty']):
-            console.print(f"[green]Closed profitable {exit_side} qty={pos['qty']} pnl={pnl:.8f}[/green]")
-            cycle_pnl += pnl
+        if isinstance(pos['realized_pnl'], (int,float)) and pos['realized_pnl']>0 and execute_real_order(exit_side, pos['qty']):
+            console.print(f"[green]Closed profitable {exit_side} qty={pos['qty']} pnl={pos['realized_pnl']:.8f}[/green]")
+            cycle_pnl += pos['realized_pnl']
         else:
             keep.append(pos)
     open_positions = keep
     update_real_pnl()
-    profit_history.append(sum([p['realized_pnl'] for p in open_positions]) + cycle_pnl)
+    profit_history.append(sum([p['realized_pnl'] for p in open_positions if isinstance(p['realized_pnl'], (int,float))]) + cycle_pnl)
 
 # ============================
 # BACKGROUND SIMULATION
@@ -220,7 +247,6 @@ def simulate_background(signal, mid, n_trades=3):
     for _ in range(n_trades):
         sim_side = signal if signal in ['buy', 'sell'] else random.choice(['buy','sell'])
         background_sim_positions.append({"side": sim_side, "entry": mid})
-    # Remove old/irrelevant positions
     background_sim_positions = [p for p in background_sim_positions if (mid - p['entry'] if p['side']=='buy' else p['entry'] - mid) <= 0]
 
 # ============================
@@ -239,10 +265,11 @@ def calculate_position_stats(mid):
         total_qty += qty
         total_cost += qty * entry
         pnl = pos.get('realized_pnl',0)
-        if pnl > 0: wins += 1
-        elif pnl < 0: losses += 1
+        if isinstance(pnl, (int,float)):
+            if pnl > 0: wins += 1
+            elif pnl < 0: losses += 1
     avg_entry = total_cost / total_qty if total_qty > 0 else 0
-    total_pnl = sum([pos.get('realized_pnl',0) for pos in open_positions])
+    total_pnl = sum([p.get('realized_pnl',0) if isinstance(p.get('realized_pnl',0),(int,float)) else 0 for p in open_positions])
     return avg_entry, total_pnl, wins, losses
 
 def render_dashboard(signal, pred, conf, bid, ask, mid, wallet, wallet_delta, wallet_delta_percent):
@@ -256,7 +283,7 @@ def render_dashboard(signal, pred, conf, bid, ask, mid, wallet, wallet_delta, wa
             positions_html = "<p>NO INFO</p>"
             profit_html = "<p>NO INFO</p>"
         else:
-            positions_html = "".join([f"<div class='card'><h3>Pos {i+1} ({pos['side'].upper()})</h3><p>Qty: {pos['qty']:.6f}</p><p>Entry: {pos['entry']:.6f}</p><p>PnL: <span style='color:{'green' if pos['realized_pnl']>0 else 'red'};'>{pos['realized_pnl']:.8f}</span></p></div>" for i,pos in enumerate(open_positions)])
+            positions_html = "".join([f"<div class='card'><h3>Pos {i+1} ({pos['side'].upper()})</h3><p>Qty: {pos['qty']:.6f}</p><p>Entry: {pos['entry']:.6f}</p><p>PnL: <span style='color:{'green' if isinstance(pos['realized_pnl'],(int,float)) and pos['realized_pnl']>0 else 'red'};'>{pos['realized_pnl'] if isinstance(pos['realized_pnl'],(int,float)) else 'NO INFO'}</span></p></div>" for i,pos in enumerate(open_positions)])
             profit_html = "<div class='card'><h3>Profit History</h3><ul>" + "".join([f"<li style='color:{'green' if p>=0 else 'red'};'>Cycle {len(profit_history)-len(profit_history[-10:])+i+1}: {p:.8f}</li>" for i,p in enumerate(profit_history[-10:])]) + "</ul></div>"
 
         html_content = f"""
@@ -310,7 +337,7 @@ def render_dashboard(signal, pred, conf, bid, ask, mid, wallet, wallet_delta, wa
         table.add_row("Open Positions", str(len(open_positions)))
         if avg_entry != "NO INFO":
             for idx,pos in enumerate(open_positions):
-                table.add_row(f"Pos {idx+1} ({pos['side']})", f"Qty={pos['qty']:.6f} Entry={pos['entry']:.6f} PnL={pos['realized_pnl']:.8f}")
+                table.add_row(f"Pos {idx+1} ({pos['side']})", f"Qty={pos['qty']:.6f} Entry={pos['entry']:.6f} PnL={pos['realized_pnl'] if isinstance(pos['realized_pnl'],(int,float)) else 'NO INFO'}")
             for idx,pnl in enumerate(profit_history[-10:]):
                 table.add_row(f"Profit Cycle {len(profit_history)-10+idx+1}", f"{pnl:.8f}")
         else:
@@ -366,6 +393,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
 
