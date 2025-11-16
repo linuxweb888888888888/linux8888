@@ -479,6 +479,10 @@ if __name__ == "__main__":
   # Buy/sell loop not starting
   # Library errors/exceptions/warnings for numpy, pandas, sklearn
   # wallet change feature show increased or decreased profit or loss in percentage not cumulating or decumalating
+  # Coin info fetch error: could not convert string to float: coinrealinfo.sh
+  # bot not writing to html file
+  # also fix warning and errors and exceptions if found
+  # background simulation count not showing html dashboard
 # Make script ready to run
 # Always place real trades when profitable; never dry run
 # Enable multi-sizing and multi-positions
@@ -506,3 +510,12 @@ if __name__ == "__main__":
 # use coinrealinfo.sh for accurate learning and accurate adapting real open trade can be calculated with quantity can also get real pnl and learn from that also the entryprice is in coinrealinfo.sh can run the bash script with bash /coinrealinfo.sh ATOMUSDT_PERP only need coin name to get info like ATOMUSDT_PERP use the info to adapt and learn to calculate accurate calculations fot profit and other metrics and factors learn and adapt acording all this is for all open position and almost like a summary
 # if coinrealinfo.sh pnl not available calculate with entryprice in coinrealinfo.sh should get accurate pnl then
 # use only coinrealinfo.sh entryprice for total pnl and profit calculate all other learning and adapt and all other profit methods and all other calculations according to making profit including everything else
+# display wins and losses in html dashboard and calculate pnl profit according to being in the positive total pnl must be average entryprice of positions entryprice calculated with prices adapt
+# get avg entryprice from and entryprice for positions from coinrealinfo.sh to show real pnl and accurrate reading for profit pnl calculate according adapt and learn
+# when bot opens real position positions then use coinrealinfo script do not change other logic adapt and learn
+# if real open position or positions coinrealinfo.sh output of real values if not output will show NO INFO to make more simpler do not change dashboard html only use in calculations and to learn and adapt
+# coinrealinfo.sh It only handles one position increment of quantity is the multiple positions adapt and learn accordingly
+# learn when to open and close new position or positions at wright price for improved and for gaining profit can open multiple quantity one quantity at a time if profit can be gained with higher pnl
+# improve pnl learning for more prove pnl indicates profit to be made
+# learn to increase real pnl by adapting and learning
+# calculate position or positions pnl according to coinrealinfo try to place order to increase pnl at the right price learn and adapt to positions pnl according to real total pnl
