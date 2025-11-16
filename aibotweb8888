@@ -186,7 +186,6 @@ def add_position(side, qty, entry_price):
 def update_real_pnl():
     coin_info = get_coin_real_info()
     if coin_info:
-        # Simplify: use only one real position
         if open_positions:
             pos = open_positions[0]
             pos['qty'] = coin_info['qty']
@@ -221,6 +220,7 @@ def simulate_background(signal, mid, n_trades=3):
     for _ in range(n_trades):
         sim_side = signal if signal in ['buy', 'sell'] else random.choice(['buy','sell'])
         background_sim_positions.append({"side": sim_side, "entry": mid})
+    # Remove old/irrelevant positions
     background_sim_positions = [p for p in background_sim_positions if (mid - p['entry'] if p['side']=='buy' else p['entry'] - mid) <= 0]
 
 # ============================
@@ -366,6 +366,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
 
