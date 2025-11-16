@@ -56,6 +56,9 @@ def get_ohlcv():
     try:
         data = exchange.fetch_ohlcv(SYMBOL, timeframe="1m", limit=MODEL_WINDOW)
         df = pd.DataFrame(data, columns=["time","open","high","low","close","volume"])
+        df['mid'] = (df['high'] + df['low'])/2
+        df['returns'] = df['mid'].pct_change().fillna(0)
+        df['volatility'] = df['mid'].rolling(SMOOTH_WINDOW).std().fillna(0.0001)
         return df
     except Exception as e:
         console.print(f"[red]OHLCV Error: {e}[/red]")
@@ -72,9 +75,6 @@ def get_wallet_balance():
         console.print(f"[red]Wallet fetch error: {e}[/red]")
         return 0
 
-# ============================
-# COIN REAL INFO
-# ============================
 def get_coin_real_info():
     try:
         if not os.path.exists("/coinrealinfo.sh"):
@@ -85,9 +85,7 @@ def get_coin_real_info():
         for line in output:
             if ':' not in line: continue
             key, value = line.split(":", 1)
-            key = key.strip().lower()
-            value = value.strip().lower()
-            data[key] = value
+            data[key.strip().lower()] = value.strip().lower()
 
         def safe_float(val):
             try:
@@ -125,14 +123,11 @@ def get_bid_ask_mid():
 def train_model_incremental(df):
     global model_initialized
     try:
-        df['mid'] = (df['high'] + df['low'])/2
         X = np.arange(len(df)).reshape(-1,1)
         y = df['mid'].values
-
         recent_changes = np.diff(df['mid'].values[-SMOOTH_WINDOW:]) if len(df['mid'].values) >= SMOOTH_WINDOW else np.array([1e-6])
         volatility = max(np.mean(np.abs(recent_changes)), 1e-4)
         model.eta0 = min(0.05, 0.01 + volatility*0.5)
-
         if not model_initialized:
             model.partial_fit(X, y)
             model_initialized = True
@@ -162,11 +157,11 @@ def predict_pnl_direction(df):
 
         recent_changes = np.diff(df['mid'].values[-SMOOTH_WINDOW:]) if len(df['mid'].values) >= SMOOTH_WINDOW else np.array([1e-6])
         volatility = max(np.mean(np.abs(recent_changes)), 1e-4)
-        smoothing_factor = min(max(1, int(SMOOTH_WINDOW / volatility)), 5)
+
         pred_history.append(change)
-        if len(pred_history) > smoothing_factor:
+        if len(pred_history) > 5:
             pred_history.pop(0)
-        smoothed_change = sum(pred_history)/len(pred_history)
+        smoothed_change = np.mean(pred_history)
 
         confidence = min(MAX_CONFIDENCE, max(0.0, abs(smoothed_change)/volatility))
         return smoothed_change, confidence
@@ -203,6 +198,8 @@ def execute_real_order(side, qty):
         result = subprocess.run(["bash", "/placeorder.sh", BASE, qty_str, side], capture_output=True, text=True)
         out = result.stdout.strip()
         if "SUCCESS" in out.upper():
+            with open("/var/log/bot_orders.log", "a") as f:
+                f.write(f"{time.ctime()} {side} {qty:.6f}\n")
             return True
         console.print(f"[red]Order ERROR: {out}[/red]")
         return False
@@ -210,12 +207,12 @@ def execute_real_order(side, qty):
         console.print(f"[red]Execution error: {e}[/red]")
         return False
 
-def calc_order_qty(wallet, price, predicted_profit=0):
+def calc_order_qty(wallet, price, predicted_profit=0, confidence=1.0):
     try:
-        use_usdt = wallet * WALLET_RISK
-        qty = use_usdt / price * (1 + predicted_profit*5)
+        use_usdt = wallet * WALLET_RISK * confidence
+        qty = use_usdt / price * (1 + predicted_profit*2)
         qty = max(MIN_QTY, np.floor(qty*1000)/1000)
-        qty = min(qty, wallet*WALLET_RISK)
+        qty = min(qty, wallet*WALLET_RISK*0.9)
         return qty
     except Exception as e:
         console.print(f"[red]Qty calc error: {e}[/red]")
@@ -263,7 +260,6 @@ def simulate_background(signal, mid, n_trades=3):
                 "sim_pnl": 0.0,
                 "qty": MIN_QTY
             })
-        # Clean old simulations
         background_sim_positions = [
             p for p in background_sim_positions
             if abs((mid - p['entry']) if p['side']=='buy' else (p['entry'] - mid)) <= 1000
@@ -294,6 +290,34 @@ def learn_from_simulations(mid):
     except Exception as e:
         console.print(f"[red]Learning error: {e}[/red]")
         return "hold", mid, 0.0
+
+# ============================
+# ADAPTIVE POSITION MANAGEMENT
+# ============================
+def manage_positions(mid, wallet, confidence):
+    global open_positions
+    try:
+        for pos in open_positions[:]:
+            unrealized_pnl = (mid - pos['entry'])*pos['qty'] - mid*pos['qty']*FEE_RATE if pos['side']=='buy' else (pos['entry'] - mid)*pos['qty'] - mid*pos['qty']*FEE_RATE
+            pos['realized_pnl'] = unrealized_pnl
+
+            profit_target = 0.005 * wallet
+            stop_loss = -0.01 * wallet
+            if unrealized_pnl >= profit_target or unrealized_pnl <= stop_loss:
+                execute_real_order('sell' if pos['side']=='buy' else 'buy', pos['qty'])
+                open_positions.remove(pos)
+
+        wallet_used = sum([p['qty']*mid for p in open_positions])
+        wallet_free = wallet * WALLET_RISK - wallet_used
+        if wallet_free >= MIN_QTY*mid:
+            best_side, best_entry, predicted_profit = learn_from_simulations(mid)
+            if best_side in ['buy','sell'] and confidence > CONF_THRESHOLD:
+                qty = calc_order_qty(wallet, mid, predicted_profit, confidence)
+                if qty >= MIN_QTY:
+                    price = best_entry
+                    success = execute_real_order(best_side, qty)
+                    if success:
+                        add_position(best_side, qty, price, predicted_profit)
 
 # ============================
 # DASHBOARD
@@ -375,32 +399,44 @@ def render_dashboard(signal, pred, conf, bid, ask, mid, wallet, wallet_delta, wa
         <head>
             <meta charset="utf-8">
             <link href="https://fonts.googleapis.com/icon?family=Material+Icons" rel="stylesheet">
-            <link href="https://fonts.googleapis.com/css?family=Roboto:400,500,700" rel="stylesheet">
             <style>
-                body {{ font-family: 'Roboto', sans-serif; background: #f5f5f5; margin:0; padding:0; }}
-                h1 {{ text-align:center; color:#3f51b5; margin-top:20px; }}
-                .metrics {{ display:flex; flex-wrap:wrap; justify-content:center; margin:20px; }}
-                .card {{ background:#fff; border-radius:8px; padding:15px; margin:10px; min-width:150px; box-shadow:0 4px 6px rgba(0,0,0,0.1); }}
-                .positions {{ display:flex; flex-wrap:wrap; justify-content:center; margin:20px; }}
-                .positions .card {{ min-width:200px; }}
-                ul {{ padding-left:20px; }}
-                p {{ margin:5px 0; font-size:14px; }}
+                body {{
+                    font-family: 'Roboto', sans-serif;
+                    background-color: #f5f5f5;
+                    color: #333;
+                    margin: 0; padding: 0;
+                }}
+                .container {{
+                    display: grid;
+                    grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+                    gap: 16px;
+                    padding: 16px;
+                }}
+                .card {{
+                    background: white;
+                    border-radius: 12px;
+                    padding: 16px;
+                    box-shadow: 0 2px 10px rgba(0,0,0,0.1);
+                }}
+                h3 {{
+                    margin-top: 0;
+                    font-size: 18px;
+                    color: #1976d2;
+                }}
             </style>
         </head>
         <body>
-            <h1>ATOM Trading Bot Dashboard</h1>
-            <div class='metrics'>
-                <div class='card'><h3>Signal</h3><p>{signal}</p></div>
-                <div class='card'><h3>Prediction</h3><p>{pred_text}</p></div>
-                <div class='card'><h3>Confidence</h3><p>{conf:.2f}</p></div>
-                <div class='card'><h3>Bid</h3><p>{bid:.6f}</p></div>
-                <div class='card'><h3>Ask</h3><p>{ask:.6f}</p></div>
-                <div class='card'><h3>Mid Price</h3><p>{mid:.6f}</p></div>
-                <div class='card'><h3>Wallet</h3><p style='color:{wallet_color};'>{wallet_sign}{wallet:.6f} USDT ({wallet_delta_percent:.2f}%)</p></div>
-                <div class='card'><h3>Signal Accuracy</h3><p>{accuracy:.2f}%</p></div>
-                <div class='card'><h3>Background Simulations</h3><p>{sim_count}</p></div>
-            </div>
-            <div class='positions'>
+            <div class="container">
+                <div class="card">
+                    <h3>Market Info</h3>
+                    <p>Signal: {signal.upper()}</p>
+                    <p>Bid: {bid:.6f}</p>
+                    <p>Ask: {ask:.6f}</p>
+                    <p>Mid: {mid:.6f}</p>
+                    <p>{pred_text}</p>
+                    <p>Confidence: {conf:.2f}</p>
+                    <p>Wallet: {wallet:.6f} USDT ({wallet_sign}{wallet_delta:.6f}, {wallet_delta_percent:.2f}%)</p>
+                </div>
                 {positions_html}
                 {profit_html}
                 {pred_vs_actual_html}
@@ -408,7 +444,7 @@ def render_dashboard(signal, pred, conf, bid, ask, mid, wallet, wallet_delta, wa
         </body>
         </html>
         """
-        with open(HTML_DASHBOARD_FILE,"w") as f:
+        with open(HTML_DASHBOARD_FILE, "w") as f:
             f.write(html_content)
     except Exception as e:
         console.print(f"[red]Dashboard render error: {e}[/red]")
@@ -425,35 +461,36 @@ def main():
                 time.sleep(UPDATE_INTERVAL)
                 continue
 
+            # Train and predict
             train_model_incremental(df)
             pred_change, confidence = predict_pnl_direction(df)
             signal = get_signal(df)
             bid, ask, mid = get_bid_ask_mid()
+
+            # Simulate background trades for learning
             simulate_background(signal, mid)
 
+            # Wallet info
             wallet = get_wallet_balance()
             if starting_wallet is None:
                 starting_wallet = wallet
             wallet_delta = wallet - starting_wallet
             wallet_delta_percent = ((wallet - starting_wallet)/starting_wallet*100) if starting_wallet else 0
 
-            best_side, best_entry, predicted_profit = learn_from_simulations(mid)
+            # Manage adaptive positions
+            manage_positions(mid, wallet, confidence)
 
-            predicted_profit_ratio = pred_change / mid if mid>0 else 0
-            if signal in ["buy","sell"] and confidence>CONF_THRESHOLD:
-                qty = calc_order_qty(wallet, mid, predicted_profit_ratio)
-                if qty >= MIN_QTY:
-                    price = ask if signal=="buy" else bid
-                    success = execute_real_order(signal, qty)
-                    if success:
-                        add_position(signal, qty, price, predicted_profit_ratio)
-
+            # Update real PnL from exchange
             update_real_pnl()
+
+            # Track profit and signal accuracy
             total_pnl = sum([p.get('realized_pnl',0) for p in open_positions])
             profit_history.append(total_pnl)
             signal_accuracy.append(1 if pred_change*(1 if signal=="buy" else -1) >0 else 0)
 
+            # Render HTML dashboard
             render_dashboard(signal, pred_change, confidence, bid, ask, mid, wallet, wallet_delta, wallet_delta_percent)
+
             time.sleep(UPDATE_INTERVAL)
 
         except Exception as e:
@@ -463,11 +500,13 @@ def main():
 
 if __name__ == "__main__":
     try:
+        # Close all positions on startup
         if os.path.exists("/closepositions.sh"):
             subprocess.run(["bash","/closepositions.sh"])
     except:
         pass
     main()
+
 
 
 
