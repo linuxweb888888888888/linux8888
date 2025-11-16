@@ -48,6 +48,7 @@ model_initialized = False
 prev_wallet = None
 starting_wallet = None
 pred_history = []
+signal_accuracy = []
 
 # ============================
 # DATA FETCHING
@@ -103,8 +104,8 @@ def get_coin_real_info():
         pnl   = safe_float(data.get("pnl", 0))
 
         # Internal PnL calculation if missing or zero
+        bid, ask, mid = get_bid_ask_mid()
         if pnl is None or pnl == 0:
-            bid, ask, mid = get_bid_ask_mid()
             if qty is not None and entry is not None:
                 pnl = ((bid - entry)*abs(qty) - bid*abs(qty)*FEE_RATE) if qty > 0 else ((entry - ask)*abs(qty) - ask*abs(qty)*FEE_RATE)
             else:
@@ -239,6 +240,7 @@ def simulate_background(signal, mid, n_trades=3):
     for _ in range(n_trades):
         sim_side = signal if signal in ['buy', 'sell'] else random.choice(['buy','sell'])
         background_sim_positions.append({"side": sim_side, "entry": mid})
+    # Remove stale simulations
     background_sim_positions = [p for p in background_sim_positions if (mid - p['entry'] if p['side']=='buy' else p['entry'] - mid) <= 0]
 
 # ============================
