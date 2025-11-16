@@ -154,9 +154,13 @@ def predict_pnl_direction(df):
         X_future = np.array([[len(df)]])
         pred = model.predict(X_future)[0]
         change = pred - mid
-        confidence = min(MAX_CONFIDENCE, abs(change)/(mid*0.01))
 
-        # Adjust with background sim effect
+        # =============================
+        # FIXED CONFIDENCE CALC
+        # =============================
+        confidence = min(MAX_CONFIDENCE, abs(change) / (mid * 0.002))  # 0.2% threshold
+
+        # background sim effect
         sim_effect = 0
         for pos in background_sim_positions:
             sim_effect += (mid - pos['entry']) if pos['side']=='buy' else (pos['entry'] - mid)
@@ -238,9 +242,8 @@ def update_real_pnl():
 def simulate_background(signal, mid, n_trades=3):
     global background_sim_positions
     for _ in range(n_trades):
-        sim_side = signal if signal in ['buy', 'sell'] else random.choice(['buy','sell'])
+        sim_side = signal if signal in ['buy','sell'] else random.choice(['buy','sell'])
         background_sim_positions.append({"side": sim_side, "entry": mid})
-    # Remove stale simulations
     background_sim_positions = [p for p in background_sim_positions if (mid - p['entry'] if p['side']=='buy' else p['entry'] - mid) <= 0]
 
 # ============================
@@ -376,7 +379,7 @@ def main():
                     # Learn and adapt: increase orders if previous PnL positive
                     total_pnl = sum([p.get('realized_pnl',0) for p in open_positions])
                     if total_pnl>0:
-                        qty *= 1 + min(total_pnl/wallet,0.5)  # scale aggressiveness
+                        qty *= 1 + min(total_pnl/wallet,0.5)
 
                     qty = max(MIN_QTY, np.floor(qty*1000)/1000)
                     if qty>=MIN_QTY and execute_real_order(cci_signal, qty):
@@ -398,6 +401,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
 
