@@ -32,8 +32,8 @@ MAX_CONFIDENCE = 1
 HTML_DASHBOARD_FILE = "/var/www/html/dashboard.html"
 SMOOTH_WINDOW = 3
 SIM_PNL_WEIGHT = 0.3
-MAX_ORDER_MULTIPLIER = 1.5  # === FIX APPLIED === prevent oversized orders
-SOFT_STOP_LOSS = -0.05      # === FIX APPLIED === max -5% loss
+MAX_ORDER_MULTIPLIER = 1.5
+SOFT_STOP_LOSS = -0.05
 
 # ============================
 # EXCHANGE INIT
@@ -54,7 +54,8 @@ starting_wallet = None
 
 wallet_learning = {
     "signal_history": [],
-    "adjustment_factor": 1.0
+    "adjustment_factor": 1.0,
+    "wallet_history": []
 }
 
 # ============================
@@ -89,24 +90,17 @@ def get_coin_real_info():
         entry = qty = pnl = None
         for line in lines:
             if line.startswith("Quantity:"):
-                try:
-                    qty = float(line.split(":")[1].strip())
-                except:
-                    qty = None
+                try: qty = float(line.split(":")[1].strip())
+                except: qty = None
             elif line.startswith("Entry Price:"):
-                try:
-                    entry = float(line.split(":")[1].strip())
-                except:
-                    entry = None
+                try: entry = float(line.split(":")[1].strip())
+                except: entry = None
             elif line.startswith("PnL:"):
-                try:
-                    pnl = float(line.split(":")[1].strip())
-                except:
-                    pnl = None
+                try: pnl = float(line.split(":")[1].strip())
+                except: pnl = None
         if entry is not None and qty is not None and pnl is not None:
             return {"entry": entry, "qty": qty, "pnl": pnl}
-        else:
-            return None
+        return None
     except Exception as e:
         console.print(f"[red]Coin info fetch error: {e}[/red]")
         return None
@@ -149,7 +143,6 @@ def predict_pnl_direction(df):
         pred = model.predict(X_future)[0]
         change = pred - current
 
-        # Add simulation effect using real positions if available
         sim_effect = 0
         for pos in background_sim_positions:
             pnl_val = pos.get("realized_pnl")
@@ -161,9 +154,7 @@ def predict_pnl_direction(df):
             sim_effect /= len(background_sim_positions)
         change += sim_effect
 
-        # === FIX APPLIED === clip extreme predictions
         change = max(min(change, mid*0.01), -mid*0.01)
-
         confidence = min(MAX_CONFIDENCE, max(0.01, abs(change)/(current*0.01)))
         pred_history.append(change)
         if len(pred_history) > SMOOTH_WINDOW:
@@ -197,9 +188,8 @@ def execute_real_order(side, qty):
         out = result.stdout.strip()
         if "SUCCESS" in out.upper():
             return True
-        else:
-            console.print(f"[red]Order ERROR: {out}[/red]")
-            return False
+        console.print(f"[red]Order ERROR: {out}[/red]")
+        return False
     except Exception as e:
         console.print(f"[red]Execution error: {e}[/red]")
         return False
@@ -207,7 +197,7 @@ def execute_real_order(side, qty):
 def calc_order_qty(wallet, price, predicted_profit=0):
     adjustment = wallet_learning.get("adjustment_factor", 1.0)
     use_usdt = wallet * WALLET_RISK * adjustment
-    multiplier = min(MAX_ORDER_MULTIPLIER, 1 + predicted_profit*5)  # === FIX APPLIED === clamp multiplier
+    multiplier = min(MAX_ORDER_MULTIPLIER, 1 + predicted_profit*5)
     qty = use_usdt / price * multiplier
     qty = max(MIN_QTY, np.floor(qty*1000)/1000)
     return qty
@@ -222,22 +212,18 @@ def add_position(side, qty, entry_price):
 def update_real_pnl():
     coin_info = get_coin_real_info()
     bid, ask, mid = get_bid_ask_mid()
-    if coin_info:
-        real_entry = coin_info["entry"]
-        real_qty   = coin_info["qty"]
-        for pos in open_positions:
-            pos["entry"] = real_entry
-            pos["qty"]   = real_qty
-            if pos['side'] == 'buy':
-                pos['realized_pnl'] = (mid - real_entry) * real_qty - real_qty * FEE_RATE * mid
-            else:
-                pos['realized_pnl'] = (real_entry - mid) * real_qty - real_qty * FEE_RATE * mid
-    else:
-        for pos in open_positions:
-            if pos['side'] == 'buy':
-                pos['realized_pnl'] = (mid - pos['entry']) * pos['qty'] - pos['qty'] * FEE_RATE * mid
-            else:
-                pos['realized_pnl'] = (pos['entry'] - mid) * pos['qty'] - pos['qty'] * FEE_RATE * mid
+    for pos in open_positions:
+        qty = pos['qty']
+        entry = pos['entry']
+        if coin_info and abs(coin_info['qty'] - qty) < 0.0001:
+            entry = coin_info['entry']
+            qty = coin_info['qty']
+        if pos['side']=='buy':
+            pos['realized_pnl'] = (mid - entry) * qty - qty*FEE_RATE*mid
+        else:
+            pos['realized_pnl'] = (entry - mid) * qty - qty*FEE_RATE*mid
+        pos['qty'] = qty
+        pos['entry'] = entry
 
 # ============================
 # CLOSE POSITIONS & WALLET LEARNING
@@ -247,19 +233,23 @@ def close_positions_if_profitable():
     keep=[]
     cycle_pnl=0
     update_real_pnl()
-    total_unrealized_pnl = sum(pos.get('realized_pnl',0) for pos in open_positions)
     bid, ask, mid = get_bid_ask_mid()
-    sim_pnl = sum(p.get('realized_pnl',0) for p in background_sim_positions if p.get('realized_pnl') is not None)
-
     for pos in open_positions:
         pnl = pos.get('realized_pnl',0)
+        loss_pct = pnl / (pos['entry']*pos['qty']) if pos['entry']*pos['qty'] else 0
         exit_side = 'sell' if pos['side']=='buy' else 'buy'
-        # === FIX APPLIED === close if profitable or soft stop-loss exceeded
-        if (pnl > 0 or (pnl / (pos['qty']*pos['entry']) < SOFT_STOP_LOSS)) and execute_real_order(exit_side, pos['qty']):
-            console.print(f"[green]Closed {exit_side} qty={pos['qty']} pnl={pnl:.8f}[/green]")
-            cycle_pnl += pnl
-            wallet_learning["signal_history"].append((pos['side'], pnl, 1.0))
+        if pnl > 0 or loss_pct < SOFT_STOP_LOSS:
+            if execute_real_order(exit_side, pos['qty']):
+                console.print(f"[green]Closed {exit_side} qty={pos['qty']} pnl={pnl:.8f}[/green]")
+                cycle_pnl += pnl
+                wallet_learning["signal_history"].append((pos['side'], pnl, 1.0))
         else:
+            # Scale down small loss positions
+            if abs(loss_pct) > 0.02 and pos['qty'] > 2*MIN_QTY:
+                reduced_qty = pos['qty']/2
+                execute_real_order(exit_side, reduced_qty)
+                pos['qty'] -= reduced_qty
+                console.print(f"[yellow]Scaled down {exit_side} qty={reduced_qty} due to small loss[/yellow]")
             keep.append(pos)
     open_positions = keep
     profit_history.append(cycle_pnl)
@@ -268,14 +258,21 @@ def close_positions_if_profitable():
     global starting_wallet
     if starting_wallet is None:
         starting_wallet = wallet
-    wallet_delta = wallet - starting_wallet
+    # Smooth wallet delta
+    wallet_learning['wallet_history'].append(wallet)
+    if len(wallet_learning['wallet_history']) > 5:
+        wallet_learning['wallet_history'].pop(0)
+    smoothed_wallet = sum(wallet_learning['wallet_history'])/len(wallet_learning['wallet_history'])
+    wallet_delta = smoothed_wallet - starting_wallet
+
+    # Update adjustment factor
     history = wallet_learning["signal_history"][-5:]
     trade_pnl = sum(p for s,p,c in history)
     real_unrealized_pnl = sum(pos.get('realized_pnl',0) for pos in open_positions)
     factor = 1 + (trade_pnl + SIM_PNL_WEIGHT*real_unrealized_pnl) / (starting_wallet if starting_wallet else 1)
     if wallet_delta < 0:
-        factor *= max(0.5, 1 - abs(wallet_delta)/(starting_wallet if starting_wallet else 1))
-    factor = max(0.5, min(3.0, factor))
+        factor *= max(0.6, 1 - abs(wallet_delta)/(starting_wallet if starting_wallet else 1))
+    factor = max(0.5, min(2.0, factor))
     wallet_learning['adjustment_factor'] = factor
 
 # ============================
@@ -369,6 +366,8 @@ def render_dashboard(signal, pred, conf, bid, ask, mid, wallet, wallet_delta, wa
         """
         with open(HTML_DASHBOARD_FILE, "w") as f:
             f.write(html_content)
+
+        # Rich Panel
         table = Table(title="ATOM Trading Bot Dashboard")
         table.add_column("Metric")
         table.add_column("Value")
@@ -411,7 +410,8 @@ def main():
                 if starting_wallet is None:
                     starting_wallet = wallet
                 pred, conf = predict_pnl_direction(df)
-                if abs(pred) < mid*0.0003:
+
+                if abs(pred) < mid*0.0005 or conf < 0.2:
                     cci_signal = "hold"
 
                 # === FAST SIGNAL ORDER ===
@@ -442,6 +442,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
 
