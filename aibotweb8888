@@ -108,14 +108,15 @@ def get_coin_real_info():
 def get_bid_ask_mid():
     try:
         ticker = exchange.fetch_ticker(SYMBOL)
-        bid = ticker['bid']
-        ask = ticker['ask']
+        bid = ticker.get('bid',0)
+        ask = ticker.get('ask',0)
+        if bid==0 or ask==0: return None,None,None
         if bid == ask: ask += 0.0001
         mid = (bid + ask)/2
         return bid, ask, mid
     except Exception as e:
         console.print(f"[red]Bid/Ask fetch error: {e}[/red]")
-        return 0,0,0
+        return None,None,None
 
 # ============================
 # MODEL & SIGNAL FUNCTIONS
@@ -138,6 +139,7 @@ def predict_pnl_direction(df):
     try:
         if not model_initialized: return 0,0
         bid, ask, mid = get_bid_ask_mid()
+        if mid is None: return 0,0
         current = mid
         X_future = np.array([[len(df)]])
         pred = model.predict(X_future)[0]
@@ -212,6 +214,7 @@ def add_position(side, qty, entry_price):
 def update_real_pnl():
     coin_info = get_coin_real_info()
     bid, ask, mid = get_bid_ask_mid()
+    if mid is None: return
     for pos in open_positions:
         qty = pos['qty']
         entry = pos['entry']
@@ -226,7 +229,7 @@ def update_real_pnl():
         pos['entry'] = entry
 
 # ============================
-# CLOSE POSITIONS & WALLET LEARNING
+# CLOSE POSITIONS PROFIT-AWARE
 # ============================
 def close_positions_if_profitable():
     global open_positions, profit_history
@@ -234,17 +237,20 @@ def close_positions_if_profitable():
     cycle_pnl=0
     update_real_pnl()
     bid, ask, mid = get_bid_ask_mid()
+    if mid is None: return
+    wallet = get_wallet_balance()
     for pos in open_positions:
         pnl = pos.get('realized_pnl',0)
         loss_pct = pnl / (pos['entry']*pos['qty']) if pos['entry']*pos['qty'] else 0
         exit_side = 'sell' if pos['side']=='buy' else 'buy'
-        if pnl > 0 or loss_pct < SOFT_STOP_LOSS:
+        # Only close a position if doing so is expected to increase the wallet balance
+        predicted_wallet_increase = pnl - (pos['qty']*FEE_RATE*mid)
+        if predicted_wallet_increase > 0 or loss_pct < SOFT_STOP_LOSS:
             if execute_real_order(exit_side, pos['qty']):
                 console.print(f"[green]Closed {exit_side} qty={pos['qty']} pnl={pnl:.8f}[/green]")
                 cycle_pnl += pnl
                 wallet_learning["signal_history"].append((pos['side'], pnl, 1.0))
         else:
-            # Scale down small loss positions
             if abs(loss_pct) > 0.02 and pos['qty'] > 2*MIN_QTY:
                 reduced_qty = pos['qty']/2
                 execute_real_order(exit_side, reduced_qty)
@@ -254,18 +260,15 @@ def close_positions_if_profitable():
     open_positions = keep
     profit_history.append(cycle_pnl)
 
-    wallet = get_wallet_balance()
     global starting_wallet
     if starting_wallet is None:
         starting_wallet = wallet
-    # Smooth wallet delta
     wallet_learning['wallet_history'].append(wallet)
     if len(wallet_learning['wallet_history']) > 5:
         wallet_learning['wallet_history'].pop(0)
     smoothed_wallet = sum(wallet_learning['wallet_history'])/len(wallet_learning['wallet_history'])
     wallet_delta = smoothed_wallet - starting_wallet
 
-    # Update adjustment factor
     history = wallet_learning["signal_history"][-5:]
     trade_pnl = sum(p for s,p,c in history)
     real_unrealized_pnl = sum(pos.get('realized_pnl',0) for pos in open_positions)
@@ -367,7 +370,6 @@ def render_dashboard(signal, pred, conf, bid, ask, mid, wallet, wallet_delta, wa
         with open(HTML_DASHBOARD_FILE, "w") as f:
             f.write(html_content)
 
-        # Rich Panel
         table = Table(title="ATOM Trading Bot Dashboard")
         table.add_column("Metric")
         table.add_column("Value")
@@ -406,6 +408,7 @@ def main():
                 train_model_incremental(df)
                 cci_signal = get_signal(df)
                 bid, ask, mid = get_bid_ask_mid()
+                if mid is None: time.sleep(1); continue
                 wallet = get_wallet_balance()
                 if starting_wallet is None:
                     starting_wallet = wallet
@@ -414,7 +417,6 @@ def main():
                 if abs(pred) < mid*0.0005 or conf < 0.2:
                     cci_signal = "hold"
 
-                # === FAST SIGNAL ORDER ===
                 if cci_signal in ['buy','sell'] and conf>CONF_THRESHOLD:
                     entry_price = bid if cci_signal=='buy' else ask
                     qty = calc_order_qty(wallet, entry_price, pred/mid)
@@ -442,6 +444,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
 
