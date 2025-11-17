@@ -232,6 +232,10 @@ def update_real_pnl():
 # CLOSE POSITIONS PROFIT-AWARE
 # ============================
 def close_positions_if_profitable():
+    """
+    Only close a position if doing so is expected to increase the wallet balance.
+    Ensures no position is closed at a net loss after fees unless forced by soft stop-loss.
+    """
     global open_positions, profit_history
     keep=[]
     cycle_pnl=0
@@ -241,21 +245,14 @@ def close_positions_if_profitable():
     wallet = get_wallet_balance()
     for pos in open_positions:
         pnl = pos.get('realized_pnl',0)
-        loss_pct = pnl / (pos['entry']*pos['qty']) if pos['entry']*pos['qty'] else 0
         exit_side = 'sell' if pos['side']=='buy' else 'buy'
-        # Only close a position if doing so is expected to increase the wallet balance
         predicted_wallet_increase = pnl - (pos['qty']*FEE_RATE*mid)
-        if predicted_wallet_increase > 0 or loss_pct < SOFT_STOP_LOSS:
+        if predicted_wallet_increase > 0 or pnl/(pos['entry']*pos['qty']) < SOFT_STOP_LOSS:
             if execute_real_order(exit_side, pos['qty']):
                 console.print(f"[green]Closed {exit_side} qty={pos['qty']} pnl={pnl:.8f}[/green]")
                 cycle_pnl += pnl
                 wallet_learning["signal_history"].append((pos['side'], pnl, 1.0))
         else:
-            if abs(loss_pct) > 0.02 and pos['qty'] > 2*MIN_QTY:
-                reduced_qty = pos['qty']/2
-                execute_real_order(exit_side, reduced_qty)
-                pos['qty'] -= reduced_qty
-                console.print(f"[yellow]Scaled down {exit_side} qty={reduced_qty} due to small loss[/yellow]")
             keep.append(pos)
     open_positions = keep
     profit_history.append(cycle_pnl)
@@ -444,6 +441,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
 
