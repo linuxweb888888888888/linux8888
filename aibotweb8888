@@ -27,10 +27,10 @@ FEE_RATE = 0.001
 WALLET_RISK = 0.35
 UPDATE_INTERVAL = 1
 MODEL_WINDOW = 50
-CONF_THRESHOLD = 0.3
+CONF_THRESHOLD = 0.2   # lower threshold for faster signals
 MAX_CONFIDENCE = 1
 HTML_DASHBOARD_FILE = "/var/www/html/dashboard.html"
-SMOOTH_WINDOW = 3
+SMOOTH_WINDOW = 2      # reduce smoothing to react faster
 SIM_PNL_WEIGHT = 0.3
 MAX_ORDER_MULTIPLIER = 1.5
 SOFT_STOP_LOSS = -0.05
@@ -167,21 +167,34 @@ def predict_pnl_direction(df):
         console.print(f"[red]Prediction error: {e}[/red]")
         return 0,0
 
+# ----------------------------
+# FAST SIGNAL
+# ----------------------------
 def get_signal(df):
-    typical = (df['high'] + df['low'] + df['close'])/3
-    sma = typical.rolling(20).mean()
-    mad = typical.rolling(20).apply(lambda x: np.mean(np.abs(x - np.mean(x))), raw=True)
-    cci = (typical - sma)/(0.015 * mad)
-    last_cci = cci.iloc[-1]
-    if last_cci > 100: return "buy"
-    elif last_cci < -100: return "sell"
-    return "hold"
+    try:
+        typical = (df['high'] + df['low'] + df['close'])/3
+        sma = typical.rolling(10).mean()  # faster window
+        mad = typical.rolling(10).apply(lambda x: np.mean(np.abs(x - np.mean(x))), raw=True)
+        cci = (typical - sma)/(0.015 * mad)
+        last_cci = cci.iloc[-1]
+
+        # very short term momentum
+        recent_change = df['close'].iloc[-1] - df['close'].iloc[-3]
+
+        if last_cci > 50 and recent_change > 0:
+            return "buy"
+        elif last_cci < -50 and recent_change < 0:
+            return "sell"
+        return "hold"
+    except Exception as e:
+        console.print(f"[red]Signal error: {e}[/red]")
+        return "hold"
 
 # ============================
 # ORDER FUNCTIONS
 # ============================
 def execute_real_order(side, qty):
-    qty_str = f"{qty:.6f}"
+    qty_str = f"{round(qty,6):.6f}"
     try:
         if not os.path.exists("/placeorder.sh"):
             console.print("[red]ERROR: placeorder.sh not found[/red]")
@@ -201,7 +214,7 @@ def calc_order_qty(wallet, price, predicted_profit=0):
     use_usdt = wallet * WALLET_RISK * adjustment
     multiplier = min(MAX_ORDER_MULTIPLIER, 1 + predicted_profit*5)
     qty = use_usdt / price * multiplier
-    qty = max(MIN_QTY, np.floor(qty*1000)/1000)
+    qty = max(MIN_QTY, np.floor(qty*1000000)/1000000)
     return qty
 
 def add_position(side, qty, entry_price):
@@ -232,10 +245,6 @@ def update_real_pnl():
 # CLOSE POSITIONS PROFIT-AWARE
 # ============================
 def close_positions_if_profitable():
-    """
-    Only close a position if doing so is expected to increase the wallet balance.
-    Ensures no position is closed at a net loss after fees unless forced by soft stop-loss.
-    """
     global open_positions, profit_history
     keep=[]
     cycle_pnl=0
@@ -246,8 +255,8 @@ def close_positions_if_profitable():
     for pos in open_positions:
         pnl = pos.get('realized_pnl',0)
         exit_side = 'sell' if pos['side']=='buy' else 'buy'
-        predicted_wallet_increase = pnl - (pos['qty']*FEE_RATE*mid)
-        if predicted_wallet_increase > 0 or pnl/(pos['entry']*pos['qty']) < SOFT_STOP_LOSS:
+        effective_pnl_ratio = (pnl - pos['qty']*FEE_RATE*mid) / (pos['entry']*pos['qty'])
+        if pnl - pos['qty']*FEE_RATE*mid > 0 or effective_pnl_ratio < SOFT_STOP_LOSS:
             if execute_real_order(exit_side, pos['qty']):
                 console.print(f"[green]Closed {exit_side} qty={pos['qty']} pnl={pnl:.8f}[/green]")
                 cycle_pnl += pnl
@@ -339,7 +348,7 @@ def render_dashboard(signal, pred, conf, bid, ask, mid, wallet, wallet_delta, wa
         <html>
         <head>
             <meta charset=\"utf-8\">
-            <meta http-equiv="refresh" content="5">
+            <meta http-equiv="refresh" content="1">
             <link href=\"https://fonts.googleapis.com/icon?family=Material+Icons\" rel=\"stylesheet\">
             <link href=\"https://fonts.googleapis.com/css?family=Roboto:400,500,700\" rel=\"stylesheet\">
             <style>
@@ -403,30 +412,32 @@ def main():
                 df = get_ohlcv()
                 if df is None or len(df)<MODEL_WINDOW: time.sleep(1); continue
                 train_model_incremental(df)
-                cci_signal = get_signal(df)
+                signal = get_signal(df)
                 bid, ask, mid = get_bid_ask_mid()
-                if mid is None: time.sleep(1); continue
+                if None in [bid, ask, mid]:
+                    console.print("[yellow]Bid/Ask not available, skipping this cycle[/yellow]")
+                    time.sleep(1)
+                    continue
                 wallet = get_wallet_balance()
                 if starting_wallet is None:
                     starting_wallet = wallet
                 pred, conf = predict_pnl_direction(df)
 
                 if abs(pred) < mid*0.0005 or conf < 0.2:
-                    cci_signal = "hold"
+                    signal = "hold"
 
-                if cci_signal in ['buy','sell'] and conf>CONF_THRESHOLD:
-                    entry_price = bid if cci_signal=='buy' else ask
+                if signal in ['buy','sell'] and conf>CONF_THRESHOLD:
+                    entry_price = bid if signal=='buy' else ask
                     qty = calc_order_qty(wallet, entry_price, pred/mid)
-                    if qty>=MIN_QTY and execute_real_order(cci_signal, qty):
-                        add_position(cci_signal, qty, entry_price)
+                    if qty>=MIN_QTY and execute_real_order(signal, qty):
+                        add_position(signal, qty, entry_price)
 
-                simulate_background(cci_signal, mid)
-                close_positions_if_profitable()
-                update_real_pnl()
+                simulate_background(signal, mid)
+                close_positions_if_profitable()  # already updates PnL
 
                 wallet_delta = wallet - starting_wallet
                 wallet_delta_percent = (wallet_delta / starting_wallet * 100) if starting_wallet else 0
-                panel = render_dashboard(cci_signal, pred, conf, bid, ask, mid, wallet, wallet_delta, wallet_delta_percent)
+                panel = render_dashboard(signal, pred, conf, bid, ask, mid, wallet, wallet_delta, wallet_delta_percent)
                 live.update(panel)
                 prev_wallet = wallet
                 time.sleep(UPDATE_INTERVAL)
@@ -441,6 +452,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
 
