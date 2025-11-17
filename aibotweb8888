@@ -12,7 +12,6 @@ from sklearn.preprocessing import StandardScaler
 import subprocess
 import os
 import random
-import traceback
 
 console = Console()
 
@@ -36,7 +35,7 @@ TRAILING_MULTIPLIER = 1.5
 WALLET_RISK_BASE = 0.35
 SIM_PNL_WEIGHT = 0.3
 MAX_SIM_POSITIONS = 20
-MICRO_PROFIT_TARGET = 0.001  # 0.1% ultra-fast scalping
+MICRO_PROFIT_TARGET = 0.001  # 0.1% target
 
 # ============================
 # EXCHANGE INIT
@@ -67,8 +66,7 @@ def get_ohlcv():
         data = exchange.fetch_ohlcv(SYMBOL, timeframe="1m", limit=MODEL_WINDOW)
         df = pd.DataFrame(data, columns=["time","open","high","low","close","volume"])
         return df
-    except Exception as e:
-        console.print(f"[red]OHLCV Error: {e}[/red]")
+    except:
         return None
 
 def get_tick_data():
@@ -78,8 +76,7 @@ def get_tick_data():
         ask = orderbook['asks'][0][0] if orderbook['asks'] else 0
         mid = (bid + ask)/2 if bid and ask else None
         return bid, ask, mid
-    except Exception as e:
-        console.print(f"[red]Tick data error: {e}[/red]")
+    except:
         return None, None, None
 
 def get_wallet_balance():
@@ -90,11 +87,10 @@ def get_wallet_balance():
     except:
         return 0
 
-def get_coin_real_info_safe():
-    """Only call coinrealinfo.sh if open positions exist"""
-    if not open_positions:
-        return None
+def get_coin_real_info():
     try:
+        if not open_positions:  # Only when open positions exist
+            return None
         if not os.path.exists("/coinrealinfo.sh"): return None
         result = subprocess.run(["bash", "/coinrealinfo.sh", BASE+QUOTE+"_PERP"], capture_output=True, text=True)
         lines = result.stdout.strip().split("\n")
@@ -128,7 +124,7 @@ def train_model_incremental(df):
             y_scaled = scaler_y.transform(y[-5:]).ravel()
             model.partial_fit(X_scaled, y_scaled)
     except:
-        console.print(f"[red]Model training error[/red]")
+        pass
 
 def predict_pnl_direction(df):
     try:
@@ -139,20 +135,19 @@ def predict_pnl_direction(df):
         X_scaled = scaler_X.transform(X_future)
         pred_scaled = model.predict(X_scaled)[0]
         pred = scaler_y.inverse_transform([[pred_scaled]])[0][0]
-
-        # simulation effect for smoothing only
+        change = pred - mid
         sim_effect = 0
         for pos in background_sim_positions:
-            if pos['realized_pnl'] is not None:
-                sim_effect += pos['realized_pnl']
+            pnl_val = pos.get("realized_pnl")
+            if pnl_val is not None:
+                sim_effect += pnl_val
             else:
                 sim_effect += (mid - pos['entry']) if pos['side']=='buy' else (pos['entry'] - mid)
         if background_sim_positions: sim_effect /= len(background_sim_positions)
-
-        pred += sim_effect
-        pred = max(min(pred, mid*0.01), -mid*0.01)
-        confidence = min(MAX_CONFIDENCE, max(0.01, abs(pred)/(mid*0.01)))
-        pred_history.append(pred)
+        change += sim_effect
+        change = max(min(change, mid*0.01), -mid*0.01)
+        confidence = min(MAX_CONFIDENCE, max(0.01, abs(change)/(mid*0.01)))
+        pred_history.append(change)
         if len(pred_history) > 3: pred_history.pop(0)
         smoothed_change = sum(pred_history)/len(pred_history)
         return smoothed_change, confidence
@@ -165,10 +160,8 @@ def predict_pnl_direction(df):
 def get_ultra_fast_signal():
     if len(tick_history) < 3: return "hold"
     delta = tick_history[-1] - tick_history[-3]
-    deltas = [tick_history[i+1]-tick_history[i] for i in range(len(tick_history)-1)]
-    avg_delta = sum(deltas[-3:])/min(3,len(deltas))
-    if avg_delta > 0: return "buy"
-    if avg_delta < 0: return "sell"
+    if delta > 0: return "buy"
+    if delta < 0: return "sell"
     return "hold"
 
 def get_orderbook_signal(orderbook):
@@ -184,24 +177,15 @@ def get_orderbook_signal(orderbook):
 # ============================
 # ORDER FUNCTIONS
 # ============================
-def execute_real_order_realistic(side, qty, price=None, slippage=0.0005):
-    """Execute order with realistic fill effects and slippage"""
+def execute_real_order(side, qty):
     inverted_side = 'sell' if side=='buy' else 'buy'
     qty_str = f"{round(qty,6):.6f}"
-    effective_price = price or (get_tick_data()[1] if side=='buy' else get_tick_data()[0])
-    if effective_price is None: return False, 0
-    if side == 'buy':
-        effective_price *= 1 + slippage
-    else:
-        effective_price *= 1 - slippage
     try:
-        if not os.path.exists("/placeorder.sh"): return False, effective_price
+        if not os.path.exists("/placeorder.sh"): return False
         result = subprocess.run(["bash", "/placeorder.sh", BASE, qty_str, inverted_side], capture_output=True, text=True)
         out = result.stdout.strip()
-        success = "SUCCESS" in out.upper()
-        return success, effective_price
-    except:
-        return False, effective_price
+        return "SUCCESS" in out.upper()
+    except: return False
 
 def calc_order_qty(wallet, price, predicted_profit=0):
     adjustment = wallet_learning.get("adjustment_factor", 1.0)
@@ -211,7 +195,7 @@ def calc_order_qty(wallet, price, predicted_profit=0):
     return max(MIN_QTY, np.floor(qty*1000000)/1000000)
 
 def add_position(side, qty, entry_price):
-    coin_info = get_coin_real_info_safe()
+    coin_info = get_coin_real_info()
     if coin_info:
         entry_price = coin_info['entry']
         qty = coin_info['qty']
@@ -226,57 +210,47 @@ def add_position(side, qty, entry_price):
         })
 
 # ============================
-# REALISTIC PNL FUNCTIONS
+# PNL FUNCTIONS
 # ============================
-def update_realistic_pnl():
-    """Update PnL with slippage and trailing stop, using coinrealinfo.sh only when positions exist"""
-    coin_info = get_coin_real_info_safe()
+def update_real_pnl():
+    coin_info = get_coin_real_info()
     bid, ask, mid = get_tick_data()
     if mid is None: return
-
     for pos in open_positions:
         qty = pos['qty']
         entry = pos['entry']
-
-        if coin_info and abs(coin_info['qty'] - qty) < 0.0001:
+        if coin_info and abs(coin_info['qty'] - qty)<0.0001:
             entry = coin_info['entry']
             qty = coin_info['qty']
-
         if pos['side']=='buy':
-            effective_price = bid*(1+0.0005)
-            pos['realized_pnl'] = (bid - entry) * qty - qty*FEE_RATE*bid
+            current_price = bid if bid else mid
+            pos['realized_pnl'] = (current_price - entry)*qty - qty*FEE_RATE*current_price
         else:
-            effective_price = ask*(1-0.0005)
-            pos['realized_pnl'] = (entry - ask) * qty - qty*FEE_RATE*ask
-
-        if pos['trailing_stop'] is None:
-            pos['trailing_stop'] = mid*(0.99 if pos['side']=='buy' else 1.01)
-        else:
-            if pos['side']=='buy':
-                pos['trailing_stop'] = max(pos['trailing_stop'], mid*(1-0.005))
-            else:
-                pos['trailing_stop'] = min(pos['trailing_stop'], mid*(1+0.005))
-
-        pos['qty'] = qty
-        pos['entry'] = entry
+            current_price = ask if ask else mid
+            pos['realized_pnl'] = (entry - current_price)*qty - qty*FEE_RATE*current_price
+        pos['qty']=qty
+        pos['entry']=entry
 
 def close_positions_if_profitable():
     global open_positions, profit_history
     keep=[]; cycle_pnl=0
-    update_realistic_pnl()
+    update_real_pnl()
     bid, ask, mid = get_tick_data()
     if mid is None: return
     wallet = get_wallet_balance()
     for pos in open_positions:
         pnl = pos.get('realized_pnl',0)
         exit_side = 'sell' if pos['side']=='buy' else 'buy'
+        if pos['trailing_stop'] is None:
+            pos['trailing_stop'] = mid*(1-0.01 if pos['side']=='buy' else 1+0.01)
         micro_target = pos['entry']*(1+MICRO_PROFIT_TARGET if pos['side']=='buy' else 1-MICRO_PROFIT_TARGET)
         close_cond = (pos['side']=='buy' and mid >= micro_target) or (pos['side']=='sell' and mid <= micro_target)
-        if (pos['side']=='buy' and mid < pos['trailing_stop']) or (pos['side']=='sell' and mid > pos['trailing_stop']):
-            close_cond = True
-        if close_cond:
-            success, _ = execute_real_order_realistic(exit_side, pos['qty'])
-            if success:
+        if pos['side']=='buy':
+            pos['trailing_stop'] = max(pos['trailing_stop'], mid*(1-0.005))
+        else:
+            pos['trailing_stop'] = min(pos['trailing_stop'], mid*(1+0.005))
+        if close_cond or ((pos['side']=='buy' and mid < pos['trailing_stop']) or (pos['side']=='sell' and mid > pos['trailing_stop'])):
+            if execute_real_order(exit_side, pos['qty']):
                 cycle_pnl += pnl
                 wallet_learning["signal_history"].append((pos['side'], pnl, 1.0))
         else:
@@ -289,56 +263,40 @@ def close_positions_if_profitable():
     if len(wallet_learning['wallet_history'])>5: wallet_learning['wallet_history'].pop(0)
     smoothed_wallet = sum(wallet_learning['wallet_history'])/len(wallet_learning['wallet_history'])
     wallet_delta = smoothed_wallet - starting_wallet
-    history = wallet_learning["signal_history"][-5:]
-    trade_pnl = sum(p for s,p,c in history)
-    unrealized_pnl = sum(pos.get('realized_pnl',0) for pos in open_positions)
-    graded_pnl = grade_positions_with_simulation()
-    factor = 1 + (trade_pnl + graded_pnl)/(starting_wallet if starting_wallet else 1)
+    # --- Learning from real and simulated trades ---
+    mid_price = mid or 0
+    real_feedback = sum(pnl for side,pnl,_ in wallet_learning["signal_history"][-5:])
+    sim_feedback = 0
+    if background_sim_positions:
+        sim_feedback = sum((mid_price - p['entry']) if p['side']=='buy' else (p['entry'] - mid_price) for p in background_sim_positions) / len(background_sim_positions)
+    factor = 1 + (real_feedback + SIM_PNL_WEIGHT * sim_feedback)/(starting_wallet if starting_wallet else 1)
     if wallet_delta<0: factor *= max(0.6, 1 - abs(wallet_delta)/(starting_wallet if starting_wallet else 1))
     wallet_learning['adjustment_factor'] = max(0.5, min(2.0, factor))
 
 # ============================
 # BACKGROUND SIMULATION
 # ============================
-def simulate_realistic_background(mid_price, n_sim=3):
-    """Simulate positions for ML smoothing without touching real PnL"""
+def simulate_realistic_background(mid_price, n_trades=3):
     global background_sim_positions
-    for _ in range(n_sim):
-        side = random.choice(['buy','sell'])
-        entry = mid_price*(1 + random.uniform(-0.0005,0.0005))
-        background_sim_positions.append({"side": side, "entry": entry, "realized_pnl": None})
+    for _ in range(n_trades):
+        sim_side = random.choice(['buy','sell'])
+        background_sim_positions.append({"side": sim_side, "entry": mid_price, "realized_pnl": None})
     if len(background_sim_positions) > MAX_SIM_POSITIONS:
         background_sim_positions = background_sim_positions[-MAX_SIM_POSITIONS:]
     background_sim_positions = [p for p in background_sim_positions if p.get('realized_pnl') is None]
-
-def grade_positions_with_simulation():
-    """Returns graded PnL with simulation effect for adaptive sizing"""
-    bid, ask, mid = get_tick_data()
-    if mid is None: return 0
-    graded_pnl = sum(pos.get('realized_pnl',0) for pos in open_positions)
-    sim_effect = 0
-    for pos in background_sim_positions:
-        if pos['realized_pnl'] is not None:
-            sim_effect += pos['realized_pnl']
-        else:
-            sim_effect += (mid - pos['entry']) if pos['side']=='buy' else (pos['entry'] - mid)
-    if background_sim_positions:
-        sim_effect /= len(background_sim_positions)
-    graded_pnl += SIM_PNL_WEIGHT * sim_effect
-    return graded_pnl
 
 # ============================
 # DASHBOARD
 # ============================
 def render_dashboard(signal, pred, conf, bid, ask, mid, wallet, wallet_delta, wallet_delta_percent):
     try:
+        graded_pnl = sum(pos.get('realized_pnl',0) for pos in open_positions)
         positions_html = "".join([f"<div class='card'><h3>Pos {i+1} {p['side'].upper()}</h3><p>Qty:{p['qty']:.6f}</p><p>Entry:{p['entry']:.6f}</p><p>PnL:<span style='color:{'green' if p['realized_pnl']>0 else 'red'}'>{p['realized_pnl']:.8f}</span></p></div>" for i,p in enumerate(open_positions)])
         sims_html = f"<p>Background Simulations: {len(background_sim_positions)}</p>"
         wallet_color="green" if wallet_delta>0 else "red" if wallet_delta<0 else "grey"
         wallet_sign="+" if wallet_delta>0 else "-" if wallet_delta<0 else ""
         pred_text = f"↑ {pred:.8f}" if pred>0 else f"↓ {pred:.8f}" if pred<0 else f"→ {pred:.8f}"
-        graded_pnl = grade_positions_with_simulation()
-        metrics_html=f"<div class='metrics'><div class='card'><h3>Signal</h3><p>{signal}</p></div><div class='card'><h3>Prediction</h3><p>{pred_text}</p></div><div class='card'><h3>Confidence</h3><p>{conf:.2f}</p></div><div class='card'><h3>Bid</h3><p>{bid:.8f}</p></div><div class='card'><h3>Ask</h3><p>{ask:.8f}</p></div><div class='card'><h3>Mid</h3><p>{mid:.8f}</p></div><div class='card'><h3>Wallet</h3><p style='color:{wallet_color};'>{wallet:.8f} ({wallet_sign}{abs(wallet_delta):.8f}, {wallet_sign}{abs(wallet_delta_percent):.2f}%)</p></div><div class='card'><h3>Graded PnL</h3><p>{graded_pnl:.8f}</p></div><div class='card'><h3>Open Positions</h3><p>{len(open_positions)}</p></div></div>"
+        metrics_html=f"<div class='metrics'><div class='card'><h3>Signal</h3><p>{signal}</p></div><div class='card'><h3>Prediction</h3><p>{pred_text}</p></div><div class='card'><h3>Confidence</h3><p>{conf:.2f}</p></div><div class='card'><h3>Bid</h3><p>{bid:.8f}</p></div><div class='card'><h3>Ask</h3><p>{ask:.8f}</p></div><div class='card'><h3>Mid</h3><p>{mid:.8f}</p></div><div class='card'><h3>Wallet</h3><p style='color:{wallet_color};'>{wallet:.8f} ({wallet_sign}{abs(wallet_delta):.8f}, {wallet_sign}{abs(wallet_delta_percent):.2f}%)</p></div><div class='card'><h3>Open Positions</h3><p>{len(open_positions)}</p></div><div class='card'><h3>Graded PnL</h3><p>{graded_pnl:.8f}</p></div></div>"
         profit_html="<div class='card'><h3>Profit History</h3><ul>"+ "".join([f"<li style='color:{'green' if pnl>=0 else 'red'}'>Cycle {len(profit_history)-10+i+1}: {pnl:.8f}</li>" for i,pnl in enumerate(profit_history[-10:])]) + "</ul></div>"
         html_content=f"<html><head><meta charset='utf-8'><meta http-equiv='refresh' content='1'><style>body{{font-family:Roboto;background:#f5f5f5}}.metrics{{display:flex;flex-wrap:wrap;}}.card{{background:#fff;border-radius:8px;padding:15px;margin:10px;min-width:150px;box-shadow:0 4px 6px rgba(0,0,0,0.1);}} ul{{padding-left:20px}}</style></head><body><h1>ATOM Bot Dashboard</h1>{metrics_html}{profit_html}<div class='positions'>{positions_html}</div><div class='footer' style='text-align:center;margin:20px'>{sims_html}</div></body></html>"
         with open(HTML_DASHBOARD_FILE,"w") as f: f.write(html_content)
@@ -362,60 +320,46 @@ def close_opposite_positions():
     try:
         if os.path.exists("/closepositions.sh"):
             subprocess.run(["bash","/closepositions.sh"])
-    except Exception as e:
-        console.print(f"[red]Failed to close positions at start: {e}[/red]")
+    except:
+        pass
 
 # ============================
 # MAIN LOOP
 # ============================
 def main():
     global tick_history, starting_wallet, current_direction
-    console.print("[green]Starting ATOM/USDT advanced bot (ultra-fast futures scalping)...[/green]")
+    console.print("[green]Starting ATOM/USDT ultra-fast bot...[/green]")
     close_opposite_positions()
     with Live(refresh_per_second=4) as live:
         while True:
             try:
-                df = get_ohlcv()
-                if df is None or len(df) < MODEL_WINDOW:
-                    time.sleep(1)
-                    continue
+                df=get_ohlcv()
+                if df is None or len(df)<MODEL_WINDOW: time.sleep(1); continue
                 train_model_incremental(df)
-
-                tick_bid, tick_ask, tick_mid = get_tick_data()
-                if tick_mid: tick_history.append(tick_mid)
-                if len(tick_history) > ULTRA_FAST_WINDOW: tick_history = tick_history[-ULTRA_FAST_WINDOW:]
-
-                pred, conf = predict_pnl_direction(df)
-                ultra_signal = get_ultra_fast_signal()
-                orderbook_signal = get_orderbook_signal(exchange.fetch_order_book(SYMBOL))
-                signal = ultra_signal if ultra_signal in ['buy','sell'] else orderbook_signal
-                if signal not in ['buy','sell']: signal = 'hold'
-
-                wallet = get_wallet_balance()
-                if starting_wallet is None: starting_wallet = wallet
-
-                if signal in ['buy','sell'] and conf > CONF_THRESHOLD:
-                    if current_direction != signal:
-                        current_direction = signal
-                    entry_price = tick_ask if signal=='buy' else tick_bid
-                    qty = calc_order_qty(wallet, entry_price, abs(pred)/tick_mid)
-                    add_position(signal, qty, entry_price)
-
-                simulate_realistic_background(tick_mid or df['close'].iloc[-1])
+                tick_bid, tick_ask, tick_mid=get_tick_data()
+                if tick_mid is not None: tick_history.append(tick_mid)
+                if len(tick_history)>10: tick_history=tick_history[-10:]
+                signal_fast=get_ultra_fast_signal()
+                pred, conf=predict_pnl_direction(df)
+                wallet=get_wallet_balance()
+                wallet_delta = wallet - (starting_wallet if starting_wallet else wallet)
+                wallet_delta_percent = (wallet_delta/(starting_wallet if starting_wallet else 1))*100 if starting_wallet else 0
+                render_dashboard(signal_fast, pred, conf, tick_bid, tick_ask, tick_mid or 0, wallet, wallet_delta, wallet_delta_percent)
+                simulate_realistic_background(tick_mid or 0, n_trades=2)
                 close_positions_if_profitable()
-
-                wallet_delta = wallet - starting_wallet
-                wallet_delta_percent = (wallet_delta / starting_wallet * 100) if starting_wallet else 0
-                panel = render_dashboard(signal, pred, conf, tick_bid or 0, tick_ask or 0, tick_mid or 0, wallet, wallet_delta, wallet_delta_percent)
-                live.update(panel)
+                # --- Decide to enter ---
+                if signal_fast in ['buy','sell']:
+                    qty=calc_order_qty(wallet, tick_mid or 1, pred)
+                    add_position(signal_fast, qty, tick_mid)
+                live.update(render_dashboard(signal_fast, pred, conf, tick_bid, tick_ask, tick_mid or 0, wallet, wallet_delta, wallet_delta_percent))
                 time.sleep(UPDATE_INTERVAL)
             except Exception as e:
-                console.print(f"[red]Main loop error: {e}[/red]")
-                console.print(traceback.format_exc())
+                console.print(f"[red]{e}[/red]")
                 time.sleep(1)
 
-if __name__ == "__main__":
+if __name__=="__main__":
     main()
+
 
 
 
