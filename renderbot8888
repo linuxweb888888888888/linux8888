@@ -407,7 +407,8 @@ class TradingBot:
                             if (is_long and prediction > 0) or (not is_long and prediction < 0):
                                 logger.info("PYRAMIDING (COMPOUNDING)")
                                 add_qty = free_margin / price_data['last']
-                                add_qty = max(MIN_QTY, round(add_qty, 3))
+                                # *** HIGH PRECISION UPDATE HERE ***
+                                add_qty = max(MIN_QTY, round(add_qty, 5))
                                 side = 'buy' if is_long else 'sell'
                                 self.sys.place_order(BASE_COIN, add_qty, side)
                                 action_log = "COMPOUNDING"
@@ -423,7 +424,8 @@ class TradingBot:
                                 logger.info("GRID RECOVERY (AVG DOWN)")
                                 # Use 50% of remaining free margin to avg down (leave some for further drops)
                                 recovery_qty = (free_margin * 0.5) / price_data['last']
-                                recovery_qty = max(MIN_QTY, round(recovery_qty, 3))
+                                # *** HIGH PRECISION UPDATE HERE ***
+                                recovery_qty = max(MIN_QTY, round(recovery_qty, 5))
                                 side = 'buy' if is_long else 'sell'
                                 self.sys.place_order(BASE_COIN, recovery_qty, side)
                                 action_log = "AVG DOWN"
@@ -438,7 +440,8 @@ class TradingBot:
                         
                         if max_usd_to_use > (price_data['last'] * MIN_QTY):
                             calc_qty = max_usd_to_use / price_data['last']
-                            trade_qty = max(MIN_QTY, round(calc_qty, 3))
+                            # *** HIGH PRECISION UPDATE HERE ***
+                            trade_qty = max(MIN_QTY, round(calc_qty, 5))
                             
                             if prediction > 0:
                                 self.sys.place_order(BASE_COIN, trade_qty, 'buy')
