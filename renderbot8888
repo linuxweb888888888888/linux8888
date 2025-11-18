@@ -111,13 +111,66 @@ class SystemInterface:
         return output
 
 # ------------------------------------------------------------------------------
+# WALLET LEARNER
+# ------------------------------------------------------------------------------
+class WalletLearner:
+    def __init__(self):
+        self.initial_balance = 0.0
+        self.current_balance = 0.0
+        self.previous_balance = 0.0
+        self.trade_history = deque(maxlen=50) # Track recent balance changes
+        self.dynamic_threshold = 55.0 # Starting confidence threshold
+        self.risk_multiplier = 0.98 # Start with 98% usage
+
+    def update_balance(self, new_balance):
+        if self.initial_balance == 0:
+            self.initial_balance = new_balance
+            self.current_balance = new_balance
+            self.previous_balance = new_balance
+            return
+
+        self.previous_balance = self.current_balance
+        self.current_balance = new_balance
+        
+        delta = self.current_balance - self.previous_balance
+        
+        if abs(delta) > 0.0001: # Ignore tiny fluctuations
+            self.trade_history.append(delta)
+            self.adapt_strategy(delta)
+
+    def adapt_strategy(self, delta):
+        """
+        Learns from wallet changes to adjust Risk and Confidence.
+        Goal: Increase USDT.
+        """
+        # If we just made money (delta > 0)
+        if delta > 0:
+            # We are winning. We can afford to be slightly looser with entry to catch more trades
+            # But keep risk high to compound.
+            self.dynamic_threshold = max(50.0, self.dynamic_threshold - 0.5)
+            self.risk_multiplier = min(0.99, self.risk_multiplier + 0.01) # Increase usage
+            logger.info(f"PROFIT DETECTED: (+{delta:.4f}) -> Loosening Threshold to {self.dynamic_threshold}")
+            
+        # If we lost money (delta < 0)
+        else:
+            # We are losing. Tighten up. Require higher confidence.
+            self.dynamic_threshold = min(75.0, self.dynamic_threshold + 1.0)
+            # Do not reduce risk multiplier too much, we need to recover, but maybe slightly safer
+            self.risk_multiplier = max(0.90, self.risk_multiplier - 0.02)
+            logger.info(f"LOSS DETECTED: ({delta:.4f}) -> Tightening Threshold to {self.dynamic_threshold}")
+
+    def get_growth_pct(self):
+        if self.initial_balance == 0: return 0.0
+        return ((self.current_balance - self.initial_balance) / self.initial_balance) * 100
+
+# ------------------------------------------------------------------------------
 # AI & MARKET DATA ENGINE
 # ------------------------------------------------------------------------------
 class AIEngine:
     def __init__(self):
         self.exchange = ccxt.hitbtc({'enableRateLimit': True})
         self.history = pd.DataFrame()
-        self.model = RandomForestRegressor(n_estimators=50, max_depth=7, random_state=42) # Deeper trees for complex patterns
+        self.model = RandomForestRegressor(n_estimators=50, max_depth=7, random_state=42)
         self.scaler = StandardScaler()
         self.is_trained = False
         self.simulation_wins = 0
@@ -154,7 +207,7 @@ class AIEngine:
         
         # Fast RSI
         delta = df['last'].diff()
-        gain = (delta.where(delta > 0, 0)).rolling(window=7).mean() # Faster window
+        gain = (delta.where(delta > 0, 0)).rolling(window=7).mean()
         loss = (-delta.where(delta < 0, 0)).rolling(window=7).mean()
         rs = gain / loss
         df['rsi'] = 100 - (100 / (1 + rs))
@@ -175,7 +228,7 @@ class AIEngine:
         return df
 
     def train_and_predict(self):
-        if len(self.history) < 20: # Reduce minimum data req for faster start
+        if len(self.history) < 20:
             return 0, 0 
 
         df = self.calculate_features(self.history)
@@ -218,6 +271,7 @@ class TradingBot:
     def __init__(self):
         self.sys = SystemInterface()
         self.ai = AIEngine()
+        self.wallet_learner = WalletLearner()
         self.running = True
         self.iteration = 0
 
@@ -239,6 +293,9 @@ class TradingBot:
         sim_acc = 0
         if self.ai.simulation_total > 0:
             sim_acc = (self.ai.simulation_wins / self.ai.simulation_total) * 100
+            
+        growth_pct = self.wallet_learner.get_growth_pct()
+        growth_class = "success-text" if growth_pct >= 0 else "danger-text"
 
         html = f"""
         <!DOCTYPE html>
@@ -246,7 +303,7 @@ class TradingBot:
         <head>
             <meta charset="UTF-8">
             <meta http-equiv="refresh" content="1">
-            <title>HitBTC MAX AGGRESSIVE</title>
+            <title>HitBTC SMART WALLET BOT</title>
             <style>
                 body {{ font-family: 'Roboto', sans-serif; background-color: #000000; color: #e0e0e0; margin: 0; padding: 20px; }}
                 .container {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 20px; }}
@@ -257,18 +314,21 @@ class TradingBot:
                 h2 {{ margin-top: 0; font-size: 1.2rem; color: #888; }}
                 .value {{ font-size: 2.5rem; font-weight: 900; }}
                 .sub {{ font-size: 0.9rem; color: #666; }}
+                .success-text {{ color: #00ff00; }}
+                .danger-text {{ color: #ff0000; }}
                 .status-bar {{ background: #222; padding: 15px; margin-bottom: 20px; border-radius: 4px; border-bottom: 2px solid #0088ff; }}
             </style>
         </head>
         <body>
             <div class="status-bar">
-                <strong>STATUS:</strong> {action_msg} | <strong>TIME:</strong> {datetime.now().strftime('%H:%M:%S')}
+                <strong>STATUS:</strong> {action_msg} | <strong>MODE:</strong> {self.wallet_learner.risk_multiplier*100:.0f}% Usage
             </div>
             <div class="container">
                 <div class="card info">
-                    <h2>WALLET (ALL-IN MODE)</h2>
+                    <h2>WALLET (SMART LEARNING)</h2>
                     <div class="value">${wallet:.2f}</div>
-                    <div class="sub">Risk: MAXIMUM</div>
+                    <div class="sub">Growth: <span class="{growth_class}">{growth_pct:.2f}%</span></div>
+                    <div class="sub">Dynamic Threshold: {self.wallet_learner.dynamic_threshold:.1f}%</div>
                 </div>
                 <div class="card {pnl_class}">
                     <h2>ACTIVE PNL</h2>
@@ -291,13 +351,21 @@ class TradingBot:
             logger.error(f"Failed to write dashboard: {e}")
 
     def run(self):
-        logger.info("Starting MAX AGGRESSIVE Bot...")
+        logger.info("Starting SMART WALLET LEARNING Bot...")
         self.sys.close_all_positions()
+        
+        # Initial Wallet Read
+        initial_wallet = self.sys.get_wallet_balance()
+        self.wallet_learner.update_balance(initial_wallet)
         
         while self.running:
             try:
                 action_log = "Scanning..."
                 wallet = self.sys.get_wallet_balance()
+                
+                # Update Learning (Detect changes in balance from closed trades)
+                self.wallet_learner.update_balance(wallet)
+                
                 pos_data = self.sys.get_real_position(SYMBOL_BASH)
                 price_data = self.ai.fetch_price()
                 
@@ -309,7 +377,7 @@ class TradingBot:
                 prediction, confidence = self.ai.train_and_predict()
                 
                 # ---------------------------------------------------------
-                # CASE A: HAS POSITION -> MANAGE OR CLOSE
+                # CASE A: HAS POSITION -> MANAGE, PYRAMID, OR CLOSE
                 # ---------------------------------------------------------
                 if pos_data['has_position']:
                     qty = pos_data['qty']
@@ -318,6 +386,8 @@ class TradingBot:
                     
                     # Calculate Real PnL
                     current_pnl = 0
+                    price_diff_pct = 0
+                    
                     if is_long:
                         current_pnl = (price_data['bid'] - entry) * abs(qty)
                         price_diff_pct = (price_data['last'] - entry) / entry
@@ -331,37 +401,55 @@ class TradingBot:
                     action_log = f"PnL: {net_pnl:.4f}"
 
                     # 1. TAKE PROFIT (Strict PnL > Fee)
-                    if net_pnl > 0 and net_pnl > (total_fee * 1.1):
+                    if net_pnl > 0 and net_pnl > (total_fee * 1.2): # Slightly higher buffer
                         logger.info(f"$$$ PROFIT CLOSE: {net_pnl:.6f}")
                         side = 'sell' if is_long else 'buy'
                         self.sys.place_order(BASE_COIN, abs(qty), side)
                         action_log = "CLOSING PROFIT"
 
-                    # 2. AGGRESSIVE GRID ADDITION (If wallet has leftover dust or deposit)
-                    elif price_diff_pct < -GRID_STEP_PCT:
-                        # Use whatever is left in wallet (MAX USAGE)
-                        usable_wallet = wallet * 0.98
-                        cost_min = price_data['last'] * MIN_QTY
+                    # 2. PYRAMIDING (Adding to winners to MAXIMIZE USDT)
+                    # If we are winning, trending, and have wallet space -> ADD
+                    elif net_pnl > (total_fee * 0.5) and confidence > self.wallet_learner.dynamic_threshold:
+                         # Use remaining wallet to compound
+                        usable_wallet = wallet * self.wallet_learner.risk_multiplier
+                        # Subtract estimated current position value to find free margin
+                        current_pos_val = abs(qty) * price_data['last']
+                        free_margin = usable_wallet - current_pos_val
                         
-                        if usable_wallet > cost_min:
-                            # Check AI agreement
+                        if free_margin > (price_data['last'] * MIN_QTY):
                             if (is_long and prediction > 0) or (not is_long and prediction < 0):
-                                logger.info("Adding remaining wallet to position")
-                                add_qty = usable_wallet / price_data['last']
+                                logger.info("PYRAMIDING (Adding to winner)")
+                                add_qty = free_margin / price_data['last']
                                 add_qty = max(MIN_QTY, round(add_qty, 3))
                                 side = 'buy' if is_long else 'sell'
                                 self.sys.place_order(BASE_COIN, add_qty, side)
-                                action_log = "GRID REINFORCE"
+                                action_log = "MAXIMIZING PROFIT"
+                    
+                    # 3. GRID RECOVERY (If losing)
+                    elif price_diff_pct < -GRID_STEP_PCT:
+                        usable_wallet = wallet * self.wallet_learner.risk_multiplier
+                        # Note: In cross margin, wallet is shared. 
+                        # Just try to add a step to lower entry price
+                        cost_min = price_data['last'] * MIN_QTY
+                        if wallet > cost_min: # Check raw wallet for recovery
+                            if (is_long and prediction > 0) or (not is_long and prediction < 0):
+                                logger.info("Grid Recovery Addition")
+                                # Add modest amount to fix entry, not full all-in to avoid liquidation risk
+                                recovery_qty = MIN_QTY * 2 
+                                side = 'buy' if is_long else 'sell'
+                                self.sys.place_order(BASE_COIN, recovery_qty, side)
+                                action_log = "GRID RECOVERY"
 
                 # ---------------------------------------------------------
-                # CASE B: NO POSITION -> OPEN MAX
+                # CASE B: NO POSITION -> OPEN SMART
                 # ---------------------------------------------------------
                 else:
-                    if self.ai.is_trained and confidence > 55: # Lowered threshold for speed
+                    # Use Dynamic Threshold learned from Wallet Performance
+                    if self.ai.is_trained and confidence > self.wallet_learner.dynamic_threshold: 
                         
-                        # MAX WALLET USAGE CALCULATION
-                        # Use 98% of wallet (reserve 2% for fees/slippage)
-                        max_usd_to_use = wallet * 0.98
+                        # SMART WALLET USAGE
+                        # Usage % adapts based on winning/losing streak
+                        max_usd_to_use = wallet * self.wallet_learner.risk_multiplier
                         
                         if max_usd_to_use > (price_data['last'] * MIN_QTY):
                             calc_qty = max_usd_to_use / price_data['last']
@@ -369,14 +457,14 @@ class TradingBot:
                             
                             if prediction > 0:
                                 self.sys.place_order(BASE_COIN, trade_qty, 'buy')
-                                action_log = "ALL-IN LONG"
+                                action_log = "SMART ENTRY LONG"
                             elif prediction < 0:
                                 self.sys.place_order(BASE_COIN, trade_qty, 'sell')
-                                action_log = "ALL-IN SHORT"
+                                action_log = "SMART ENTRY SHORT"
 
                 self.generate_dashboard(wallet, pos_data, price_data, prediction, confidence, action_log)
                 self.iteration += 1
-                time.sleep(0.1) # Hyper-fast loop
+                time.sleep(0.1)
 
             except KeyboardInterrupt:
                 self.running = False
