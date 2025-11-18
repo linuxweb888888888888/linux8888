@@ -209,24 +209,27 @@ class AIEngine:
         df = df.copy()
         df['returns'] = df['last'].pct_change()
         
-        # MAX SPEED: Ultra Fast RSI (Period 3) - Reacts instantly
+        # FIX: Increased look-back window from 3 to 5 to generate more stable, non-zero signals.
+        # This is necessary because 50ms gaps often result in zero-change data, causing the model to predict 0.
+        
+        # Ultra Fast RSI (Period 5) 
         delta = df['last'].diff()
-        gain = (delta.where(delta > 0, 0)).rolling(window=3).mean()
-        loss = (-delta.where(delta < 0, 0)).rolling(window=3).mean()
+        gain = (delta.where(delta > 0, 0)).rolling(window=5).mean()
+        loss = (-delta.where(delta < 0, 0)).rolling(window=5).mean()
         rs = gain / loss
         df['rsi'] = 100 - (100 / (1 + rs))
         
-        # MAX SPEED: Volatility (Period 3) - Measures short-term instability
-        df['volatility'] = df['returns'].rolling(window=3).std()
+        # Volatility (Period 5) - Measures short-term instability
+        df['volatility'] = df['returns'].rolling(window=5).std()
         
-        # Momentum (Period 2)
-        df['momentum'] = df['last'] - df['last'].shift(2)
+        # Momentum (Period 3)
+        df['momentum'] = df['last'] - df['last'].shift(3)
 
         # Spread
         df['spread'] = df['ask'] - df['bid']
         
-        # Fast Moving Average (MA 3)
-        df['ma_3'] = df['last'].rolling(window=3).mean()
+        # Fast Moving Average (MA 5)
+        df['ma_5'] = df['last'].rolling(window=5).mean()
         
         # Target: Immediate next tick
         df['target'] = df['last'].shift(-1) - df['last']
@@ -234,8 +237,8 @@ class AIEngine:
         return df
 
     def train_and_predict(self):
-        # Increased requirement to 30 to ensure robust feature calculation after dropna
-        if len(self.history) < 30: 
+        # Increased requirement to 50 to ensure robust feature calculation after dropna, matching the 5-period window.
+        if len(self.history) < 50: 
             return 0, 0 
 
         df_all = self.calculate_features(self.history)
@@ -250,8 +253,8 @@ class AIEngine:
         if df_train.empty or X_current.empty: 
             return 0, 0
 
-        # Feature definition
-        feature_cols = ['rsi', 'volatility', 'spread', 'momentum', 'ma_3'] 
+        # Feature definition (Updated feature name from 'ma_3' to 'ma_5')
+        feature_cols = ['rsi', 'volatility', 'spread', 'momentum', 'ma_5'] 
         
         # Check if the needed features exist in the current feature set
         X_current = X_current[feature_cols]
@@ -279,7 +282,7 @@ class AIEngine:
         
         # Calculate volatility based on the training data
         avg_vol = df_train['volatility'].mean()
-        # Confidence based on strength of signal vs noise
+        # Confidence based on strength of signal vs noise (capped at 100%)
         confidence = min(abs(prediction) / (avg_vol + 1e-9), 1.0) * 100
         
         self.last_prediction = prediction
