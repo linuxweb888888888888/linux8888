@@ -224,24 +224,40 @@ class AIEngine:
         # Target: Immediate next tick
         df['target'] = df['last'].shift(-1) - df['last']
         
-        df = df.dropna()
+        # IMPORTANT: Do NOT dropna here. We dropna in train_and_predict 
+        # to separate the training set from the prediction set.
         return df
 
     def train_and_predict(self):
-        if len(self.history) < 15: # Start very fast
+        # Increased requirement to 30 to ensure robust feature calculation after dropna
+        if len(self.history) < 30: 
             return 0, 0 
 
-        df = self.calculate_features(self.history)
-        if df.empty: return 0, 0
+        df_all = self.calculate_features(self.history)
+        
+        # Separate the current, untargeted row for prediction
+        X_current = df_all.iloc[[-1]].drop(columns=['target']).dropna()
+        
+        # Create the training set (removes last row with NaN target, and early rows with NaN features)
+        df_train = df_all.iloc[:-1].dropna()
 
-        # Include the new 'ma_3' feature
+        # Check for sufficient data after cleaning
+        if df_train.empty or X_current.empty: 
+            return 0, 0
+
+        # Feature definition
         feature_cols = ['rsi', 'volatility', 'spread', 'momentum', 'ma_3'] 
-        X = df[feature_cols]
-        y = df['target']
+        
+        # Check if the needed features exist in the current feature set
+        X_current = X_current[feature_cols]
 
-        # Simulation Tracking
+        X = df_train[feature_cols]
+        y = df_train['target']
+
+        # Simulation Tracking - Run *before* training the new model
         if self.is_trained:
-            actual_move = df.iloc[-1]['target'] if not pd.isna(df.iloc[-1]['target']) else 0
+            # Check the outcome of the last data point in the training set
+            actual_move = df_all.iloc[-2]['target'] if not pd.isna(df_all.iloc[-2]['target']) else 0
             if (self.last_prediction > 0 and actual_move > 0) or (self.last_prediction < 0 and actual_move < 0):
                 self.simulation_wins += 1
             self.simulation_total += 1
@@ -250,12 +266,14 @@ class AIEngine:
             self.model.fit(X, y)
             self.is_trained = True
         except Exception as e:
+            logger.error(f"ML Training failed: {e}")
             return 0, 0
 
-        current_features = X.iloc[[-1]]
-        prediction = self.model.predict(current_features)[0]
+        # Predict using the clean, current feature vector
+        prediction = self.model.predict(X_current)[0]
         
-        avg_vol = df['volatility'].mean()
+        # Calculate volatility based on the training data
+        avg_vol = df_train['volatility'].mean()
         # Confidence based on strength of signal vs noise
         confidence = min(abs(prediction) / (avg_vol + 1e-9), 1.0) * 100
         
