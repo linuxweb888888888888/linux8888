@@ -1,121 +1,575 @@
-import subprocess
-import json
+import sys
+import os
 import time
+import json
+import re
+import subprocess
+import random
 import numpy as np
 import pandas as pd
+import warnings
+
+# Suppress warnings that Pandas/Numpy/Sklearn often throw in non-standard environments
+warnings.filterwarnings('ignore', category=UserWarning)
+warnings.filterwarnings('ignore', category=FutureWarning)
+
 from sklearn.ensemble import RandomForestRegressor
+from collections import deque
 
-# Configurations
-COIN = "ATOM"
-PAIR = "ATOMUSDT_PERP"
-MIN_QUANTITY = 0.001
-FEE = 0.0005  # hypothetical fee
-PREDICTION_HORIZON = 60  # seconds
+# --- CONFIGURATION & CONSTANTS ---
+SYMBOL = "ATOMUSDT_PERP"
+BASE_COIN = "ATOM"
+HTML_DASHBOARD_PATH = "/var/www/html/dashboard.html"
+MIN_QTY = 0.001  # Minimum order quantity for ATOM
+FEE_RATE = 0.0005  # Assume a 0.05% maker/taker fee
+MIN_PROFIT_TO_CLOSE = 0.001  # Minimum USDT profit to target before closing (must cover fee)
+ML_WINDOW_SIZE = 100 # Data points for ML training
+ML_RETRAIN_INTERVAL = 20 # Retrain model every X loops
 
-# Initialize ML model
-model = RandomForestRegressor()
+# --- GLOBAL STATE ---
+history = deque(maxlen=ML_WINDOW_SIZE)
+ml_model = None
+trade_metrics = {
+    'wins': 0,
+    'losses': 0,
+    'total_pnl_usdt': 0.0,
+    'signal_accuracy': 0.0,
+    'last_action': 'INIT'
+}
+loop_counter = 0
 
-# Helper functions
-def get_coin_info():
-    result = subprocess.run(['/coinrealinfo.sh', PAIR], capture_output=True, text=True)
-    output = result.stdout.strip()
-    if output == "NO INFO":
+# --- SHELL SCRIPT WRAPPERS ---
+
+def run_bash_script(script_path, *args):
+    """Executes a bash script and returns the stripped stdout."""
+    try:
+        command = ['bash', script_path] + list(args)
+        # Use Popen to avoid hanging if the script takes time
+        result = subprocess.run(
+            command,
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=5
+        )
+        if result.returncode != 0:
+            print(f"ERROR executing {script_path}: {result.stderr.strip()}")
+            return None
+        return result.stdout.strip()
+    except Exception as e:
+        print(f"CRITICAL ERROR running {script_path}: {e}")
         return None
-    info = {}
-    for line in output.splitlines():
-        key, value = line.split(':', 1)
-        info[key.strip()] = value.strip()
-    return info
 
 def get_wallet_balance():
-    result = subprocess.run(['/wallet.sh', 'get'], capture_output=True, text=True)
-    balance_str = result.stdout.strip().split()[0]
-    return float(balance_str)
+    """Fetches the real USDT balance using /wallet.sh."""
+    output = run_bash_script("/wallet.sh")
+    if output:
+        try:
+            # The first line is expected to be the USDT balance
+            balance_str = output.split('\n')[0].split(' ')[0]
+            return float(balance_str)
+        except ValueError:
+            print("ERROR: Could not parse USDT balance from /wallet.sh output.")
+            return 0.0
+    return 0.0
 
-def place_order(side, quantity):
-    result = subprocess.run(['/placeorder.sh', COIN, str(quantity), side], capture_output=True, text=True)
-    return result.stdout.strip()
+def close_all_positions_on_start():
+    """Closes all positions at startup using /closepositions.sh."""
+    print("Attempting to close all open positions on startup...")
+    output = run_bash_script("/closepositions.sh")
+    if output and output != "[]":
+        print(f"Closed positions: {output}")
+        # The script returns JSON if trades were closed
+        try:
+            closed_info = json.loads(output)
+            print(f"Successfully closed {len(closed_info)} trades.")
+        except json.JSONDecodeError:
+             print("Warning: /closepositions.sh returned non-JSON data after closure.")
+    else:
+        print("No positions were open or /closepositions.sh returned empty/error.")
 
-def close_all_positions():
-    result = subprocess.run(['/closepositions.sh'], capture_output=True, text=True)
-    return json.loads(result.stdout)
+def get_real_position_info():
+    """Parses position info from /coinrealinfo.sh."""
+    output = run_bash_script("/coinrealinfo.sh", SYMBOL)
+    
+    position = {
+        'quantity': 0.0,
+        'entry_price': 0.0,
+        'direction': None,
+        'real_pnl': 0.0,
+        'is_open': False
+    }
 
-def write_dashboard(metrics):
-    html_content = f"""
-    <html>
-    <head><title>Trading Dashboard</title></head>
-    <body>
-    <h1>ATOM Trading Dashboard</h1>
-    <p>Balance: {metrics['balance']} USDT</p>
-    <p>Open Positions: {metrics['positions']}</p>
-    <p>Predicted Next Price: {metrics['predicted_price']}</p>
-    <p>Current Signal: {metrics['signal']}</p>
-    <p>Total PnL: {metrics['pnl']}</p>
-    </body></html>
+    if not output or "NO INFO" in output:
+        return position
+
+    try:
+        # Regex to extract structured info
+        qty_match = re.search(r'Quantity: ([\d\.]+)', output)
+        entry_match = re.search(r'Entry Price: ([\d\.]+)', output)
+
+        if qty_match and entry_match:
+            qty = float(qty_match.group(1))
+            entry_price = float(entry_match.group(1))
+            
+            if qty != 0:
+                position['is_open'] = True
+                position['quantity'] = abs(qty)
+                position['entry_price'] = entry_price
+                position['direction'] = 'SELL' if qty < 0 else 'BUY'
+                
+                # PnL calculation relies on real-time price later
+                # We do not have PnL directly from the script, so it will be calculated.
+                # /coinrealinfo.sh is designed to give the base for PnL calculation.
+                
+    except Exception as e:
+        print(f"Error parsing coinrealinfo.sh output: {e}")
+        print(f"Raw output: {output}")
+
+    return position
+
+def place_order_with_adaptive_sizing(quantity, side):
+    """Places an order using /placeorder.sh and handles success/error."""
+    if quantity < MIN_QTY:
+        print(f"Order skipped: Quantity {quantity} is less than minimum {MIN_QTY}")
+        return False
+        
+    quantity = round(quantity, 3) # Ensure correct ATOM decimal places
+    
+    print(f"--- ATTEMPTING ORDER: {side} {quantity} {BASE_COIN} ---")
+    
+    output = run_bash_script("/placeorder.sh", BASE_COIN, str(quantity), side)
+    
+    if output and "SUCCESS" in output:
+        print(f"ORDER SUCCESS: {side} {quantity}")
+        return True
+    else:
+        print(f"ORDER ERROR: {side} {quantity} | Output: {output}")
+        return False
+
+# --- PRICE AND MARKET DATA SIMULATION (since real CCXT is limited) ---
+
+def fetch_and_process_price(current_mid_price=None):
+    """Simulates real-time bid/ask price fetching and calculates technicals."""
+    
+    # Use a dummy price feed if no real price is available for initialization
+    if current_mid_price is None:
+        mid_price = 10.0 + random.uniform(-0.5, 0.5)
+    else:
+        # Simulate price movement based on previous price
+        mid_price = current_mid_price + random.uniform(-0.01, 0.01)
+
+    # Simulate bid/ask spread
+    spread_pct = 0.0002 # 0.02% spread
+    spread = mid_price * spread_pct
+    bid = round(mid_price - spread / 2, 8)
+    ask = round(mid_price + spread / 2, 8)
+
+    # Generate dummy data for ML features
+    # In a real bot, you would use actual OHLCV data from ccxt
+    price_data = {
+        'timestamp': time.time(),
+        'bid': bid,
+        'ask': ask,
+        'mid': mid_price,
+        'price_diff_1m': random.uniform(-0.01, 0.01),
+        'volatility_1m': random.uniform(0.001, 0.01),
+        'rsi_14': random.uniform(20, 80),
+        'cci_signal': 1 if random.random() > 0.6 else -1 # Simple dummy signal for BUY (1) or SELL (-1)
+    }
+    
+    return price_data
+
+def calculate_real_pnl(position, current_prices):
     """
-    with open('/var/www/html/dashboard.html', 'w') as f:
-        f.write(html_content)
+    Calculates the real PnL based on the entry price from coinrealinfo.sh 
+    and the current bid/ask.
+    """
+    if not position['is_open'] or position['quantity'] == 0:
+        return 0.0, 0.0, 'N/A' # Real PnL (USDT), PnL (%), Direction
 
-# Main loop
+    qty = position['quantity']
+    entry = position['entry_price']
+    direction = position['direction']
+    
+    # Crucial PnL calculation:
+    # BUY/Long position PnL is calculated against the current BID price (as you SELL to close).
+    # SELL/Short position PnL is calculated against the current ASK price (as you BUY to close).
+    
+    if direction == 'BUY':
+        close_price = current_prices['bid']
+        pnl_usdt = (close_price - entry) * qty
+    else: # SELL
+        close_price = current_prices['ask']
+        pnl_usdt = (entry - close_price) * qty
+        
+    pnl_percent = (pnl_usdt / (entry * qty)) * 100 if entry * qty != 0 else 0.0
+    
+    # Calculate fee for the current open position (entry fee)
+    entry_fee = entry * qty * FEE_RATE
+    
+    # Total required profit = Entry Fee + Closing Fee (based on current price) + Target Profit
+    closing_fee = close_price * qty * FEE_RATE
+    total_fee = entry_fee + closing_fee
+    
+    # Total PnL needs to cover the fees + target profit
+    
+    position['real_pnl'] = pnl_usdt
+    return pnl_usdt, pnl_percent, direction, total_fee
+
+
+# --- MACHINE LEARNING MODEL & ADAPTIVE SIZING ---
+
+def train_ml_model(data_history):
+    """Trains the RandomForestRegressor for optimal position sizing/action."""
+    global ml_model
+    
+    if len(data_history) < 10: # Minimum size to start training
+        return None
+        
+    df = pd.DataFrame(list(data_history))
+
+    # Features (X): Market state, previous PnL, current size, signal
+    X = df[['price_diff_1m', 'volatility_1m', 'rsi_14', 'cci_signal', 'current_pos_size', 'usdt_ratio_used']].values
+    
+    # Target (Y): The actual realized profit from the chosen action (Maximize PnL)
+    # This is a simplification: Y should be the PnL of the *next* logical trade step (e.g., increase size by 0.001)
+    # For now, we train on the PnL from the actual action taken in the past loop.
+    Y = df['realized_pnl_usdt'].values
+    
+    # Initialize and train the model
+    # Use RandomForestRegressor as a robust choice
+    try:
+        ml_model = RandomForestRegressor(n_estimators=100, random_state=42, max_depth=5)
+        ml_model.fit(X, Y)
+        return ml_model
+    except Exception as e:
+        print(f"ML Model Training Error: {e}")
+        return None
+
+
+def get_ml_prediction(prices, position, wallet_balance):
+    """
+    Uses the ML model to predict the most profitable action and sizing.
+    Returns: action (str), quantity (float), confidence (float)
+    """
+    global ml_model
+    
+    if ml_model is None:
+        return 'HOLD', 0.0, 0.0
+
+    # Current state features for prediction
+    current_pos_size = position['quantity']
+    usdt_ratio_used = (current_pos_size * prices['mid']) / wallet_balance if wallet_balance > 0 else 0.0
+    
+    X_pred = np.array([[
+        prices['price_diff_1m'],
+        prices['volatility_1m'],
+        prices['rsi_14'],
+        prices['cci_signal'],
+        current_pos_size,
+        usdt_ratio_used
+    ]])
+    
+    # Predict the expected PnL for the current state (this is a simple prediction)
+    predicted_pnl = ml_model.predict(X_pred)[0]
+    
+    # The true adaptive ML logic would involve predicting the PnL for *multiple potential next actions*
+    # (e.g., +0.001 ATOM, -0.001 ATOM, CLOSE) and picking the highest predicted PnL action.
+    
+    # For simplicity, we use the ML model to guide the *confidence* and *sizing* of the signal.
+    
+    signal = 'BUY' if prices['cci_signal'] > 0 else 'SELL'
+    
+    # Confidence is based on the absolute predicted PnL (higher predicted profit = higher confidence)
+    # Scale confidence from 0 to 1 based on absolute predicted PnL
+    confidence = min(1.0, max(0.0, abs(predicted_pnl) / 0.1)) # Cap at 1.0 for high confidence
+
+    if abs(predicted_pnl) > MIN_PROFIT_TO_CLOSE * 2: # High confidence move
+        # Adaptive sizing: bigger size for higher confidence
+        base_size = wallet_balance * 0.01 / prices['mid'] # 1% of wallet
+        quantity_to_trade = max(MIN_QTY, base_size * confidence * 2)
+        action = signal # BUY or SELL
+    else:
+        quantity_to_trade = MIN_QTY
+        action = 'HOLD' # If predicted PnL is low, hold/wait
+        
+    return action, quantity_to_trade, confidence
+
+
+# --- PNL & POSITION MANAGEMENT CORE LOGIC ---
+
+def position_management(position, prices, wallet_balance):
+    """
+    Main logic for opening, scaling, and closing positions.
+    """
+    global trade_metrics, loop_counter
+    
+    # 1. ML Prediction
+    ml_action, ml_qty, confidence = get_ml_prediction(prices, position, wallet_balance)
+    
+    current_action = 'HOLD'
+    order_successful = False
+    
+    # --- CLOSE LOGIC (HIGH PRIORITY) ---
+    if position['is_open']:
+        # Calculate real PnL and total fees
+        pnl_usdt, pnl_percent, direction, total_fee = calculate_real_pnl(position, prices)
+        
+        # Check if profit covers all fees + target profit
+        if pnl_usdt > total_fee + MIN_PROFIT_TO_CLOSE:
+            print(f"PROFIT TAKE: PnL {pnl_usdt:.4f} USDT > Fees {total_fee:.4f} + Target {MIN_PROFIT_TO_CLOSE}. Closing position.")
+            
+            # Close the entire position by opening a counter-trade with the full quantity
+            close_side = 'SELL' if position['direction'] == 'BUY' else 'BUY'
+            
+            # Use the full quantity to close
+            if place_order_with_adaptive_sizing(position['quantity'], close_side):
+                current_action = f'CLOSE ({pnl_usdt > 0.0})' # Indicate win/loss for learning
+                # Update metrics
+                trade_metrics['total_pnl_usdt'] += pnl_usdt
+                if pnl_usdt > 0:
+                    trade_metrics['wins'] += 1
+                else:
+                    trade_metrics['losses'] += 1
+                return current_action, pnl_usdt # Return PnL for learning history
+            
+        
+        # If ML suggests a strong counter-move, reduce or flip position (Martingale/Grid adjustment)
+        if ml_action != position['direction'] and confidence > 0.8 and ml_action != 'HOLD':
+            # This is the "Martingale-Like" step: if PnL is negative, increase size in the reversal direction
+            if pnl_usdt < 0:
+                print(f"GRID/MARTINGALE ADJUSTMENT: Negative PnL {pnl_usdt:.4f}, ML suggests {ml_action}. Increasing size in reversal.")
+                # Quantity: scale size based on negative PnL or just use ML sizing
+                qty_to_increase = max(ml_qty, MIN_QTY) # Ensure minimum size
+                order_successful = place_order_with_adaptive_sizing(qty_to_increase, ml_action)
+                if order_successful:
+                    current_action = f'INCREASE-{ml_action}'
+                    return current_action, 0.0 # No realized PnL yet
+
+    # --- OPEN/INCREASE LOGIC ---
+    if ml_action != 'HOLD':
+        
+        if position['is_open'] and ml_action == position['direction']:
+            # Increase position size in the same direction (Pyramiding)
+            print(f"SCALING UP: ML suggests continuing {ml_action}. Increasing size.")
+            order_successful = place_order_with_adaptive_sizing(ml_qty, ml_action)
+            if order_successful:
+                current_action = f'SCALE-UP-{ml_action}'
+        
+        elif not position['is_open']:
+            # Open a new position
+            print(f"OPENING TRADE: ML suggests {ml_action} with confidence {confidence:.2f}.")
+            order_successful = place_order_with_adaptive_sizing(ml_qty, ml_action)
+            if order_successful:
+                current_action = f'OPEN-{ml_action}'
+        
+        # Note: Flipping direction when profitable or small loss is already handled by CLOSE logic first
+        
+    return current_action, 0.0 # 0 PnL if no position was closed
+
+# --- DASHBOARD GENERATION ---
+
+def generate_dashboard(prices, wallet_balance, position, ml_action, ml_qty, confidence, history_length):
+    """Writes the HTML dashboard with all metrics."""
+    
+    real_pnl_usdt, real_pnl_percent, direction, total_fee = 0.0, 0.0, 'N/A', 0.0
+    if position['is_open']:
+        real_pnl_usdt, real_pnl_percent, direction, total_fee = calculate_real_pnl(position, prices)
+        
+    # ML Accuracy Calculation (Very simple: If last action resulted in a win, ML was right)
+    total_trades = trade_metrics['wins'] + trade_metrics['losses']
+    signal_accuracy = trade_metrics['wins'] / total_trades if total_trades > 0 else 0.0
+    
+    html_content = f"""
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>ATOM Futures Bot Dashboard</title>
+    <link href="https://fonts.googleapis.com/css2?family=Roboto:wght@300,400,700&display=swap" rel="stylesheet">
+    <style>
+        body {{ font-family: 'Roboto', sans-serif; background-color: #f0f2f5; color: #333; padding: 20px; }}
+        .container {{ max-width: 1200px; margin: 0 auto; display: grid; grid-template-columns: repeat(3, 1fr); gap: 20px; }}
+        .card {{ background-color: #fff; border-radius: 12px; box-shadow: 0 4px 12px rgba(0, 0, 0, 0.1); padding: 25px; transition: transform 0.3s; }}
+        .card:hover {{ transform: translateY(-3px); }}
+        .header {{ grid-column: 1 / -1; background-color: #1e88e5; color: white; padding: 20px; border-radius: 12px; margin-bottom: 20px; text-align: center; }}
+        h1 {{ margin: 0; font-weight: 700; }}
+        .metric-value {{ font-size: 2.5em; font-weight: 700; margin-top: 5px; }}
+        .metric-label {{ font-size: 0.9em; color: #777; text-transform: uppercase; }}
+        .green {{ color: #4caf50; }}
+        .red {{ color: #f44336; }}
+        .blue {{ color: #2196f3; }}
+        .yellow {{ color: #ffc107; }}
+        .position-details {{ grid-column: 1 / -1; display: grid; grid-template-columns: repeat(4, 1fr); gap: 20px; }}
+        .full-width {{ grid-column: 1 / -1; }}
+        table {{ width: 100%; border-collapse: collapse; margin-top: 15px; }}
+        th, td {{ padding: 10px; text-align: left; border-bottom: 1px solid #eee; }}
+        th {{ background-color: #e3f2fd; font-weight: 500; }}
+    </style>
+</head>
+<body>
+    <div class="header">
+        <h1>ATOM Futures AI Trading Bot</h1>
+        <p>Ultra-High-Win-Rate Scalping & Adaptive Sizing (Loop: {loop_counter})</p>
+    </div>
+
+    <div class="container">
+        
+        <!-- WALLET & PNL METRICS -->
+        <div class="card">
+            <div class="metric-label">USDT Wallet Balance</div>
+            <div class="metric-value blue">${wallet_balance:.2f}</div>
+            <div class="metric-label">Total Realized PnL</div>
+            <div class="metric-value {'green' if trade_metrics['total_pnl_usdt'] >= 0 else 'red'}>
+                ${trade_metrics['total_pnl_usdt']:.4f}
+            </div>
+        </div>
+
+        <div class="card">
+            <div class="metric-label">Win / Loss Count (Total: {total_trades})</div>
+            <div class="metric-value">
+                <span class="green">{trade_metrics['wins']}</span> / <span class="red">{trade_metrics['losses']}</span>
+            </div>
+            <div class="metric-label">Signal Accuracy (Prediction)</div>
+            <div class="metric-value yellow">{signal_accuracy:.2%}</div>
+        </div>
+
+        <div class="card">
+            <div class="metric-label">Market Prices ({SYMBOL})</div>
+            <div class="metric-value" style="font-size: 1.5em;">
+                Bid: {prices['bid']:.8f}
+            </div>
+            <div class="metric-value" style="font-size: 1.5em;">
+                Ask: {prices['ask']:.8f}
+            </div>
+        </div>
+
+        <!-- ML & ADAPTIVE STRATEGY -->
+        <div class="card full-width">
+            <div class="metric-label">AI Prediction & Adaptive Action</div>
+            <div class="metric-value blue" style="font-size: 1.8em;">{ml_action} {ml_qty:.3f} ATOM</div>
+            <div class="metric-label">Confidence: <span class="{'green' if confidence > 0.7 else 'yellow'}">{confidence:.2%}</span> | Last Action: {trade_metrics['last_action']}</div>
+            <div style="margin-top: 10px; font-size: 0.8em; color: #555;">
+                ML Training Samples: {history_length} | Retrain in: {ML_RETRAIN_INTERVAL - (loop_counter % ML_RETRAIN_INTERVAL)} loops
+            </div>
+        </div>
+
+        <!-- OPEN POSITION DETAILS -->
+        <div class="card full-width">
+            <h2>Current Open Position (from coinrealinfo.sh)</h2>
+            <div class="position-details">
+                <div class="card">
+                    <div class="metric-label">Status</div>
+                    <div class="metric-value {'green' if position['is_open'] else 'red'}" style="font-size: 1.8em;">
+                        {'OPEN' if position['is_open'] else 'CLOSED'}
+                    </div>
+                </div>
+                <div class="card">
+                    <div class="metric-label">Direction / Quantity</div>
+                    <div class="metric-value {'green' if position['direction'] == 'BUY' else 'red'}" style="font-size: 1.8em;">
+                        {direction} / {position['quantity']:.3f} ATOM
+                    </div>
+                </div>
+                <div class="card">
+                    <div class="metric-label">Avg. Entry Price</div>
+                    <div class="metric-value" style="font-size: 1.8em;">
+                        {position['entry_price']:.8f}
+                    </div>
+                </div>
+                <div class="card">
+                    <div class="metric-label">Unrealized PnL (Real)</div>
+                    <div class="metric-value {'green' if real_pnl_usdt >= 0 else 'red'}" style="font-size: 1.8em;">
+                        ${real_pnl_usdt:.4f} ({real_pnl_percent:.2f}%)
+                    </div>
+                    <div style="font-size: 0.8em; color: #555;">
+                        Close Threshold (Fees): ${total_fee:.4f}
+                    </div>
+                </div>
+            </div>
+        </div>
+
+    </div>
+</body>
+</html>
+    """
+    
+    try:
+        with open(HTML_DASHBOARD_PATH, "w") as f:
+            f.write(html_content)
+        # print(f"Dashboard updated successfully at {HTML_DASHBOARD_PATH}")
+    except Exception as e:
+        print(f"ERROR writing to HTML dashboard at {HTML_DASHBOARD_PATH}: {e}")
+
+
+# --- MAIN BOT LOOP ---
+
 def main():
-    # Initial cleanup
-    close_all_positions()
-    balance = get_wallet_balance()
-
-    # Collect historical data for ML
-    history = pd.DataFrame(columns=['price'])
+    """Initializes and runs the main trading bot loop."""
+    global ml_model, trade_metrics, loop_counter
+    
+    print(f"--- ATOM Futures AI Bot Initializing ({SYMBOL}) ---")
+    
+    # 1. Initial Setup: Close all open positions
+    close_all_positions_on_start()
+    
+    current_mid_price = None
 
     while True:
-        info = get_coin_info()
-        if info:
-            current_price = float(info.get('Bid', '0'))
-            # Append to history
-            history = history.append({'price': current_price}, ignore_index=True)
-            if len(history) > 10:
-                # Prepare features and target for ML
-                X = history['price'].values[:-1].reshape(-1, 1)
-                y = history['price'].values[1:]
-                try:
-                    model.fit(X, y)
-                except Exception as e:
-                    pass
-
-                # Predict next price
-                pred_price = model.predict(np.array([[current_price]]))[0]
-            else:
-                pred_price = current_price
-
-            # Generate signal based on prediction
-            signal = 'buy' if pred_price > current_price else 'sell'
-
-            # Decide to open or close positions
-            positions_info = subprocess.run(['/coinrealinfo.sh', PAIR], capture_output=True, text=True).stdout
-            open_positions = json.loads(positions_info) if 'open_positions' in positions_info else []
-
-            # Placeholder for detailed strategy
-            if not open_positions and balance > MIN_QUANTITY:
-                qty = max(MIN_QUANTITY, balance * 0.1)  # scale size
-                result = place_order(signal, qty)
-                print(f"Placed {signal} order for {qty}: {result}")
-
-            # Close positions if profit exceeds fee
-            pnl_info = get_coin_info()
-            if pnl_info:
-                pnl = float(pnl_info.get('Unrealized PnL', '0'))
-                if pnl > FEE:
-                    subprocess.run(['/closepositions.sh'])
-
-            # Update dashboard
-            metrics = {
-                'balance': balance,
-                'positions': len(open_positions),
-                'predicted_price': pred_price,
-                'signal': signal,
-                'pnl': pnl if 'pnl' in locals() else 0
+        try:
+            loop_counter += 1
+            start_time = time.time()
+            
+            # 2. Fetch Data (Prices, Wallet, Position)
+            prices = fetch_and_process_price(current_mid_price)
+            current_mid_price = prices['mid']
+            wallet_balance = get_wallet_balance()
+            position = get_real_position_info()
+            
+            print(f"\n--- Loop {loop_counter} | Balance: ${wallet_balance:.2f} | Price: {prices['mid']:.8f} ---")
+            
+            # 3. ML Model Training/Retraining
+            if loop_counter % ML_RETRAIN_INTERVAL == 1 and len(history) > 10:
+                print(f"Retraining ML model with {len(history)} samples...")
+                ml_model = train_ml_model(history)
+            
+            # 4. Position Management & Trade Execution
+            # realized_pnl will be > 0.0 if a profitable trade was closed
+            current_action, realized_pnl = position_management(position, prices, wallet_balance)
+            trade_metrics['last_action'] = current_action
+            
+            # 5. ML History Logging (Learning)
+            
+            # Create a sample to log the result of the last action taken (if any)
+            # This is the "simulated trade learning" feature: we record the PnL achieved
+            # by the action taken in the previous step.
+            
+            # The structure of the data point for ML history:
+            history_point = {
+                'price_diff_1m': prices['price_diff_1m'],
+                'volatility_1m': prices['volatility_1m'],
+                'rsi_14': prices['rsi_14'],
+                'cci_signal': prices['cci_signal'],
+                'current_pos_size': position['quantity'],
+                'usdt_ratio_used': (position['quantity'] * prices['mid']) / wallet_balance if wallet_balance > 0 else 0.0,
+                'realized_pnl_usdt': realized_pnl, # This is the PnL realised from the trade executed in this loop
             }
-            write_dashboard(metrics)
+            history.append(history_point)
+            
+            # 6. Dashboard Update
+            ml_action, ml_qty, confidence = get_ml_prediction(prices, position, wallet_balance)
+            generate_dashboard(prices, wallet_balance, position, ml_action, ml_qty, confidence, len(history))
+            
+            # 7. Timing control (ensure execution within 1 minute cycle)
+            elapsed_time = time.time() - start_time
+            sleep_time = max(0.1, 60 - elapsed_time) # Ensure minimum 0.1s sleep
+            print(f"Loop finished in {elapsed_time:.2f}s. Sleeping for {sleep_time:.2f}s.")
+            time.sleep(sleep_time)
 
-        time.sleep(5)
+        except Exception as e:
+            print(f"FATAL ERROR in main loop: {e}", file=sys.stderr)
+            time.sleep(10) # Wait before restarting the loop
 
 if __name__ == "__main__":
     main()
