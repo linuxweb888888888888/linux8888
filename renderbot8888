@@ -30,6 +30,8 @@ MAX_POSITION_RISK_PERCENT = 0.50 # Max percentage of balance for total position 
 # Dashboard path
 DASHBOARD_PATH = "/var/www/html/dashboard.html"
 
+print("linux8888")
+
 # --- GLOBAL STATE (Persisted DataFrames for ML learning) ---
 try:
     historical_df = pd.read_csv('historical_data.csv', index_col='timestamp')
