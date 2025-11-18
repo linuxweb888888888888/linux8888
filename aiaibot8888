@@ -1,0 +1,847 @@
+import ccxt
+import time
+import subprocess
+import pandas as pd
+import numpy as np
+import os
+import re
+import logging
+from datetime import datetime
+from sklearn.ensemble import RandomForestRegressor
+from sklearn.preprocessing import StandardScaler
+from collections import deque
+
+# ------------------------------------------------------------------------------
+# CONFIGURATION
+# ------------------------------------------------------------------------------
+SYMBOL_CCXT = 'ATOM/USDT'      # For CCXT Fetching
+SYMBOL_BASH = 'ATOMUSDT_PERP'  # For Bash Scripts
+BASE_COIN = 'ATOM'             # For placeorder arguments
+MIN_QTY = 0.001                # Minimum step size (Confirmed 0.001)
+
+# *** UPDATED FOR HYPER-MINIMUM ENTRY ***
+# New Factor: Determines how many MIN_QTY units to use for a new, small entry
+# Setting to 1 to ensure new trades are the absolute smallest possible size (0.001)
+MIN_TRADE_QTY_FACTOR = 1       
+DECIMAL_PRECISION = len(str(MIN_QTY).split('.')[-1]) 
+DASHBOARD_PATH = '/var/www/html/dashboard.html'
+MAX_HISTORY = 200              # Data points for ML training
+TRAINING_INTERVAL = 1          # Train every step for max adaptation
+FEE_RATE = 0.0006              # Est. Taker fee (0.06%)
+# MAX SPEED: Target 0.01% gross profit + fees for immediate closure
+TARGET_PROFIT_PCT = 0.0001     
+# MAX SPEED: Averaging down extremely close (0.1%)
+GRID_STEP_PCT = 0.001          
+# This multiplier is now ONLY used for scaling in (compounding/grid recovery)
+INITIAL_ENTRY_SIZE_MULTIPLIER = 2.0 
+
+# MAX SPEED: Time to wait between loop iterations (50ms)
+UHF_SLEEP_SECONDS = 0.05 
+
+# Dashboard Configuration
+SPREAD_TIGHT_THRESHOLD = 0.0005 # Max spread considered 'tight' for display
+
+# ------------------------------------------------------------------------------
+# LOGGING SETUP
+# ------------------------------------------------------------------------------
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger()
+
+# ------------------------------------------------------------------------------
+# SYSTEM INTERFACE (Bash Scripts)
+# ------------------------------------------------------------------------------
+class SystemInterface:
+    @staticmethod
+    def run_command(command_list):
+        try:
+            # Added shorter timeout for faster feedback loop
+            result = subprocess.run(command_list, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=3)
+            return result.stdout.strip()
+        except Exception as e:
+            logger.error(f"Command failed: {command_list} | Error: {e}")
+            return None
+
+    @staticmethod
+    def get_wallet_balance():
+        """Reads USDT balance from /wallet.sh. First line is USDT."""
+        output = SystemInterface.run_command(['bash', '/wallet.sh'])
+        if output:
+            try:
+                lines = output.split('\n')
+                balance = float(lines[0].strip())
+                return balance
+            except ValueError:
+                logger.error("Could not parse wallet balance.")
+        return 0.0
+
+    @staticmethod
+    def get_real_position(symbol_bash):
+        """Parses /coinrealinfo.sh output."""
+        output = SystemInterface.run_command(['bash', '/coinrealinfo.sh', symbol_bash])
+        
+        data = {
+            'symbol': symbol_bash,
+            'qty': 0.0,
+            'entry_price': 0.0,
+            'has_position': False
+        }
+
+        if not output or "NO INFO" in output or output == "":
+            return data
+
+        try:
+            qty_match = re.search(r'Quantity:\s*([\d\.-]+)', output)
+            entry_match = re.search(r'Entry Price:\s*([\d\.-]+)', output)
+
+            if qty_match:
+                data['qty'] = float(qty_match.group(1))
+            if entry_match:
+                data['entry_price'] = float(entry_match.group(1))
+            
+            if abs(data['qty']) > 0:
+                data['has_position'] = True
+                
+        except Exception as e:
+            logger.error(f"Error parsing coin info: {e}")
+
+        return data
+
+    @staticmethod
+    def place_order(coin_base, qty, side):
+        """
+        Executes /placeorder.sh (base) (qty) (side)
+        """
+        cmd = ['bash', '/placeorder.sh', coin_base, str(qty), side]
+        output = SystemInterface.run_command(cmd)
+        if output and "SUCCESS" in output:
+            logger.info(f"Order SUCCESS: {side} {qty} {coin_base}")
+            return True
+        else:
+            logger.error(f"Order ERROR: {output}")
+            return False
+
+    @staticmethod
+    def close_all_positions():
+        """Runs /closepositions.sh"""
+        output = SystemInterface.run_command(['bash', '/closepositions.sh'])
+        logger.info(f"Close Positions: {output}")
+        return output
+
+# ------------------------------------------------------------------------------
+# WALLET LEARNER (ULTRA-AGGRESSIVE MODE)
+# ------------------------------------------------------------------------------
+class WalletLearner:
+    def __init__(self):
+        self.initial_balance = 0.0
+        self.current_balance = 0.0
+        self.previous_balance = 0.0
+        self.trade_history = deque(maxlen=50)
+        # MAX SPEED: Low starting threshold (30.0%) for maximum trade frequency
+        self.dynamic_threshold = 30.0 
+        self.risk_multiplier = 0.99   # Start MAX usage (99% - leaving 1% for fees)
+
+    def update_balance(self, new_balance):
+        if self.initial_balance == 0:
+            self.initial_balance = new_balance
+            self.current_balance = new_balance
+            self.previous_balance = new_balance
+            return
+
+        self.previous_balance = self.current_balance
+        self.current_balance = new_balance
+        
+        delta = self.current_balance - self.previous_balance
+        
+        if abs(delta) > 0.0001:
+            self.trade_history.append(delta)
+            self.adapt_strategy(delta)
+
+    def adapt_strategy(self, delta):
+        """
+        Ultra-aggressive adaptation for maximum frequency trading.
+        """
+        if delta > 0:
+            # Winning: Go faster (lower threshold for faster entries, down to 15.0 for maximum frequency)
+            self.dynamic_threshold = max(15.0, self.dynamic_threshold - 0.5)
+            self.risk_multiplier = 0.99 # Keep pinned at max
+            logger.info(f"PROFIT (+{delta:.6f}) -> MAX VELOCITY (Threshold: {self.dynamic_threshold:.2f}%)")
+            
+        else:
+            # Losing: Tighten threshold slightly (max 40.0 to maintain high activity but manage risk)
+            self.dynamic_threshold = min(40.0, self.dynamic_threshold + 1.0)
+            self.risk_multiplier = 0.99 # STAY AGGRESSIVE
+            logger.info(f"LOSS ({delta:.6f}) -> RECOVERY MODE (Threshold: {self.dynamic_threshold:.2f}%)")
+
+    def get_growth_pct(self):
+        if self.initial_balance == 0: return 0.0
+        return ((self.current_balance - self.initial_balance) / self.initial_balance) * 100
+
+# ------------------------------------------------------------------------------
+# AI & MARKET DATA ENGINE (FASTEST POSSIBLE INDICATORS)
+# ------------------------------------------------------------------------------
+class AIEngine:
+    def __init__(self):
+        self.exchange = ccxt.hitbtc({'enableRateLimit': True})
+        self.history = pd.DataFrame()
+        # MAX SPEED: Less complex model for ultra-fast training
+        self.model = RandomForestRegressor(n_estimators=20, max_depth=8, random_state=42)
+        self.scaler = StandardScaler()
+        self.is_trained = False
+        self.simulation_wins = 0
+        self.simulation_total = 0
+        self.last_prediction = 0.0
+        self.confidence = 0.0
+        self.avg_volatility = 0.0 # Store average volatility for dashboard
+
+    def fetch_price(self):
+        try:
+            ticker = self.exchange.fetch_ticker(SYMBOL_CCXT)
+            return {
+                'bid': ticker['bid'],
+                'ask': ticker['ask'],
+                'last': ticker['last'],
+                'timestamp': datetime.now()
+            }
+        except Exception as e:
+            logger.error(f"CCXT Error: {e}")
+            return None
+
+    def update_data(self, price_data):
+        new_row = pd.DataFrame([price_data])
+        if self.history.empty:
+            self.history = new_row
+        else:
+            self.history = pd.concat([self.history, new_row], ignore_index=True)
+        
+        if len(self.history) > MAX_HISTORY:
+            self.history = self.history.iloc[-MAX_HISTORY:]
+
+    def calculate_features(self, df):
+        df = df.copy()
+        
+        # UHF SCALPING FOCUS
+        df['mid_price'] = (df['bid'] + df['ask']) / 2
+        df['returns'] = df['mid_price'].pct_change()
+        
+        # Ultra Fast RSI (Period 5) based on MID-PRICE
+        delta = df['mid_price'].diff()
+        gain = (delta.where(delta > 0, 0)).rolling(window=5).mean()
+        loss = (-delta.where(delta < 0, 0)).rolling(window=5).mean()
+        rs = gain / loss
+        df['rsi'] = 100 - (100 / (1 + rs))
+        
+        # Volatility (Period 5) - Measures short-term instability
+        df['volatility'] = df['returns'].rolling(window=5).std()
+        
+        # Momentum (Period 3) based on MID-PRICE
+        df['momentum'] = df['mid_price'] - df['mid_price'].shift(3)
+
+        # Spread (distance between bid/ask)
+        df['spread'] = df['ask'] - df['bid']
+        
+        # CRITICAL FEATURE: Spread Change (Widening or Narrowing)
+        df['spread_change'] = df['spread'].diff()
+        
+        # Fast Moving Average (MA 5) based on MID-PRICE
+        df['ma_5'] = df['mid_price'].rolling(window=5).mean()
+        
+        # NEW TARGET: Predict the change in the next MID-PRICE tick
+        df['target'] = df['mid_price'].shift(-1) - df['mid_price']
+        
+        return df
+
+    def train_and_predict(self):
+        if len(self.history) < 50: 
+            return 0, 0 
+
+        df_all = self.calculate_features(self.history)
+        
+        X_current = df_all.iloc[[-1]].drop(columns=['target']).dropna()
+        df_train = df_all.iloc[:-1].dropna()
+
+        if df_train.empty or X_current.empty: 
+            return 0, 0
+
+        feature_cols = ['rsi', 'volatility', 'spread', 'momentum', 'ma_5', 'spread_change'] 
+        
+        X_current = X_current[feature_cols]
+
+        X = df_train[feature_cols]
+        y = df_train['target']
+
+        if self.is_trained:
+            actual_move = df_all.iloc[-2]['target'] if not pd.isna(df_all.iloc[-2]['target']) else 0
+            if (self.last_prediction > 0 and actual_move > 0) or (self.last_prediction < 0 and actual_move < 0):
+                self.simulation_wins += 1
+            self.simulation_total += 1
+
+        try:
+            self.model.fit(X, y)
+            self.is_trained = True
+        except Exception as e:
+            logger.error(f"ML Training failed: {e}")
+            return 0, 0
+
+        prediction = self.model.predict(X_current)[0]
+        
+        # Calculate volatility based on the training data
+        avg_vol = df_train['volatility'].mean()
+        # Confidence based on strength of signal vs noise (capped at 100%)
+        confidence = min(abs(prediction) / (avg_vol + 1e-9), 1.0) * 100
+        
+        self.last_prediction = prediction
+        self.confidence = confidence
+        self.avg_volatility = avg_vol # Store for dashboard
+        
+        return prediction, confidence
+
+# ------------------------------------------------------------------------------
+# MAIN BOT LOGIC
+# ------------------------------------------------------------------------------
+class TradingBot:
+    def __init__(self):
+        self.sys = SystemInterface()
+        self.ai = AIEngine()
+        self.wallet_learner = WalletLearner()
+        self.running = True
+        self.iteration = 0
+        # Storage for recent actions to display in the dashboard
+        self.action_history = deque(maxlen=5) 
+
+    def generate_dashboard(self, wallet, position, price_info, prediction, confidence, action_msg, action_type, avg_volatility, dynamic_threshold, required_pnl_usd, action_history):
+        unrealized_pnl = 0.0
+        target_price = 0.0
+        
+        pos_dir = "FLAT"
+        pos_qty_display = "0.000"
+        
+        if position['has_position']:
+            qty = position['qty']
+            entry = position['entry_price']
+            
+            # 1. PNL Calculation
+            is_long = qty > 0
+            curr_price = price_info['bid'] if is_long else price_info['ask']
+            
+            if is_long: 
+                unrealized_pnl = (curr_price - entry) * abs(qty)
+                pos_dir = "LONG"
+            else: 
+                unrealized_pnl = (entry - curr_price) * abs(qty)
+                pos_dir = "SHORT"
+            
+            pos_qty_display = f"{abs(qty):.{DECIMAL_PRECISION}f}"
+            
+            # 2. Target Price Calculation
+            if abs(qty) > 0:
+                if is_long:
+                    target_price = entry + (required_pnl_usd / abs(qty))
+                else:
+                    target_price = entry - (required_pnl_usd / abs(qty))
+        
+        # Style Definitions
+        pnl_class = "neutral-text"
+        if unrealized_pnl > 0: pnl_class = "success-text"
+        elif unrealized_pnl < 0: pnl_class = "danger-text"
+
+        sim_acc = 0
+        if self.ai.simulation_total > 0:
+            sim_acc = (self.ai.simulation_wins / self.ai.simulation_total) * 100
+            
+        growth_pct = self.wallet_learner.get_growth_pct()
+        growth_class = "success-text" if growth_pct >= 0 else "danger-text"
+        
+        ai_signal = 'LONG' if prediction > 0 else 'SHORT'
+        signal_color = 'var(--success-green)' if prediction > 0 else ('var(--danger-red)' if prediction < 0 else 'var(--neutral-gray)')
+        
+        prediction_val_str = f"{prediction:.8f}"
+        
+        spread = price_info['ask'] - price_info['bid']
+        spread_status = "Tight" if spread <= SPREAD_TIGHT_THRESHOLD else "Wide"
+        spread_class = "success-text" if spread_status == "Tight" else "danger-text"
+
+        # Action bar style based on action_type
+        action_style = {
+            "SCANNING": "cyan-bar",
+            "ENTRY": "blue-bar",
+            "PROFIT": "success-bar",
+            "RECOVERY": "danger-bar",
+            "COMPOUND": "success-bar",
+            "CLOSE": "success-bar"
+        }.get(action_type, "cyan-bar")
+
+        # Confidence Bar Logic
+        confidence_level = confidence
+        threshold = dynamic_threshold
+        # Normalize for bar width (0-100)
+        confidence_width = min(confidence_level, 100) 
+        threshold_pos = min(threshold, 100) 
+        
+        # Position Bar Style
+        pos_class = "neutral-pos"
+        if pos_dir == "LONG": pos_class = "long-pos"
+        elif pos_dir == "SHORT": pos_class = "short-pos"
+
+        # Generate Action History HTML
+        history_html = ""
+        for item in action_history:
+            msg = item['message']
+            cls = item['class']
+            history_html += f"""
+            <div class='log-entry {cls}'>
+                <span class='log-time'>{item['time']}</span> 
+                <span class='log-message'>{msg}</span>
+            </div>
+            """
+        if not history_html:
+            history_html = "<div class='log-entry neutral-pos'>Awaiting first action...</div>"
+
+
+        html = f"""
+        <!DOCTYPE html>
+        <html lang="en">
+        <head>
+            <meta charset="UTF-8">
+            <meta http-equiv="refresh" content="0.5"> <!-- Faster refresh for UHF feel -->
+            <meta name="viewport" content="width=device-width, initial-scale=1.0">
+            <title>UHF SCALPER COMMAND CENTER V2.0</title>
+            <style>
+                @import url('https://fonts.googleapis.com/css2?family=Orbitron:wght@400;700;900&family=Roboto+Mono:wght@300;400;700&display=swap');
+                
+                :root {{
+                    --bg-dark: #070D12;
+                    --card-bg: #101F2B;
+                    --success-green: #00FF99; /* Neon Green */
+                    --danger-red: #FF3366; /* Neon Red */
+                    --accent-blue: #00BFFF; /* Deep Cyan/Blue */
+                    --neutral-gray: #4A6D7C;
+                    --text-light: #E0FFEF;
+                    --long-color: #00BFFF;
+                    --short-color: #FF3366;
+                }}
+
+                body {{ 
+                    font-family: 'Roboto Mono', monospace; 
+                    background-color: var(--bg-dark); 
+                    color: var(--text-light); 
+                    margin: 0; 
+                    padding: 15px;
+                    overflow-x: hidden;
+                }}
+                
+                .header {{
+                    font-family: 'Orbitron', sans-serif;
+                    text-align: center;
+                    margin-bottom: 20px;
+                    font-size: 1.8rem;
+                    font-weight: 900;
+                    color: var(--success-green);
+                    text-shadow: 0 0 8px rgba(0, 255, 153, 0.7);
+                    padding-bottom: 10px;
+                    border-bottom: 2px solid var(--neutral-gray);
+                }}
+                
+                .container {{ 
+                    max-width: 1200px;
+                    margin: auto;
+                }}
+                
+                .grid-main {{
+                    display: grid; 
+                    grid-template-columns: 2fr 1fr;
+                    gap: 15px; 
+                }}
+                
+                .grid-bottom {{
+                    display: grid; 
+                    grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); 
+                    gap: 15px; 
+                    margin-top: 15px;
+                }}
+
+                .card {{ 
+                    background-color: var(--card-bg); 
+                    border-radius: 8px; 
+                    padding: 20px; 
+                    border: 1px solid var(--neutral-gray);
+                    box-shadow: 0 4px 10px rgba(0, 0, 0, 0.6);
+                    overflow: hidden;
+                }}
+
+                h2 {{ 
+                    font-family: 'Orbitron', sans-serif;
+                    margin-top: 0; 
+                    font-size: 0.8rem; 
+                    color: var(--text-light);
+                    text-transform: uppercase;
+                    letter-spacing: 2px;
+                    border-bottom: 1px dashed var(--neutral-gray);
+                    padding-bottom: 5px;
+                    margin-bottom: 15px;
+                }}
+                
+                .value {{ 
+                    font-size: 2rem; 
+                    font-weight: 700; 
+                    margin-top: 5px; 
+                    line-height: 1.1;
+                }}
+                .value.pnl {{ font-size: 3.5rem; }}
+                
+                .sub {{ 
+                    font-size: 0.8rem; 
+                    color: var(--neutral-gray); 
+                    margin-top: 5px;
+                    line-height: 1.3;
+                }}
+                
+                .success-text {{ color: var(--success-green); }}
+                .danger-text {{ color: var(--danger-red); }}
+                .neutral-text {{ color: var(--accent-blue); }}
+
+                /* PNL Block */
+                .pnl-block {{
+                    text-align: center;
+                    display: flex;
+                    flex-direction: column;
+                    justify-content: center;
+                }}
+                
+                /* Position Status Bar */
+                .status-bar {{
+                    display: flex;
+                    justify-content: space-between;
+                    align-items: center;
+                    margin-bottom: 15px;
+                    padding: 10px 15px;
+                    border-radius: 6px;
+                    font-family: 'Orbitron', sans-serif;
+                    font-size: 1rem;
+                    font-weight: 700;
+                    border: 1px solid;
+                }}
+                .long-pos {{ background-color: rgba(0, 191, 255, 0.2); border-color: var(--long-color); color: var(--long-color); }}
+                .short-pos {{ background-color: rgba(255, 51, 102, 0.2); border-color: var(--short-color); color: var(--short-color); }}
+                .neutral-pos {{ background-color: rgba(74, 109, 124, 0.2); border-color: var(--neutral-gray); color: var(--neutral-gray); }}
+
+                /* Confidence Gauge */
+                .confidence-gauge {{
+                    height: 10px;
+                    background-color: var(--neutral-gray);
+                    border-radius: 5px;
+                    overflow: hidden;
+                    position: relative;
+                    margin-top: 10px;
+                }}
+                .confidence-fill {{
+                    height: 100%;
+                    background-color: var(--success-green);
+                    transition: width 0.3s;
+                }}
+                .threshold-marker {{
+                    position: absolute;
+                    height: 100%;
+                    width: 2px;
+                    background-color: var(--danger-red);
+                    top: 0;
+                }}
+                .gauge-labels {{
+                    display: flex;
+                    justify-content: space-between;
+                    font-size: 0.7rem;
+                    color: var(--neutral-gray);
+                    margin-top: 5px;
+                }}
+                
+                /* Action History Log */
+                .log-entry {{
+                    font-size: 0.8rem;
+                    padding: 5px 0;
+                    border-bottom: 1px dotted rgba(74, 109, 124, 0.3);
+                    display: flex;
+                    font-family: 'Roboto Mono', monospace;
+                }}
+                .log-entry:last-child {{ border-bottom: none; }}
+                .log-time {{ color: var(--neutral-gray); min-width: 60px; margin-right: 10px; }}
+                .log-message {{ font-weight: 400; }}
+
+                .log-entry.entry .log-message {{ color: var(--accent-blue); }}
+                .log-entry.profit .log-message {{ color: var(--success-green); }}
+                .log-entry.recovery .log-message {{ color: var(--danger-red); }}
+                .log-entry.compound .log-message {{ color: var(--success-green); }}
+                .log-entry.close .log-message {{ color: var(--text-light); }}
+
+                /* Responsive Adjustments */
+                @media (max-width: 900px) {{
+                    .grid-main {{ grid-template-columns: 1fr; }}
+                    .value.pnl {{ font-size: 2.5rem; }}
+                }}
+            </style>
+        </head>
+        <body>
+            <div class="header">UHF SCALPER V2.0 / {SYMBOL_CCXT} MONITOR</div>
+            
+            <div class="container">
+                <div class="status-bar {pos_class}">
+                    <span>POSITION STATUS: {pos_dir}</span>
+                    <span>QTY: {pos_qty_display} {BASE_COIN}</span>
+                    <span>ENTRY: {position['entry_price']:.6f}</span>
+                </div>
+
+                <div class="grid-main">
+                    <!-- LEFT COLUMN: PNL and Key Metrics -->
+                    <div>
+                        <!-- PNL BLOCK (Dominant) -->
+                        <div class="card pnl-block" style="border-left: 4px solid {'var(--success-green)' if unrealized_pnl > 0 else 'var(--danger-red)' if unrealized_pnl < 0 else 'var(--neutral-gray)'};">
+                            <h2>UNREALIZED PNL</h2>
+                            <div class="value pnl {pnl_class}">{unrealized_pnl:.6f} USDT</div>
+                            <div class="sub">Required Profit to Close: <span class="success-text">{required_pnl_usd:.6f} USDT</span></div>
+                        </div>
+                        
+                        <!-- AI CONFIDENCE GAUGE -->
+                        <div class="card" style="margin-top: 15px;">
+                            <h2>AI CONFIDENCE GAUGE</h2>
+                            <div class="confidence-gauge">
+                                <div class="threshold-marker" style="left: {threshold_pos}%;"></div>
+                                <div class="confidence-fill" style="width: {confidence_width}%;"></div>
+                            </div>
+                            <div class="gauge-labels">
+                                <span>0%</span>
+                                <span>Threshold: {threshold:.1f}%</span>
+                                <span>Confidence: {confidence:.1f}%</span>
+                                <span>100%</span>
+                            </div>
+                        </div>
+                    </div>
+                    
+                    <!-- RIGHT COLUMN: ACTION HISTORY & CURRENT PRICE -->
+                    <div>
+                        <!-- MARKET PRICE -->
+                        <div class="card">
+                            <h2>CURRENT PRICE</h2>
+                            <div class="value neutral-text">{price_info['last']:.6f}</div>
+                            <div class="sub">AI Signal: <span style="color: {signal_color}">{ai_signal} ({prediction:.8f})</span></div>
+                            
+                            <div style="margin-top: 10px;">
+                                <div class="metric-title">TARGET EXIT PRICE</div>
+                                <div class="metric-value success-text">{target_price:.6f}</div>
+                            </div>
+                        </div>
+                        
+                        <!-- ACTION HISTORY LOG -->
+                        <div class="card" style="margin-top: 15px;">
+                            <h2>RECENT ACTION LOG</h2>
+                            {history_html}
+                        </div>
+                    </div>
+                </div>
+
+                <!-- BOTTOM ROW: CORE METRICS -->
+                <div class="grid-bottom">
+                    
+                    <div class="card">
+                        <h2>ACCOUNT BALANCE</h2>
+                        <div class="value success-text">${wallet:.6f}</div>
+                        <div class="sub">Growth YTD: <span class="{growth_class}">{growth_pct:.6f}%</span></div>
+                    </div>
+                    
+                    <div class="card">
+                        <h2>MARKET SPREAD</h2>
+                        <div class="value {spread_class}">{spread:.6f}</div>
+                        <div class="sub">Liquidity Status: {spread_status}</div>
+                    </div>
+                    
+                    <div class="card">
+                        <h2>ML PERFORMANCE</h2>
+                        <div class="value neutral-text">{sim_acc:.2f}%</div>
+                        <div class="sub">Prediction Accuracy (Simulated)</div>
+                    </div>
+                    
+                    <div class="card">
+                        <h2>VOLATILITY / NOISE</h2>
+                        <div class="value neutral-text">{(avg_volatility*100):.6f}%</div>
+                        <div class="sub">Prediction / Noise Ratio: {(abs(prediction) / (avg_volatility + 1e-9)):.2f}x</div>
+                    </div>
+                </div>
+            </div>
+            
+            <script>
+                // Prevents flicker on refresh if the dashboard were to rely on JS animations
+                // Not strictly necessary here but good practice for high-freq updates
+            </script>
+        </body>
+        </html>
+        """
+        try:
+            with open(DASHBOARD_PATH, 'w') as f:
+                f.write(html)
+        except Exception as e:
+            logger.error(f"Failed to write dashboard: {e}")
+
+    def run(self):
+        logger.info("Starting ULTRA-HIGH FREQUENCY SCALPER Bot (Command Center)...")
+        self.sys.close_all_positions()
+        
+        initial_wallet = self.sys.get_wallet_balance()
+        self.wallet_learner.update_balance(initial_wallet)
+        
+        while self.running:
+            try:
+                action_log = "Scanning market for entry signal"
+                action_type = "SCANNING"
+                
+                wallet = self.sys.get_wallet_balance()
+                self.wallet_learner.update_balance(wallet)
+                dynamic_threshold = self.wallet_learner.dynamic_threshold
+                
+                pos_data = self.sys.get_real_position(SYMBOL_BASH)
+                price_data = self.ai.fetch_price()
+                
+                if not price_data:
+                    time.sleep(0.01) 
+                    continue
+
+                self.ai.update_data(price_data)
+                
+                if self.iteration % TRAINING_INTERVAL == 0:
+                    prediction, confidence = self.ai.train_and_predict()
+                else:
+                    prediction = self.ai.last_prediction
+                    confidence = self.ai.confidence
+                
+                avg_volatility = self.ai.avg_volatility 
+                required_pnl_usd = 0.0
+                
+                # ---------------------------------------------------------
+                # TRADING LOGIC
+                # ---------------------------------------------------------
+                if pos_data['has_position']:
+                    qty = pos_data['qty']
+                    entry = pos_data['entry_price']
+                    is_long = qty > 0
+                    
+                    # 1. Calculate PnL and Required Profit
+                    if is_long:
+                        current_pnl = (price_data['bid'] - entry) * abs(qty)
+                        price_diff_pct = (price_data['bid'] - entry) / entry
+                    else:
+                        current_pnl = (entry - price_data['ask']) * abs(qty)
+                        price_diff_pct = (entry - price_data['ask']) / entry
+
+                    total_fee = (entry * abs(qty) * FEE_RATE) + (price_data['last'] * abs(qty) * FEE_RATE)
+                    net_pnl = current_pnl - total_fee
+                    
+                    entry_value = entry * abs(qty)
+                    required_gross_profit = entry_value * TARGET_PROFIT_PCT
+                    required_pnl_usd = required_gross_profit + total_fee
+                    
+                    # Action message for PnL block
+                    action_log = f"PnL: {net_pnl:.6f} (Required: {required_pnl_usd:.6f})"
+                    action_type = "PROFIT" if net_pnl >= 0 else "RECOVERY"
+
+
+                    # 1. MAX SPEED SCALP PROFIT TAKER (Full Close)
+                    if current_pnl > required_pnl_usd:
+                        logger.info(f"$$$ MAX SPEED SCALP PROFIT: {net_pnl:.6f}")
+                        side = 'sell' if is_long else 'buy'
+                        self.sys.place_order(BASE_COIN, abs(qty), side)
+                        action_log = f"Closed: +{net_pnl:.6f} Profit"
+                        action_type = "CLOSE"
+                        
+                    # 2. PARTIAL PROFIT SCALING
+                    elif net_pnl > 0 and (
+                        (is_long and prediction < 0) or (not is_long and prediction > 0)
+                    ):
+                        reduce_qty = abs(qty) * 0.25
+                        raw_qty = reduce_qty
+                        reduce_qty = np.floor(raw_qty / MIN_QTY) * MIN_QTY
+                        reduce_qty = max(MIN_QTY, round(reduce_qty, DECIMAL_PRECISION))
+                        
+                        if abs(qty) > reduce_qty: 
+                            side = 'sell' if is_long else 'buy'
+                            self.sys.place_order(BASE_COIN, reduce_qty, side)
+                            action_log = f"Scale Out: -{reduce_qty}"
+                            action_type = "PROFIT"
+                            
+                    # 3. AGGRESSIVE PYRAMIDING
+                    elif net_pnl > 0 and confidence > 55.0:
+                        if (is_long and prediction > 0) or (not is_long and prediction < 0):
+                            usable_wallet = wallet * self.wallet_learner.risk_multiplier
+                            execution_price = price_data['ask'] if is_long else price_data['bid']
+                            current_pos_val = abs(qty) * execution_price 
+                            free_margin = usable_wallet - current_pos_val
+                            
+                            if free_margin > (execution_price * MIN_QTY):
+                                # Use full aggressive multiplier for compounding
+                                raw_qty = (free_margin * INITIAL_ENTRY_SIZE_MULTIPLIER) / execution_price
+                                add_qty = np.floor(raw_qty / MIN_QTY) * MIN_QTY
+                                add_qty = max(MIN_QTY, round(add_qty, DECIMAL_PRECISION)) 
+                                side = 'buy' if is_long else 'sell'
+                                self.sys.place_order(BASE_COIN, add_qty, side)
+                                action_log = f"Compound: +{add_qty} QTY"
+                                action_type = "COMPOUND"
+                    
+                    # 4. GRID RECOVERY
+                    elif price_diff_pct < -GRID_STEP_PCT:
+                        if (is_long and prediction > 0) or (not is_long and prediction < 0):
+                            usable_wallet = wallet * self.wallet_learner.risk_multiplier
+                            execution_price = price_data['ask'] if is_long else price_data['bid']
+                            current_pos_val = abs(qty) * execution_price 
+                            free_margin = usable_wallet - current_pos_val
+
+                            if free_margin > (execution_price * MIN_QTY): 
+                                # Use 75% of aggressive multiplier for averaging down
+                                raw_qty = (free_margin * 0.75 * INITIAL_ENTRY_SIZE_MULTIPLIER) / execution_price
+                                recovery_qty = np.floor(raw_qty / MIN_QTY) * MIN_QTY
+                                recovery_qty = max(MIN_QTY, round(recovery_qty, DECIMAL_PRECISION)) 
+                                side = 'buy' if is_long else 'sell'
+                                self.sys.place_order(BASE_COIN, recovery_qty, side)
+                                action_log = f"Grid Down: +{recovery_qty} QTY"
+                                action_type = "RECOVERY"
+
+                else:
+                    # -----------------------------------------------------
+                    # NEW MIN-QUANTITY ENTRY (MAX-FREQUENCY)
+                    # -----------------------------------------------------
+                    if self.ai.is_trained and confidence > dynamic_threshold: 
+                        
+                        if prediction > 0:
+                            execution_price = price_data['ask']
+                            side = 'buy'
+                        elif prediction < 0:
+                            execution_price = price_data['bid']
+                            side = 'sell'
+                        else:
+                            continue 
+                            
+                        # New Logic: Calculate absolute minimum trade quantity (0.001)
+                        trade_qty = round(MIN_QTY * MIN_TRADE_QTY_FACTOR, DECIMAL_PRECISION)
+                        
+                        # Check if we have enough USDT to cover the smallest trade + fees
+                        if (trade_qty * execution_price) < (wallet * self.wallet_learner.risk_multiplier):
+                            self.sys.place_order(BASE_COIN, trade_qty, side)
+                            action_log = f"Entry: {side.upper()} {trade_qty} (C:{confidence:.1f}%)"
+                            action_type = "ENTRY"
+                            
+                # --- UPDATE ACTION HISTORY ---
+                # Only log non-scanning actions to keep the log clean
+                if action_type not in ["SCANNING", "NONE"]: 
+                    self.action_history.appendleft({
+                        'time': datetime.now().strftime('%H:%M:%S.%f')[:-3],
+                        'message': action_log,
+                        'class': action_type.lower()
+                    })
+
+                self.generate_dashboard(wallet, pos_data, price_data, prediction, confidence, action_log, action_type, avg_volatility, dynamic_threshold, required_pnl_usd, list(self.action_history))
+                self.iteration += 1
+                time.sleep(UHF_SLEEP_SECONDS) 
+
+            except KeyboardInterrupt:
+                self.running = False
+            except Exception as e:
+                logger.error(f"Loop Error: {e}")
+                time.sleep(1)
+
+if __name__ == "__main__":
+    bot = TradingBot()
+    bot.run()
