@@ -20,8 +20,8 @@ BASE_COIN = 'ATOM'             # For placeorder arguments
 MIN_QTY = 0.001                # Minimum step size
 DASHBOARD_PATH = '/var/www/html/dashboard.html'
 MAX_HISTORY = 200              # Data points for ML training
-TRAINING_INTERVAL = 10         # Retrain model every X iterations
-FEE_RATE = 0.0006              # Est. Taker fee (0.06%) - adjust as needed
+TRAINING_INTERVAL = 5          # Retrain model frequently (Aggressive)
+FEE_RATE = 0.0006              # Est. Taker fee (0.06%)
 PROFIT_TARGET_PCT = 0.002      # 0.2% Target per scalp
 GRID_STEP_PCT = 0.005          # Add to position if price moves 0.5% against
 
@@ -38,7 +38,7 @@ class SystemInterface:
     @staticmethod
     def run_command(command_list):
         try:
-            result = subprocess.run(command_list, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=10)
+            result = subprocess.run(command_list, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=5)
             return result.stdout.strip()
         except Exception as e:
             logger.error(f"Command failed: {command_list} | Error: {e}")
@@ -50,7 +50,6 @@ class SystemInterface:
         output = SystemInterface.run_command(['bash', '/wallet.sh'])
         if output:
             try:
-                # Assuming first line is just the number, e.g., "104.50"
                 lines = output.split('\n')
                 balance = float(lines[0].strip())
                 return balance
@@ -74,8 +73,6 @@ class SystemInterface:
             return data
 
         try:
-            # Regex to extract values
-            # Expected: Symbol: "COINUSDT_PERP"\nQuantity: 1000\nEntry Price: 0.000009025
             qty_match = re.search(r'Quantity:\s*([\d\.-]+)', output)
             entry_match = re.search(r'Entry Price:\s*([\d\.-]+)', output)
 
@@ -96,8 +93,6 @@ class SystemInterface:
     def place_order(coin_base, qty, side):
         """
         Executes /placeorder.sh (base) (qty) (side)
-        Side must be 'buy' or 'sell'.
-        Returns True if 'SUCCESS' in output.
         """
         cmd = ['bash', '/placeorder.sh', coin_base, str(qty), side]
         output = SystemInterface.run_command(cmd)
@@ -122,7 +117,7 @@ class AIEngine:
     def __init__(self):
         self.exchange = ccxt.hitbtc({'enableRateLimit': True})
         self.history = pd.DataFrame()
-        self.model = RandomForestRegressor(n_estimators=50, max_depth=5, random_state=42)
+        self.model = RandomForestRegressor(n_estimators=50, max_depth=7, random_state=42) # Deeper trees for complex patterns
         self.scaler = StandardScaler()
         self.is_trained = False
         self.simulation_wins = 0
@@ -150,71 +145,64 @@ class AIEngine:
         else:
             self.history = pd.concat([self.history, new_row], ignore_index=True)
         
-        # Keep window size fixed
         if len(self.history) > MAX_HISTORY:
             self.history = self.history.iloc[-MAX_HISTORY:]
 
     def calculate_features(self, df):
-        """
-        Calculates manual technical indicators (RSI, Volatility)
-        to avoid external heavy libraries like ta-lib.
-        """
         df = df.copy()
         df['returns'] = df['last'].pct_change()
         
-        # RSI Calculation
+        # Fast RSI
         delta = df['last'].diff()
-        gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
-        loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
+        gain = (delta.where(delta > 0, 0)).rolling(window=7).mean() # Faster window
+        loss = (-delta.where(delta < 0, 0)).rolling(window=7).mean()
         rs = gain / loss
         df['rsi'] = 100 - (100 / (1 + rs))
         
         # Volatility
-        df['volatility'] = df['returns'].rolling(window=10).std()
+        df['volatility'] = df['returns'].rolling(window=5).std()
         
+        # Momentum
+        df['momentum'] = df['last'] - df['last'].shift(3)
+
         # Spread
         df['spread'] = df['ask'] - df['bid']
         
-        # Target (Next Price Change) - For training
+        # Target: Immediate next tick direction
         df['target'] = df['last'].shift(-1) - df['last']
         
         df = df.dropna()
         return df
 
     def train_and_predict(self):
-        if len(self.history) < 30:
-            return 0, 0 # Not enough data
+        if len(self.history) < 20: # Reduce minimum data req for faster start
+            return 0, 0 
 
         df = self.calculate_features(self.history)
         
         if df.empty:
             return 0, 0
 
-        # Features for ML
-        feature_cols = ['rsi', 'volatility', 'spread']
+        feature_cols = ['rsi', 'volatility', 'spread', 'momentum']
         X = df[feature_cols]
         y = df['target']
 
-        # Background Simulation: Check if last prediction was correct
+        # Simulation Tracking
         if self.is_trained:
             actual_move = df.iloc[-1]['target'] if not pd.isna(df.iloc[-1]['target']) else 0
             if (self.last_prediction > 0 and actual_move > 0) or (self.last_prediction < 0 and actual_move < 0):
                 self.simulation_wins += 1
             self.simulation_total += 1
 
-        # Train Model
         try:
             self.model.fit(X, y)
             self.is_trained = True
         except Exception as e:
-            logger.warning(f"Training skipped: {e}")
             return 0, 0
 
-        # Predict next move using current state
-        current_features = X.iloc[[-1]] # Last row
+        current_features = X.iloc[[-1]]
         prediction = self.model.predict(current_features)[0]
         
-        # Calculate Confidence (based on volatility proxy)
         avg_vol = df['volatility'].mean()
         confidence = min(abs(prediction) / (avg_vol + 1e-9), 1.0) * 100
         
@@ -232,31 +220,22 @@ class TradingBot:
         self.ai = AIEngine()
         self.running = True
         self.iteration = 0
-        self.pnl_history = deque(maxlen=20) # Store last 20 closed PnL for dashboard
 
     def generate_dashboard(self, wallet, position, price_info, prediction, confidence, action_msg):
-        """Generates a static Material Design HTML dashboard."""
-        
-        # Calculate Real PnL for display
         unrealized_pnl = 0.0
         pnl_class = "neutral"
         
         if position['has_position']:
             qty = position['qty']
             entry = position['entry_price']
+            curr_price = price_info['bid'] if qty > 0 else price_info['ask']
             
-            curr_price = 0
-            if qty > 0: # Long
-                curr_price = price_info['bid']
-                unrealized_pnl = (curr_price - entry) * qty
-            else: # Short
-                curr_price = price_info['ask']
-                unrealized_pnl = (entry - curr_price) * abs(qty)
+            if qty > 0: unrealized_pnl = (curr_price - entry) * qty
+            else: unrealized_pnl = (entry - curr_price) * abs(qty)
                 
             if unrealized_pnl > 0: pnl_class = "success"
             elif unrealized_pnl < 0: pnl_class = "danger"
 
-        # Simulation Accuracy
         sim_acc = 0
         if self.ai.simulation_total > 0:
             sim_acc = (self.ai.simulation_wins / self.ai.simulation_total) * 100
@@ -267,70 +246,44 @@ class TradingBot:
         <head>
             <meta charset="UTF-8">
             <meta http-equiv="refresh" content="1">
-            <title>HitBTC AI Scalper</title>
+            <title>HitBTC MAX AGGRESSIVE</title>
             <style>
-                body {{ font-family: 'Roboto', sans-serif; background-color: #121212; color: #e0e0e0; margin: 0; padding: 20px; }}
+                body {{ font-family: 'Roboto', sans-serif; background-color: #000000; color: #e0e0e0; margin: 0; padding: 20px; }}
                 .container {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 20px; }}
-                .card {{ background-color: #1e1e1e; border-radius: 8px; padding: 20px; box-shadow: 0 4px 6px rgba(0,0,0,0.3); border-left: 4px solid #333; }}
-                .card.success {{ border-left-color: #00c853; }}
-                .card.danger {{ border-left-color: #d50000; }}
-                .card.info {{ border-left-color: #2962ff; }}
-                h2 {{ margin-top: 0; font-size: 1.2rem; color: #9e9e9e; }}
-                .value {{ font-size: 2rem; font-weight: bold; }}
-                .sub {{ font-size: 0.9rem; color: #757575; }}
-                .success-text {{ color: #00c853; }}
-                .danger-text {{ color: #d50000; }}
-                .table {{ width: 100%; border-collapse: collapse; margin-top: 10px; }}
-                .table th, .table td {{ text-align: left; padding: 8px; border-bottom: 1px solid #333; }}
-                .status-bar {{ background: #263238; padding: 10px; margin-bottom: 20px; border-radius: 4px; }}
+                .card {{ background-color: #121212; border-radius: 8px; padding: 20px; border: 1px solid #333; }}
+                .card.success {{ border-color: #00ff00; background-color: #051a05; }}
+                .card.danger {{ border-color: #ff0000; background-color: #1a0505; }}
+                .card.info {{ border-color: #0088ff; }}
+                h2 {{ margin-top: 0; font-size: 1.2rem; color: #888; }}
+                .value {{ font-size: 2.5rem; font-weight: 900; }}
+                .sub {{ font-size: 0.9rem; color: #666; }}
+                .status-bar {{ background: #222; padding: 15px; margin-bottom: 20px; border-radius: 4px; border-bottom: 2px solid #0088ff; }}
             </style>
         </head>
         <body>
             <div class="status-bar">
-                <strong>SYSTEM STATUS:</strong> {action_msg} | <strong>Last Update:</strong> {datetime.now().strftime('%H:%M:%S')}
+                <strong>STATUS:</strong> {action_msg} | <strong>TIME:</strong> {datetime.now().strftime('%H:%M:%S')}
             </div>
-
             <div class="container">
-                <!-- Wallet Card -->
                 <div class="card info">
-                    <h2>Wallet Balance (USDT)</h2>
+                    <h2>WALLET (ALL-IN MODE)</h2>
                     <div class="value">${wallet:.2f}</div>
-                    <div class="sub">Goal: Continuous Growth</div>
+                    <div class="sub">Risk: MAXIMUM</div>
                 </div>
-
-                <!-- Position Card -->
                 <div class="card {pnl_class}">
-                    <h2>Active Position ({SYMBOL_BASH})</h2>
-                    <div class="value">{unrealized_pnl:.4f} USDT</div>
-                    <table class="table">
-                        <tr><td>Qty:</td><td>{position['qty']}</td></tr>
-                        <tr><td>Entry:</td><td>{position['entry_price']}</td></tr>
-                        <tr><td>Current:</td><td>{price_info['last'] if price_info else 0}</td></tr>
-                    </table>
+                    <h2>ACTIVE PNL</h2>
+                    <div class="value" style="color: {'#00ff00' if unrealized_pnl > 0 else '#ff0000'}">{unrealized_pnl:.4f}</div>
+                    <div class="sub">Entry: {position['entry_price']} | Qty: {position['qty']}</div>
                 </div>
-
-                <!-- AI Prediction Card -->
                 <div class="card info">
-                    <h2>AI Prediction (RandomForest)</h2>
-                    <div class="value">{'UP' if prediction > 0 else 'DOWN'}</div>
-                    <div class="sub">Confidence: {confidence:.1f}%</div>
-                    <div class="sub">Sim Accuracy: {sim_acc:.1f}% ({self.ai.simulation_wins}/{self.ai.simulation_total})</div>
-                </div>
-
-                <!-- Market Data -->
-                <div class="card">
-                    <h2>Market Data</h2>
-                    <table class="table">
-                        <tr><td>Bid</td><td>{price_info['bid']}</td></tr>
-                        <tr><td>Ask</td><td>{price_info['ask']}</td></tr>
-                        <tr><td>Spread</td><td>{price_info['ask'] - price_info['bid']:.8f}</td></tr>
-                    </table>
+                    <h2>AI SIGNAL</h2>
+                    <div class="value">{'BUY' if prediction > 0 else 'SELL'}</div>
+                    <div class="sub">Conf: {confidence:.1f}% | Acc: {sim_acc:.1f}%</div>
                 </div>
             </div>
         </body>
         </html>
         """
-        
         try:
             with open(DASHBOARD_PATH, 'w') as f:
                 f.write(html)
@@ -338,42 +291,33 @@ class TradingBot:
             logger.error(f"Failed to write dashboard: {e}")
 
     def run(self):
-        logger.info("Starting Bot...")
-        
-        # 1. Close existing positions on start
+        logger.info("Starting MAX AGGRESSIVE Bot...")
         self.sys.close_all_positions()
         
         while self.running:
             try:
                 action_log = "Scanning..."
-                
-                # 2. Gather Info
                 wallet = self.sys.get_wallet_balance()
                 pos_data = self.sys.get_real_position(SYMBOL_BASH)
                 price_data = self.ai.fetch_price()
                 
                 if not price_data:
-                    time.sleep(2)
+                    time.sleep(0.5)
                     continue
 
-                # 3. Update AI
                 self.ai.update_data(price_data)
                 prediction, confidence = self.ai.train_and_predict()
                 
-                # 4. Trading Logic
-                
-                # --- CASE A: HAS POSITION ---
+                # ---------------------------------------------------------
+                # CASE A: HAS POSITION -> MANAGE OR CLOSE
+                # ---------------------------------------------------------
                 if pos_data['has_position']:
                     qty = pos_data['qty']
                     entry = pos_data['entry_price']
-                    
-                    # Calculate PnL (Approximation based on side)
-                    # Assuming Qty > 0 is Long, Qty < 0 is Short
                     is_long = qty > 0
                     
+                    # Calculate Real PnL
                     current_pnl = 0
-                    price_diff_pct = 0
-                    
                     if is_long:
                         current_pnl = (price_data['bid'] - entry) * abs(qty)
                         price_diff_pct = (price_data['last'] - entry) / entry
@@ -381,64 +325,64 @@ class TradingBot:
                         current_pnl = (entry - price_data['ask']) * abs(qty)
                         price_diff_pct = (entry - price_data['last']) / entry
 
-                    # Estimated Fee (Entry + Exit)
                     total_fee = (entry * abs(qty) * FEE_RATE) + (price_data['last'] * abs(qty) * FEE_RATE)
                     net_pnl = current_pnl - total_fee
 
-                    action_log = f"Monitoring PnL: {net_pnl:.6f}"
+                    action_log = f"PnL: {net_pnl:.4f}"
 
-                    # TAKE PROFIT
-                    if net_pnl > 0 and net_pnl > (total_fee * 1.5): # Ensure decent profit over fee
-                        logger.info(f"Take Profit Triggered. PnL: {net_pnl}")
-                        # Close logic: Place opposite order
+                    # 1. TAKE PROFIT (Strict PnL > Fee)
+                    if net_pnl > 0 and net_pnl > (total_fee * 1.1):
+                        logger.info(f"$$$ PROFIT CLOSE: {net_pnl:.6f}")
                         side = 'sell' if is_long else 'buy'
                         self.sys.place_order(BASE_COIN, abs(qty), side)
-                        action_log = "TAKING PROFIT"
+                        action_log = "CLOSING PROFIT"
 
-                    # MARTINGALE / GRID (Adaptive Position Management)
-                    # If losing, and AI is confident in reversal, add to position
-                    elif price_diff_pct < -GRID_STEP_PCT: 
-                        # Only add if we haven't maxed out wallet usage (simple safety)
-                        cost = price_data['last'] * abs(qty)
-                        if cost < (wallet * 0.5): # Use max 50% of wallet
+                    # 2. AGGRESSIVE GRID ADDITION (If wallet has leftover dust or deposit)
+                    elif price_diff_pct < -GRID_STEP_PCT:
+                        # Use whatever is left in wallet (MAX USAGE)
+                        usable_wallet = wallet * 0.98
+                        cost_min = price_data['last'] * MIN_QTY
+                        
+                        if usable_wallet > cost_min:
+                            # Check AI agreement
                             if (is_long and prediction > 0) or (not is_long and prediction < 0):
-                                logger.info("Adding to position (Grid/Martingale)")
+                                logger.info("Adding remaining wallet to position")
+                                add_qty = usable_wallet / price_data['last']
+                                add_qty = max(MIN_QTY, round(add_qty, 3))
                                 side = 'buy' if is_long else 'sell'
-                                self.sys.place_order(BASE_COIN, MIN_QTY, side)
-                                action_log = "GRID ADDITION"
+                                self.sys.place_order(BASE_COIN, add_qty, side)
+                                action_log = "GRID REINFORCE"
 
-                # --- CASE B: NO POSITION ---
+                # ---------------------------------------------------------
+                # CASE B: NO POSITION -> OPEN MAX
+                # ---------------------------------------------------------
                 else:
-                    # Open Trade based on AI
-                    if self.ai.is_trained and confidence > 60: # Threshold for entry
+                    if self.ai.is_trained and confidence > 55: # Lowered threshold for speed
                         
-                        # Dynamic Sizing based on Wallet
-                        # Use 5% of wallet for initial entry, but respecting min qty
-                        safe_amount_usdt = wallet * 0.05
-                        calc_qty = safe_amount_usdt / price_data['last']
+                        # MAX WALLET USAGE CALCULATION
+                        # Use 98% of wallet (reserve 2% for fees/slippage)
+                        max_usd_to_use = wallet * 0.98
                         
-                        # Round to 3 decimals (assuming atom uses 3 decimals)
-                        trade_qty = max(MIN_QTY, round(calc_qty, 3))
-                        
-                        if prediction > 0:
-                            self.sys.place_order(BASE_COIN, trade_qty, 'buy')
-                            action_log = "OPENING LONG"
-                        elif prediction < 0:
-                            self.sys.place_order(BASE_COIN, trade_qty, 'sell')
-                            action_log = "OPENING SHORT"
+                        if max_usd_to_use > (price_data['last'] * MIN_QTY):
+                            calc_qty = max_usd_to_use / price_data['last']
+                            trade_qty = max(MIN_QTY, round(calc_qty, 3))
+                            
+                            if prediction > 0:
+                                self.sys.place_order(BASE_COIN, trade_qty, 'buy')
+                                action_log = "ALL-IN LONG"
+                            elif prediction < 0:
+                                self.sys.place_order(BASE_COIN, trade_qty, 'sell')
+                                action_log = "ALL-IN SHORT"
 
-                # 5. Update Dashboard
                 self.generate_dashboard(wallet, pos_data, price_data, prediction, confidence, action_log)
-                
                 self.iteration += 1
-                time.sleep(2) # Fast scalping loop
+                time.sleep(0.1) # Hyper-fast loop
 
             except KeyboardInterrupt:
-                logger.info("Stopping bot...")
                 self.running = False
             except Exception as e:
-                logger.error(f"Main Loop Error: {e}")
-                time.sleep(5)
+                logger.error(f"Loop Error: {e}")
+                time.sleep(1)
 
 if __name__ == "__main__":
     bot = TradingBot()
