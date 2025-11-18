@@ -13,6 +13,8 @@ import random
 
 console = Console()
 
+print("linux8888")
+
 # ============================
 # CONFIG
 # ============================
