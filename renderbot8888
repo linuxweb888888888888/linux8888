@@ -30,8 +30,6 @@ MAX_POSITION_RISK_PERCENT = 0.50 # Max percentage of balance for total position 
 # Dashboard path
 DASHBOARD_PATH = "/var/www/html/dashboard.html"
 
-print("linux8888")
-
 # --- GLOBAL STATE (Persisted DataFrames for ML learning) ---
 try:
     historical_df = pd.read_csv('historical_data.csv', index_col='timestamp')
@@ -48,12 +46,11 @@ except Exception as e:
 def run_bash_command(command_parts):
     """Executes a bash command and returns the output string."""
     try:
-        # Added universal_newlines=True (same as text=True) for better cross-platform compatibility
         result = subprocess.run(
             command_parts,
             capture_output=True,
             text=True,
-            check=False, # Changed check to False here to capture ERROR output gracefully
+            check=False,
             timeout=5
         )
         
@@ -61,11 +58,11 @@ def run_bash_command(command_parts):
         
         if result.returncode != 0 and not ("NO INFO" in output or output.startswith("ERROR")):
              print(f"ERROR: Bash command exited with code {result.returncode}. Stderr: {result.stderr.strip()}")
+             # Return the error message clearly
              return f"ERROR: Exit code {result.returncode}. {result.stderr.strip()}"
 
         return output
     except subprocess.CalledProcessError as e:
-        # This block should be unreachable now that check=False, but kept for robustness
         print(f"ERROR: Bash command failed (CalledProcessError): {' '.join(command_parts)}")
         return f"ERROR: {e.stderr.strip()}"
     except Exception as e:
@@ -73,27 +70,37 @@ def run_bash_command(command_parts):
         return f"UNEXPECTED ERROR: {e}"
 
 def get_wallet_balance():
-    """Fetches and parses the USDT balance using /wallet.sh."""
+    """Fetches and parses the USDT balance using /wallet.sh. More robust error handling added."""
     output = run_bash_command(['bash', '/wallet.sh'])
+    
+    if output.startswith("ERROR"):
+        print(f"WARNING: Wallet script failed. Assuming 0 balance for safety. Output: {output}")
+        return 0.0
+
     try:
-        # Assumes the first line is the USDT balance
-        return float(output.split('\n')[0].strip())
-    except:
-        print(f"WARNING: Could not parse wallet balance from output: {output}")
+        # Assumes the first line is the USDT balance and safely converts
+        balance = float(output.split('\n')[0].strip())
+        return balance
+    except ValueError:
+        print(f"WARNING: Could not parse float balance from output: {output}. Returning 0.0.")
+        return 0.0
+    except Exception as e:
+        print(f"WARNING: Unexpected error parsing balance: {e}. Returning 0.0.")
         return 0.0
 
 def get_current_prices():
     """Simulates fetching real bid/ask prices (mocked for runnable script)."""
-    # Simple simulation to ensure the ML has changing inputs
     current_time = datetime.now()
+    # Ensure changing inputs for ML
     mock_mid_price = 10.0 + (current_time.minute % 10) * 0.1 + (current_time.second % 10) * 0.001
     bid = mock_mid_price - 0.0005
     ask = mock_mid_price + 0.0005
     return bid, ask
 
 def parse_position_info():
-    """Parses position data from /coinrealinfo.sh and calculates PnL."""
+    """Parses position data from /coinrealinfo.sh and calculates PnL. Enhanced parsing robustness."""
     output = run_bash_command(['bash', '/coinrealinfo.sh', SYMBOL])
+    
     if output == "NO INFO" or output.startswith("ERROR"):
         return None
     
@@ -105,27 +112,28 @@ def parse_position_info():
         entry_match = re.search(r'Entry Price: ([\d.e-]+)', output)
 
         if not (symbol_match and qty_match and entry_match):
-            print(f"ERROR: Failed to parse required fields from coinrealinfo.sh output: {output}")
+            # Critical parsing failure
+            print(f"ERROR: Failed to parse required fields from coinrealinfo.sh output. Returning None.")
             return None
 
         info['symbol'] = symbol_match.group(1)
-        # Handle case where quantity might be negative (short)
         raw_qty = float(qty_match.group(1))
         info['quantity'] = abs(raw_qty)
         info['entry_price'] = float(entry_match.group(1))
         
-        info['direction'] = 'buy' if raw_qty > 0 else ('sell' if raw_qty < 0 else None)
+        # If quantity is 0, treat as flat
+        if info['quantity'] == 0:
+            return None
+            
+        info['direction'] = 'buy' if raw_qty > 0 else 'sell'
         
         bid, ask = get_current_prices()
         
+        # PnL calculation based on direction
         if info['direction'] == 'buy':
-            # Long PnL: (Current Bid - Entry Price) * Quantity
             pnl_usdt = (bid - info['entry_price']) * info['quantity']
-        elif info['direction'] == 'sell':
-            # Short PnL: (Entry Price - Current Ask) * Quantity
+        else: # 'sell'
             pnl_usdt = (info['entry_price'] - ask) * info['quantity']
-        else:
-            pnl_usdt = 0.0
 
         info['pnl'] = pnl_usdt
 
@@ -146,7 +154,7 @@ def close_all_positions_on_start():
         print("Positions might have been closed successfully.")
     print("-" * 50)
 
-# --- ML & INDICATOR FUNCTIONS (Unchanged, as logic is sound) ---
+# --- ML & INDICATOR FUNCTIONS (Unchanged) ---
 
 def calculate_indicators(df):
     """Calculates technical indicators for ML features."""
@@ -159,14 +167,18 @@ def calculate_indicators(df):
     delta = df['mid_price'].diff(1)
     gain = (delta.where(delta > 0, 0)).rolling(window=WINDOW_SIZE).mean()
     loss = (-delta.where(delta < 0, 0)).rolling(window=WINDOW_SIZE).mean()
-    rs = gain / loss
+    # Avoid division by zero when calculating RS
+    rs = gain / loss.replace(0, 1e-6) 
     df['rsi'] = 100 - (100 / (1 + rs)).fillna(0)
 
     window = WINDOW_SIZE
     TP = (df['bid'] + df['ask']) / 2 
     df['ma'] = TP.rolling(window=window).mean()
     df['md'] = TP.rolling(window=window).apply(lambda x: pd.Series(x).mad(), raw=True)
-    df['cci'] = (TP - df['ma']) / (0.015 * df['md'])
+    
+    # Avoid division by zero when calculating CCI
+    md_safe = df['md'].replace(0, 1e-6)
+    df['cci'] = (TP - df['ma']) / (0.015 * md_safe)
     df['cci'] = df['cci'].replace([np.inf, -np.inf], 0).fillna(0)
 
     df = df.drop(columns=['ma', 'md'], errors='ignore')
@@ -179,16 +191,14 @@ def setup_and_train_ml_model(df, scaler, model):
     
     train_df = df[df['realized'] == True].copy()
     if len(train_df) < MIN_TRAINING_SAMPLES:
-        # ML model is trained only on realized trades, so we still return False if not enough realized data
         return scaler, model, False, 0.0
 
     features = ['price_change', 'volatility', 'cci', 'rsi', 'trade_size', 'direction_int']
-    train_df['direction_int'] = train_df['direction'].apply(lambda x: 1 if x == 'buy' else -1)
+    # Use fillna(0) just in case there are NaN in trade_size/direction_int from bad data
+    train_df['direction_int'] = train_df['direction'].apply(lambda x: 1 if x == 'buy' else -1).fillna(0)
     
     X = train_df[features].values
     y = train_df['PnL_Future'].values
-    
-    # Handle the UserWarning: X does not have valid feature names (by passing numpy arrays)
     
     if not hasattr(scaler, 'scale_'):
         scaler.fit(X)
@@ -202,32 +212,37 @@ def setup_and_train_ml_model(df, scaler, model):
         return scaler, model, False, 0.0
 
     y_pred = model.predict(X_scaled)
-    # Simple win/loss prediction accuracy
     accuracy = (np.sign(y_pred) == np.sign(y)).mean() * 100
     
-    # Model is considered trained when we have MIN_TRAINING_SAMPLES realized trades
     return scaler, model, True, accuracy
 
 
 def get_ml_prediction(df, scaler, model):
     """Generates a profit prediction for the current state."""
-    if not hasattr(scaler, 'scale_') or df.empty:
-        return 0.0, 0.5, "Untrained" 
+    # Check for empty dataframe or unscaled scaler
+    if not hasattr(scaler, 'scale_') or df.empty or len(df) < 1:
+        return 0.0, 0.5, "none" 
 
     current_state = df.iloc[[-1]]
 
     features = ['price_change', 'volatility', 'cci', 'rsi', 'trade_size', 'direction_int']
-    base_features = current_state[['price_change', 'volatility', 'cci', 'rsi']].iloc[0].tolist()
+    # .iloc[0].tolist() is safer for single-row access
+    try:
+        base_features = current_state[['price_change', 'volatility', 'cci', 'rsi']].iloc[0].tolist()
+    except:
+         # Failsafe if indicator calculation failed
+        print("WARNING: Could not extract base features for ML prediction.")
+        return 0.0, 0.5, "none"
 
     # Predict for BUY (Long)
     buy_size = MIN_QTY 
-    buy_features = base_features + [buy_size, 1] # 1 for 'buy'
+    buy_features = base_features + [buy_size, 1] 
     X_buy = scaler.transform([buy_features])
     pred_buy_pnl = model.predict(X_buy)[0]
 
     # Predict for SELL (Short)
     sell_size = MIN_QTY
-    sell_features = base_features + [sell_size, -1] # -1 for 'sell'
+    sell_features = base_features + [sell_size, -1] 
     X_sell = scaler.transform([sell_features])
     pred_sell_pnl = model.predict(X_sell)[0]
     
@@ -250,22 +265,24 @@ def get_ml_prediction(df, scaler, model):
         
     return best_pnl, confidence, best_direction
 
-# --- ADAPTIVE POSITION MANAGEMENT (Added logging) ---
+# --- ADAPTIVE POSITION MANAGEMENT (Robustness added) ---
 
 def calculate_adaptive_quantity(wallet_balance, current_position, predicted_pnl, direction):
     """Calculates the quantity (in steps of MIN_QTY) for the next trade."""
     
+    if predicted_pnl <= 0:
+         # This should have been filtered by the main loop, but as a defensive check:
+         return 0.0
+         
     max_risk_usdt = wallet_balance * MAX_POSITION_RISK_PERCENT
-    base_quantity = MIN_QTY
-    quantity_to_place = 0.0 # Start at 0.0
+    quantity_to_place = 0.0
     
     if current_position is None or current_position['quantity'] == 0:
-        if predicted_pnl > 0:
-            quantity_to_place = MIN_QTY
-        else:
-            print("Adaptive Sizing: Holding (No position & predicted PnL <= 0).")
-            return 0.0
+        # Opening new position - always minimum size
+        quantity_to_place = MIN_QTY
+        
     else:
+        # Martingale/Increase logic
         current_pnl = current_position['pnl']
         current_abs_qty = current_position['quantity']
         current_direction = current_position['direction']
@@ -275,41 +292,43 @@ def calculate_adaptive_quantity(wallet_balance, current_position, predicted_pnl,
             if current_pnl < 0:
                 # Losing trade: Martingale step.
                 loss_magnitude = abs(current_pnl) / (wallet_balance * RISK_PER_TRADE_PERCENT)
-                # Ensure factor is at least 1, and always add at least MIN_QTY
                 martingale_factor = max(1, int(np.ceil(loss_magnitude))) 
                 
-                # Calculate incremental quantity to place for the next step
                 quantity_to_place = max(MIN_QTY, martingale_factor * MIN_QTY) 
                 
+                # Check required margin for the NEW TOTAL position
                 entry_price_estimate = get_current_prices()[0] if direction == 'buy' else get_current_prices()[1]
                 required_usdt = entry_price_estimate * (current_abs_qty + quantity_to_place) / LEVERAGE
                 
                 if required_usdt > max_risk_usdt:
-                    print(f"Adaptive Sizing: MAX RISK CAP hit. Cannot increase position. Current Size: {current_abs_qty:.4f} ATOM.")
+                    print(f"Adaptive Sizing: MAX RISK CAP hit. Cannot increase position. Current size: {current_abs_qty:.4f} ATOM. Max Risk: {max_risk_usdt:.2f} USDT.")
                     return 0.0
                 print(f"Adaptive Sizing: Martingale step calculated. Increasing by {quantity_to_place:.4f} ATOM.")
                 
-            elif current_pnl > 0 and predicted_pnl > 0.001:
+            elif current_pnl > 0:
                 # Winning trade: Adaptive Scalping. Smallest increase.
                 quantity_to_place = MIN_QTY
                 print(f"Adaptive Sizing: Profitable trade increase calculated: {MIN_QTY:.4f} ATOM.")
         else:
             # Direction MISALIGNED (Should be handled by TP check before this)
-            print("Adaptive Sizing: Holding (Direction Misaligned).")
             return 0.0
             
-    # Final check and rounding to MIN_QTY steps
+    # Final check: Must be at least MIN_QTY, and rounded correctly
+    if quantity_to_place < MIN_QTY:
+        return 0.0
+        
     quantity_to_place = round(quantity_to_place / MIN_QTY) * MIN_QTY
     
     return max(0.0, quantity_to_place)
 
-# --- TRADE EXECUTION AND PNL MANAGEMENT (Added logging) ---
+# --- TRADE EXECUTION AND PNL MANAGEMENT (Robustness added) ---
 
 def execute_trade(quantity, direction, current_position, current_prices):
     """Executes a market order or closes/reduces a position."""
     if quantity < MIN_QTY:
-        return False, f"ERROR: Quantity too small ({quantity:.4f})."
+        return False, f"ERROR: Quantity too small ({quantity:.4f}). Must be >= {MIN_QTY}."
     
+    # We only execute opening or increasing trades here
     is_opening = current_position is None or current_position['quantity'] == 0
     is_increasing = (not is_opening) and (current_position['direction'] == direction)
 
@@ -322,12 +341,15 @@ def execute_trade(quantity, direction, current_position, current_prices):
         
         output = run_bash_command(command_parts)
         
-        if "SUCCESS" in output:
+        if "SUCCESS" in output or "order placed" in output.lower():
+            # SUCCESS criteria broadened slightly to catch variations in script output
             return True, f"SUCCESS: Order placed. Output: {output}"
         else:
+            # Failed to place order
             return False, f"ERROR: Order failed. Command output: {output}"
 
-    return False, "Trade execution logic error: tried to execute an unexpected trade type."
+    # Should not happen if Step 5 logic is correct
+    return False, "ERROR: Trade execution logic flow violation (tried to execute an unexpected trade type)."
 
 def check_for_take_profit(current_position, current_prices, historical_df):
     """Checks if the current position should be closed for profit and handles ML realization."""
@@ -339,9 +361,10 @@ def check_for_take_profit(current_position, current_prices, historical_df):
     pnl_usdt = current_position['pnl']
     direction = current_position['direction']
 
+    # Total estimated fee for Round-Trip (Open + Close)
     total_fee_estimate = 2 * qty * entry_price * FEE_RATE
     
-    # Condition: PnL must be larger than the estimated fee for profit
+    # Condition: PnL must be strictly greater than the estimated fee for a real profit
     if pnl_usdt > total_fee_estimate:
         print(f"TAKE PROFIT CONDITION MET: PnL {pnl_usdt:.4f} USDT > Fee {total_fee_estimate:.4f} USDT.")
         
@@ -352,10 +375,10 @@ def check_for_take_profit(current_position, current_prices, historical_df):
         print(f"CLOSING POSITION: {command_str}")
         output = run_bash_command(command_parts)
         
-        if "SUCCESS" in output:
+        if "SUCCESS" in output or "order placed" in output.lower():
             # --- ML Learning Update (Realized PnL) ---
-            # Mark the latest trade state as realized PnL
             if not historical_df.empty:
+                # Update the last entry to reflect the realized PnL from this closed trade
                 historical_df.loc[historical_df.index[-1], 'PnL_Future'] = pnl_usdt
                 historical_df.loc[historical_df.index[-1], 'realized'] = True
                 print(f"ML Learning: Realized PnL of {pnl_usdt:.4f} USDT recorded for position closure.")
@@ -364,7 +387,7 @@ def check_for_take_profit(current_position, current_prices, historical_df):
         else:
             return historical_df, False, f"ERROR: Failed to close position. Command output: {output}"
     
-    return historical_df, False, "PnL too low or insufficient to cover fees."
+    return historical_df, False, f"Holding. PnL {pnl_usdt:.4f} USDT < Fee {total_fee_estimate:.4f} USDT."
 
 # --- DASHBOARD FUNCTIONS (Unchanged) ---
 
@@ -481,7 +504,7 @@ def update_dashboard(wallet_balance, current_position, pred_pnl, confidence, acc
     except Exception as e:
         print(f"ERROR: Could not write HTML dashboard to {DASHBOARD_PATH}. Check permissions: {e}")
 
-# --- MAIN BOT LOGIC (Added extensive checks) ---
+# --- MAIN BOT LOGIC (Enhanced Robustness) ---
 
 def main():
     """The main trading loop of the bot."""
@@ -501,22 +524,30 @@ def main():
     while True:
         start_time = time.time()
         
-        # --- STEP 1: Get Real-Time Data ---
+        # --- STEP 1: Get Real-Time Data & State ---
         wallet_balance = get_wallet_balance()
+        if wallet_balance <= 0:
+            print("CRITICAL: Wallet balance is 0 or unreadable. Cannot trade. Please fund your account.")
+            time.sleep(INTERVAL_SECONDS)
+            continue
+            
         bid, ask = get_current_prices()
         mid_price = (bid + ask) / 2
         
-        print(f"\n--- {datetime.now().strftime('%H:%M:%S')} ---")
+        print(f"\n--- {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} ---")
         print(f"Wallet: ${wallet_balance:.2f} | Bid: {bid:.8f} | Ask: {ask:.8f}")
         
         # --- STEP 2: Update Historical Data & Indicators ---
+        # *** ROBUSTNESS FIX: Initialize trade_size/direction correctly for new row ***
         new_data = pd.DataFrame([{
             'timestamp': datetime.now(), 
             'bid': bid, 
             'ask': ask, 
             'mid_price': mid_price, 
             'price_change': 0.0, 'cci': 0.0, 'rsi': 0.0, 'volatility': 0.0, 
-            'PnL_Future': 0.0, 'trade_size': 0.0, 'direction': 'none', 
+            'PnL_Future': 0.0, 
+            'trade_size': 0.0,      # Default size (0.0)
+            'direction': 'none',    # Default direction (none)
             'realized': False 
         }]).set_index('timestamp')
 
@@ -539,38 +570,44 @@ def main():
         historical_df, closed, msg = check_for_take_profit(current_position, (bid, ask), historical_df)
         
         if closed:
-            current_position = parse_position_info()
+            # Must re-read position after a close to ensure state is FLAT
+            current_position = parse_position_info() 
             if msg and "PnL" in msg:
-                pnl_str = msg.split("PnL ")[-1].split(" USDT")[0]
                 try:
-                    closed_pnl = float(pnl_str)
+                    closed_pnl = float(msg.split("PnL ")[-1].split(" USDT")[0])
                     if closed_pnl > 0:
                         realized_wins += 1
                     else:
                         realized_losses += 1
                 except:
-                    pass
+                    pass # Keep quiet if PnL parsing failed here
         
-        print(f"Position Status: {'FLAT' if current_position is None else f'{current_position['direction'].upper()} {current_position['quantity']:.4f} ATOM (PnL: {current_position['pnl']:.4f} USDT)'}")
+        is_flat = current_position is None or current_position['quantity'] == 0
+        
+        # *** SYNTAX FIX: Resolved f-string quote nesting by creating a temporary message string. ***
+        position_msg = ('FLAT' if is_flat 
+                        else f"{current_position['direction'].upper()} {current_position['quantity']:.4f} ATOM (PnL: {current_position['pnl']:.4f} USDT)")
+        print(f"Position Status: {position_msg}")
 
         # --- STEP 5: Trade Execution (Open/Increase Position) ---
         
-        is_flat = current_position is None or current_position['quantity'] == 0
         can_open_trade = False
         
-        # Check primary ML gates and implement the bootstrap fix
         if not ml_model_trained:
-            # BOOTSTRAP CHECK: If model is untrained, allow initial trade if flat and signal is positive.
+            # BOOTSTRAP CHECK (FIXED PREVIOUSLY)
             if is_flat and pred_pnl > 0.0:
                 print("TRADE BOOTSTRAP: Allowing initial trade to gather first PnL data points (ML untrained, positive signal, flat).")
                 can_open_trade = True
             else:
+                # *** CLARIFIED LOGGING ***
                 print("TRADE BLOCKED: ML model is untrained and cannot bootstrap (position already open or no positive signal).")
                 can_open_trade = False
         elif pred_pnl <= 0.0:
+            # *** CLARIFIED LOGGING ***
             print(f"TRADE BLOCKED: Predicted PnL ({pred_pnl:.6f}) is not positive.")
             can_open_trade = False
         elif confidence < WIN_CONFIDENCE_THRESHOLD:
+            # *** CLARIFIED LOGGING ***
             print(f"TRADE BLOCKED: Confidence ({confidence:.2f}) is below threshold ({WIN_CONFIDENCE_THRESHOLD}).")
             can_open_trade = False
         else:
@@ -588,19 +625,23 @@ def main():
             )
             
             if quantity_to_trade > 0.0:
-                if current_position and current_position['direction'] != pred_direction and current_position['quantity'] > 0:
-                    print("TRADE BLOCKED: Waiting for existing opposite position to close before opening new direction.")
+                # *** Direction Conflict Check (Important Gate) ***
+                if not is_flat and current_position['direction'] != pred_direction:
+                    print("TRADE BLOCKED: Cannot reverse. Waiting for existing opposite position to close before opening new direction.")
                 else:
                     success, trade_msg = execute_trade(quantity_to_trade, pred_direction, current_position, (bid, ask))
                     print(f"TRADE EXECUTION RESULT: {trade_msg}")
                     
                     if success:
+                        # *** ROBUSTNESS FIX: Only update historical_df upon successful execution ***
                         historical_df.loc[historical_df.index[-1], 'trade_size'] = quantity_to_trade
                         historical_df.loc[historical_df.index[-1], 'direction'] = pred_direction
-                        
-                    current_position = parse_position_info()
+                        # Re-read position immediately after successful open/increase
+                        current_position = parse_position_info()
+                    
             else:
-                 print("TRADE BLOCKED: Adaptive sizing returned 0.0 quantity (risk cap or Martingale conditions not met).")
+                 # *** CLARIFIED LOGGING (Risk Cap/Sizing Hold) ***
+                 print("TRADE BLOCKED: Adaptive sizing returned 0.0 quantity (Risk cap, margin, or Martingale conditions not met).")
         
         # --- STEP 6: Dashboard Update & Persistence ---
         current_pnl = current_position['pnl'] if current_position else 0.0
