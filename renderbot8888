@@ -7,39 +7,38 @@ import os
 import re
 import logging
 from datetime import datetime
-from sklearn.ensemble import RandomForestRegressor
+from sklearn.ensemble import GradientBoostingClassifier
 from sklearn.preprocessing import StandardScaler
 from collections import deque
+from statsmodels.api import OLS # Used for Hurst Exponent (R/S analysis)
 
 # ------------------------------------------------------------------------------
 # CONFIGURATION
 # ------------------------------------------------------------------------------
-SYMBOL_CCXT = 'ATOM/USDT'      # For CCXT Fetching
-SYMBOL_BASH = 'ATOMUSDT_PERP'  # For Bash Scripts
-BASE_COIN = 'ATOM'             # For placeorder arguments
-MIN_QTY = 0.001                # Minimum step size (Confirmed 0.001)
-
-# *** UPDATED FOR HYPER-MINIMUM ENTRY ***
-# New Factor: Determines how many MIN_QTY units to use for a new, small entry
-# Setting to 1 to ensure new trades are the absolute smallest possible size (0.001)
+SYMBOL_CCXT = 'ATOM/USDT'      
+SYMBOL_BASH = 'ATOMUSDT_PERP'  
+BASE_COIN = 'ATOM'             
+MIN_QTY = 0.001                
 MIN_TRADE_QTY_FACTOR = 1       
 DECIMAL_PRECISION = len(str(MIN_QTY).split('.')[-1]) 
 DASHBOARD_PATH = '/var/www/html/dashboard.html'
-MAX_HISTORY = 200              # Data points for ML training
+MAX_HISTORY = 400              # Increased data points for better Hurst/GBM training
 TRAINING_INTERVAL = 1          # Train every step for max adaptation
 FEE_RATE = 0.0006              # Est. Taker fee (0.06%)
-# MAX SPEED: Target 0.01% gross profit + fees for immediate closure
-TARGET_PROFIT_PCT = 0.0001     
-# MAX SPEED: Averaging down extremely close (0.1%)
-GRID_STEP_PCT = 0.001          
-# This multiplier is now ONLY used for scaling in (compounding/grid recovery)
-INITIAL_ENTRY_SIZE_MULTIPLIER = 2.0 
 
-# MAX SPEED: Time to wait between loop iterations (50ms)
+# V4.0 Strategy Parameters
+TARGET_PROFIT_PCT = 0.00015    
+GRID_STEP_PCT = 0.001          
+INITIAL_ENTRY_RISK_CAP = 0.005 # Cap initial entry risk at 0.5% of total wallet
 UHF_SLEEP_SECONDS = 0.05 
 
+# V4.0 Risk Management Parameters
+MAX_PNL_LOSS_PCT = 0.05        # Hard Stop Loss: Max 5% unrealized loss on position value
+RECOVERY_CONFIDENCE_MIN = 60.0 # Higher confidence required for averaging down
+MIN_VOLATILITY_FACTOR = 0.0001 # A baseline volatility measure for size scaling
+
 # Dashboard Configuration
-SPREAD_TIGHT_THRESHOLD = 0.0005 # Max spread considered 'tight' for display
+SPREAD_TIGHT_THRESHOLD = 0.0005 
 
 # ------------------------------------------------------------------------------
 # LOGGING SETUP
@@ -48,13 +47,62 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 logger = logging.getLogger()
 
 # ------------------------------------------------------------------------------
+# HELPER FUNCTIONS
+# ------------------------------------------------------------------------------
+
+def calculate_hurst_exponent(series, max_lag=20):
+    """V4.0: Calculates the Hurst Exponent (H) using Rescaled Range (R/S) analysis."""
+    lags = range(2, max_lag)
+    # 1. Calculate the standard deviation of differences
+    tau = [np.std(series.diff().dropna())]
+    if tau[0] == 0: return 0.5 # Handle zero volatility
+    
+    # 2. Calculate the Rescaled Range (R/S) for each lag
+    rs_data = []
+    for lag in lags:
+        # Split series into chunks of size 'lag'
+        chunks = [series.iloc[i:i + lag] for i in range(0, len(series) - lag + 1, lag)]
+        if not chunks: continue
+        
+        # Calculate R/S for each chunk
+        rs_values = []
+        for chunk in chunks:
+            if len(chunk) < lag: continue
+            mean = chunk.mean()
+            # Calculate deviation and cumulative deviation (Y_t)
+            y_t = (chunk - mean).cumsum()
+            
+            # Calculate Range (R) and Standard Deviation (S)
+            R = y_t.max() - y_t.min()
+            S = chunk.std()
+            if S > 0:
+                rs_values.append(R / S)
+        
+        if rs_values:
+            rs_data.append(np.mean(rs_values))
+
+    # 3. Fit linear regression on log(R/S) vs log(lag)
+    if len(rs_data) < 5: return 0.5 # Not enough data points
+    
+    # Remove logs of zero
+    log_lags = np.log(list(lags)[:len(rs_data)])
+    log_rs = np.log(rs_data)
+
+    if len(log_lags) > 1 and len(log_lags) == len(log_rs):
+        model = OLS(log_rs, log_lags).fit()
+        H = model.params[0]
+        return max(0.0, min(1.0, H)) # Clamp H between 0 and 1
+        
+    return 0.5 # Default to random walk
+
+# ------------------------------------------------------------------------------
 # SYSTEM INTERFACE (Bash Scripts)
 # ------------------------------------------------------------------------------
 class SystemInterface:
     @staticmethod
     def run_command(command_list):
         try:
-            # Added shorter timeout for faster feedback loop
+            # Command logic remains the same as V3.0
             result = subprocess.run(command_list, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=3)
             return result.stdout.strip()
         except Exception as e:
@@ -63,7 +111,6 @@ class SystemInterface:
 
     @staticmethod
     def get_wallet_balance():
-        """Reads USDT balance from /wallet.sh. First line is USDT."""
         output = SystemInterface.run_command(['bash', '/wallet.sh'])
         if output:
             try:
@@ -76,7 +123,6 @@ class SystemInterface:
 
     @staticmethod
     def get_real_position(symbol_bash):
-        """Parses /coinrealinfo.sh output."""
         output = SystemInterface.run_command(['bash', '/coinrealinfo.sh', symbol_bash])
         
         data = {
@@ -108,9 +154,6 @@ class SystemInterface:
 
     @staticmethod
     def place_order(coin_base, qty, side):
-        """
-        Executes /placeorder.sh (base) (qty) (side)
-        """
         cmd = ['bash', '/placeorder.sh', coin_base, str(qty), side]
         output = SystemInterface.run_command(cmd)
         if output and "SUCCESS" in output:
@@ -122,85 +165,82 @@ class SystemInterface:
 
     @staticmethod
     def close_all_positions():
-        """Runs /closepositions.sh"""
         output = SystemInterface.run_command(['bash', '/closepositions.sh'])
         logger.info(f"Close Positions: {output}")
         return output
 
 # ------------------------------------------------------------------------------
-# WALLET LEARNER (ULTRA-AGGRESSIVE MODE)
+# WALLET LEARNER (ADAPTIVE RISK MODE)
 # ------------------------------------------------------------------------------
 class WalletLearner:
     def __init__(self):
         self.initial_balance = 0.0
         self.current_balance = 0.0
-        self.previous_balance = 0.0
         self.trade_history = deque(maxlen=50)
-        # MAX SPEED: Low starting threshold (30.0%) for maximum trade frequency
         self.dynamic_threshold = 30.0 
-        self.risk_multiplier = 0.99   # Start MAX usage (99% - leaving 1% for fees)
+        self.risk_multiplier = 0.99   
 
     def update_balance(self, new_balance):
         if self.initial_balance == 0:
             self.initial_balance = new_balance
             self.current_balance = new_balance
-            self.previous_balance = new_balance
             return
 
-        self.previous_balance = self.current_balance
+        delta = new_balance - self.current_balance
         self.current_balance = new_balance
-        
-        delta = self.current_balance - self.previous_balance
         
         if abs(delta) > 0.0001:
             self.trade_history.append(delta)
             self.adapt_strategy(delta)
 
     def adapt_strategy(self, delta):
-        """
-        Ultra-aggressive adaptation for maximum frequency trading.
-        """
+        # V3.0 Adaptive risk logic maintained
+        growth_pct = self.get_growth_pct()
+
         if delta > 0:
-            # Winning: Go faster (lower threshold for faster entries, down to 15.0 for maximum frequency)
             self.dynamic_threshold = max(15.0, self.dynamic_threshold - 0.5)
-            self.risk_multiplier = 0.99 # Keep pinned at max
-            logger.info(f"PROFIT (+{delta:.6f}) -> MAX VELOCITY (Threshold: {self.dynamic_threshold:.2f}%)")
-            
         else:
-            # Losing: Tighten threshold slightly (max 40.0 to maintain high activity but manage risk)
             self.dynamic_threshold = min(40.0, self.dynamic_threshold + 1.0)
-            self.risk_multiplier = 0.99 # STAY AGGRESSIVE
-            logger.info(f"LOSS ({delta:.6f}) -> RECOVERY MODE (Threshold: {self.dynamic_threshold:.2f}%)")
+            
+        if growth_pct < 0:
+            self.risk_multiplier = 0.85 
+            logger.warning(f"ACCOUNT DRAWDOWN detected. Risk Multiplier reduced to {self.risk_multiplier}.")
+        else:
+             self.risk_multiplier = 0.99 
 
     def get_growth_pct(self):
         if self.initial_balance == 0: return 0.0
         return ((self.current_balance - self.initial_balance) / self.initial_balance) * 100
 
 # ------------------------------------------------------------------------------
-# AI & MARKET DATA ENGINE (FASTEST POSSIBLE INDICATORS)
+# AI & MARKET DATA ENGINE (GRADIENT BOOSTING CLASSIFIER)
 # ------------------------------------------------------------------------------
 class AIEngine:
     def __init__(self):
         self.exchange = ccxt.hitbtc({'enableRateLimit': True})
         self.history = pd.DataFrame()
-        # MAX SPEED: Less complex model for ultra-fast training
-        self.model = RandomForestRegressor(n_estimators=20, max_depth=8, random_state=42)
+        self.model = GradientBoostingClassifier(n_estimators=30, max_depth=3, learning_rate=0.1, random_state=42)
         self.scaler = StandardScaler()
         self.is_trained = False
         self.simulation_wins = 0
         self.simulation_total = 0
-        self.last_prediction = 0.0
+        self.last_prediction_proba = 0.5
         self.confidence = 0.0
-        self.avg_volatility = 0.0 # Store average volatility for dashboard
+        self.avg_volatility = 0.0 
+        self.hurst_exponent = 0.5 # V4.0: New feature
 
     def fetch_price(self):
         try:
+            ob = self.exchange.fetch_order_book(SYMBOL_CCXT, limit=5)
             ticker = self.exchange.fetch_ticker(SYMBOL_CCXT)
+            
             return {
                 'bid': ticker['bid'],
                 'ask': ticker['ask'],
                 'last': ticker['last'],
-                'timestamp': datetime.now()
+                'timestamp': datetime.now(),
+                'bid_vol': sum([q for p, q in ob['bids']]),
+                'ask_vol': sum([q for p, q in ob['asks']]),
             }
         except Exception as e:
             logger.error(f"CCXT Error: {e}")
@@ -219,34 +259,34 @@ class AIEngine:
     def calculate_features(self, df):
         df = df.copy()
         
-        # UHF SCALPING FOCUS
         df['mid_price'] = (df['bid'] + df['ask']) / 2
-        df['returns'] = df['mid_price'].pct_change()
         
-        # Ultra Fast RSI (Period 5) based on MID-PRICE
+        # V4.0: Time Decay EWMA Features (Faster reaction)
+        df['ewma_3'] = df['mid_price'].ewm(span=3, adjust=False).mean()
+        df['ewma_5'] = df['mid_price'].ewm(span=5, adjust=False).mean()
+        
+        df['total_vol'] = df['bid_vol'] + df['ask_vol']
+        df['imbalance'] = (df['bid_vol'] - df['ask_vol']) / df['total_vol'].replace(0, 1)
+
         delta = df['mid_price'].diff()
-        gain = (delta.where(delta > 0, 0)).rolling(window=5).mean()
-        loss = (-delta.where(delta < 0, 0)).rolling(window=5).mean()
+        gain = (delta.where(delta > 0, 0)).ewm(span=5, adjust=False).mean() # V4.0 EWMA
+        loss = (-delta.where(delta < 0, 0)).ewm(span=5, adjust=False).mean() # V4.0 EWMA
         rs = gain / loss
         df['rsi'] = 100 - (100 / (1 + rs))
-        
-        # Volatility (Period 5) - Measures short-term instability
-        df['volatility'] = df['returns'].rolling(window=5).std()
-        
-        # Momentum (Period 3) based on MID-PRICE
+        df['volatility'] = df['mid_price'].pct_change().ewm(span=5, adjust=False).std() # V4.0 EWMA
         df['momentum'] = df['mid_price'] - df['mid_price'].shift(3)
-
-        # Spread (distance between bid/ask)
         df['spread'] = df['ask'] - df['bid']
-        
-        # CRITICAL FEATURE: Spread Change (Widening or Narrowing)
         df['spread_change'] = df['spread'].diff()
         
-        # Fast Moving Average (MA 5) based on MID-PRICE
-        df['ma_5'] = df['mid_price'].rolling(window=5).mean()
+        # V4.0: Hurst Exponent Calculation
+        if len(df) >= 20:
+             self.hurst_exponent = calculate_hurst_exponent(df['mid_price'].iloc[-20:])
+        df['hurst'] = self.hurst_exponent # Broadcast the Hurst value to the feature column
         
-        # NEW TARGET: Predict the change in the next MID-PRICE tick
-        df['target'] = df['mid_price'].shift(-1) - df['mid_price']
+        # TARGET - Predict Direction (1: up, -1: down)
+        target_returns = df['mid_price'].pct_change().shift(-1)
+        df['signal'] = np.where(target_returns > 0.000005, 1, 
+                       np.where(target_returns < -0.000005, -1, 0)) 
         
         return df
 
@@ -254,44 +294,64 @@ class AIEngine:
         if len(self.history) < 50: 
             return 0, 0 
 
-        df_all = self.calculate_features(self.history)
+        df_all = self.calculate_features(self.history).dropna()
         
-        X_current = df_all.iloc[[-1]].drop(columns=['target']).dropna()
-        df_train = df_all.iloc[:-1].dropna()
+        if df_all.empty: return 0, 0
+
+        # V4.0: Added 'hurst' to features
+        feature_cols = ['ewma_3', 'ewma_5', 'imbalance', 'rsi', 'volatility', 
+                        'spread', 'momentum', 'spread_change', 'hurst'] 
+        
+        X_current = df_all.iloc[[-1]][feature_cols]
+        df_train = df_all.iloc[:-1]
 
         if df_train.empty or X_current.empty: 
             return 0, 0
 
-        feature_cols = ['rsi', 'volatility', 'spread', 'momentum', 'ma_5', 'spread_change'] 
-        
-        X_current = X_current[feature_cols]
-
         X = df_train[feature_cols]
-        y = df_train['target']
+        y = df_train['signal']
+        
+        X_filtered = X[y != 0]
+        y_filtered = y[y != 0]
+        
+        if len(y_filtered) < 10: return 0, 0 
 
+        # Update simulation performance logic remains the same
         if self.is_trained:
-            actual_move = df_all.iloc[-2]['target'] if not pd.isna(df_all.iloc[-2]['target']) else 0
-            if (self.last_prediction > 0 and actual_move > 0) or (self.last_prediction < 0 and actual_move < 0):
+            X_prev = df_all.iloc[[-2]][feature_cols]
+            actual_signal = df_all.iloc[-2]['signal']
+            
+            proba = self.model.predict_proba(X_prev)[0] 
+            predicted_signal = 1 if proba[1] > 0.5 else (-1 if proba[0] > 0.5 else 0)
+
+            if predicted_signal == actual_signal and actual_signal != 0:
                 self.simulation_wins += 1
-            self.simulation_total += 1
+            if actual_signal != 0:
+                 self.simulation_total += 1
 
         try:
-            self.model.fit(X, y)
+            self.model.fit(X_filtered, y_filtered)
             self.is_trained = True
         except Exception as e:
             logger.error(f"ML Training failed: {e}")
             return 0, 0
 
-        prediction = self.model.predict(X_current)[0]
+        proba = self.model.predict_proba(X_current)[0]
         
-        # Calculate volatility based on the training data
-        avg_vol = df_train['volatility'].mean()
-        # Confidence based on strength of signal vs noise (capped at 100%)
-        confidence = min(abs(prediction) / (avg_vol + 1e-9), 1.0) * 100
+        if proba[1] > proba[0]:
+            prediction = 1
+            self.last_prediction_proba = proba[1]
+        elif proba[0] > proba[1]:
+            prediction = -1
+            self.last_prediction_proba = proba[0]
+        else:
+            prediction = 0
+            self.last_prediction_proba = 0.5
+
+        confidence = (self.last_prediction_proba - 0.5) * 200 
         
-        self.last_prediction = prediction
         self.confidence = confidence
-        self.avg_volatility = avg_vol # Store for dashboard
+        self.avg_volatility = df_all['volatility'].mean() 
         
         return prediction, confidence
 
@@ -305,10 +365,79 @@ class TradingBot:
         self.wallet_learner = WalletLearner()
         self.running = True
         self.iteration = 0
-        # Storage for recent actions to display in the dashboard
         self.action_history = deque(maxlen=5) 
 
-    def generate_dashboard(self, wallet, position, price_info, prediction, confidence, action_msg, action_type, avg_volatility, dynamic_threshold, required_pnl_usd, action_history):
+    def calculate_pnl(self, qty, entry, price_info):
+        # PnL calculation remains the same as V3.0
+        is_long = qty > 0
+        curr_price = price_info['bid'] if is_long else price_info['ask']
+        
+        if is_long: 
+            current_pnl = (curr_price - entry) * abs(qty)
+        else: 
+            current_pnl = (entry - curr_price) * abs(qty)
+            
+        entry_value = entry * abs(qty)
+        total_fee = (entry * abs(qty) * FEE_RATE) + (price_info['last'] * abs(qty) * FEE_RATE)
+        net_pnl = current_pnl - total_fee
+        
+        required_gross_profit = entry_value * TARGET_PROFIT_PCT
+        required_pnl_usd = required_gross_profit + total_fee
+
+        pnl_pct_of_value = (current_pnl / entry_value) if entry_value > 0 else 0.0
+
+        return net_pnl, required_pnl_usd, pnl_pct_of_value
+
+    def calculate_position_size(self, wallet, execution_price):
+        """V4.0: Calculates position size based on Volatility-Adjusted Sizing (VAS)."""
+        current_volatility = self.ai.history['volatility'].iloc[-1] if not self.ai.history.empty and 'volatility' in self.ai.history.columns else MIN_VOLATILITY_FACTOR
+        current_volatility = max(current_volatility, MIN_VOLATILITY_FACTOR)
+
+        # Base size is calculated inversely to volatility
+        # We cap the risk on the entry to a small percentage of the wallet
+        base_size_usd = wallet * INITIAL_ENTRY_RISK_CAP
+        
+        # Volatility factor: lower volatility gives a bigger multiplier
+        vol_factor = 1 / (current_volatility * 1000) # Scaling factor based on typical UHF volatility
+        
+        # Maximize size but respect wallet risk and minimum quantity
+        raw_qty = (base_size_usd * vol_factor) / execution_price
+        
+        # Apply the overall risk multiplier from the WalletLearner
+        usable_wallet_usd = wallet * self.wallet_learner.risk_multiplier
+        max_qty_based_on_wallet = usable_wallet_usd / execution_price
+        
+        # Final quantity is the minimum of Volatility-Adjusted and Wallet-Capped size
+        final_qty = min(raw_qty, max_qty_based_on_wallet)
+        
+        # Ensure it's correctly rounded to minimum tick size
+        trade_qty = np.floor(final_qty / MIN_QTY) * MIN_QTY
+        trade_qty = max(MIN_QTY, round(trade_qty, DECIMAL_PRECISION)) 
+        
+        return trade_qty, current_volatility
+
+    def check_liquidity_sweep(self, prediction):
+        """V4.0: Checks for a recent liquidity sweep (short-term reversal signal)."""
+        if len(self.ai.history) < 5:
+            return False
+            
+        prices = self.ai.history['mid_price'].iloc[-5:].values
+        
+        if prediction == 1: # Predicted LONG: Check for recent low sweep
+            # If the current price is near the 5-tick low, it suggests a bottom sweep
+            if prices[-1] <= prices.min() * 1.00005: 
+                return True
+        
+        elif prediction == -1: # Predicted SHORT: Check for recent high sweep
+            # If the current price is near the 5-tick high, it suggests a top sweep
+            if prices[-1] >= prices.max() * 0.99995: 
+                return True
+                
+        return False
+
+
+    def generate_dashboard(self, wallet, position, price_info, prediction, confidence, action_msg, action_type, avg_volatility, dynamic_threshold, required_pnl_usd, action_history, pnl_pct_of_value, current_volatility, hurst_exponent):
+        # Dashboard logic remains largely the same, with added V4.0 stats
         unrealized_pnl = 0.0
         target_price = 0.0
         
@@ -316,30 +445,22 @@ class TradingBot:
         pos_qty_display = "0.000"
         
         if position['has_position']:
+            net_pnl, _, _ = self.calculate_pnl(position['qty'], position['entry_price'], price_info)
+            unrealized_pnl = net_pnl
+            
             qty = position['qty']
             entry = position['entry_price']
-            
-            # 1. PNL Calculation
             is_long = qty > 0
-            curr_price = price_info['bid'] if is_long else price_info['ask']
             
-            if is_long: 
-                unrealized_pnl = (curr_price - entry) * abs(qty)
-                pos_dir = "LONG"
-            else: 
-                unrealized_pnl = (entry - curr_price) * abs(qty)
-                pos_dir = "SHORT"
-            
+            pos_dir = "LONG" if is_long else "SHORT"
             pos_qty_display = f"{abs(qty):.{DECIMAL_PRECISION}f}"
             
-            # 2. Target Price Calculation
             if abs(qty) > 0:
                 if is_long:
                     target_price = entry + (required_pnl_usd / abs(qty))
                 else:
                     target_price = entry - (required_pnl_usd / abs(qty))
         
-        # Style Definitions
         pnl_class = "neutral-text"
         if unrealized_pnl > 0: pnl_class = "success-text"
         elif unrealized_pnl < 0: pnl_class = "danger-text"
@@ -351,38 +472,30 @@ class TradingBot:
         growth_pct = self.wallet_learner.get_growth_pct()
         growth_class = "success-text" if growth_pct >= 0 else "danger-text"
         
-        ai_signal = 'LONG' if prediction > 0 else 'SHORT'
-        signal_color = 'var(--success-green)' if prediction > 0 else ('var(--danger-red)' if prediction < 0 else 'var(--neutral-gray)')
-        
-        prediction_val_str = f"{prediction:.8f}"
+        ai_signal = 'LONG' if prediction == 1 else ('SHORT' if prediction == -1 else 'NEUTRAL')
+        signal_color = 'var(--long-color)' if prediction == 1 else ('var(--short-color)' if prediction == -1 else 'var(--neutral-gray)')
+        prediction_val_str = f"{self.ai.last_prediction_proba:.4f}"
         
         spread = price_info['ask'] - price_info['bid']
         spread_status = "Tight" if spread <= SPREAD_TIGHT_THRESHOLD else "Wide"
         spread_class = "success-text" if spread_status == "Tight" else "danger-text"
 
-        # Action bar style based on action_type
-        action_style = {
-            "SCANNING": "cyan-bar",
-            "ENTRY": "blue-bar",
-            "PROFIT": "success-bar",
-            "RECOVERY": "danger-bar",
-            "COMPOUND": "success-bar",
-            "CLOSE": "success-bar"
-        }.get(action_type, "cyan-bar")
-
-        # Confidence Bar Logic
+        action_type_map = {
+            "SCANNING": "cyan-bar", "ENTRY": "blue-bar", "PROFIT": "success-bar", 
+            "RECOVERY": "danger-bar", "COMPOUND": "success-bar", "CLOSE": "success-bar",
+            "STOP_LOSS": "critical-bar"
+        }
+        action_type_display = action_type_map.get(action_type, "cyan-bar")
+        
         confidence_level = confidence
         threshold = dynamic_threshold
-        # Normalize for bar width (0-100)
         confidence_width = min(confidence_level, 100) 
         threshold_pos = min(threshold, 100) 
         
-        # Position Bar Style
         pos_class = "neutral-pos"
         if pos_dir == "LONG": pos_class = "long-pos"
         elif pos_dir == "SHORT": pos_class = "short-pos"
 
-        # Generate Action History HTML
         history_html = ""
         for item in action_history:
             msg = item['message']
@@ -396,28 +509,38 @@ class TradingBot:
         if not history_html:
             history_html = "<div class='log-entry neutral-pos'>Awaiting first action...</div>"
 
+        imbalance = price_info.get('imbalance', 0)
+        imbalance_class = 'success-text' if imbalance > 0.1 else ('danger-text' if imbalance < -0.1 else 'neutral-text')
+        imbalance_text = 'BUY Pressure' if imbalance > 0 else ('SELL Pressure' if imbalance < 0 else 'Balanced')
+        
+        risk_class = 'danger-text' if pnl_pct_of_value < -0.01 else 'success-text'
+        
+        # V4.0: Hurst Exponent Display
+        hurst_class = 'success-text' if hurst_exponent > 0.55 else ('danger-text' if hurst_exponent < 0.45 else 'neutral-text')
+        hurst_text = 'Trending' if hurst_exponent > 0.55 else ('Mean-Reverting' if hurst_exponent < 0.45 else 'Random Walk')
 
         html = f"""
         <!DOCTYPE html>
         <html lang="en">
         <head>
             <meta charset="UTF-8">
-            <meta http-equiv="refresh" content="0.5"> <!-- Faster refresh for UHF feel -->
+            <meta http-equiv="refresh" content="0.5"> 
             <meta name="viewport" content="width=device-width, initial-scale=1.0">
-            <title>UHF SCALPER COMMAND CENTER V2.0</title>
+            <title>UHF SCALPER COMMAND CENTER V4.0</title>
             <style>
-                @import url('https://fonts.googleapis.com/css2?family=Orbitron:wght@400;700;900&family=Roboto+Mono:wght@300;400;700&display=swap');
+                @import url('https://fonts.googleapis.com/css2?family=Orbitron:wght@400;700;900&family=Roboto+Mono:wght[300;400;700}&display=swap');
                 
                 :root {{
                     --bg-dark: #070D12;
                     --card-bg: #101F2B;
-                    --success-green: #00FF99; /* Neon Green */
-                    --danger-red: #FF3366; /* Neon Red */
-                    --accent-blue: #00BFFF; /* Deep Cyan/Blue */
+                    --success-green: #00FF99;
+                    --danger-red: #FF3366; 
+                    --accent-blue: #00BFFF; 
                     --neutral-gray: #4A6D7C;
                     --text-light: #E0FFEF;
                     --long-color: #00BFFF;
                     --short-color: #FF3366;
+                    --critical-yellow: #FFFF66;
                 }}
 
                 body {{ 
@@ -435,8 +558,8 @@ class TradingBot:
                     margin-bottom: 20px;
                     font-size: 1.8rem;
                     font-weight: 900;
-                    color: var(--success-green);
-                    text-shadow: 0 0 8px rgba(0, 255, 153, 0.7);
+                    color: var(--critical-yellow);
+                    text-shadow: 0 0 8px rgba(255, 255, 102, 0.7);
                     padding-bottom: 10px;
                     border-bottom: 2px solid var(--neutral-gray);
                 }}
@@ -535,7 +658,7 @@ class TradingBot:
                 }}
                 .confidence-fill {{
                     height: 100%;
-                    background-color: var(--success-green);
+                    background-color: var(--critical-yellow);
                     transition: width 0.3s;
                 }}
                 .threshold-marker {{
@@ -570,6 +693,7 @@ class TradingBot:
                 .log-entry.recovery .log-message {{ color: var(--danger-red); }}
                 .log-entry.compound .log-message {{ color: var(--success-green); }}
                 .log-entry.close .log-message {{ color: var(--text-light); }}
+                .log-entry.stop_loss .log-message {{ color: var(--critical-yellow); font-weight: 700; }}
 
                 /* Responsive Adjustments */
                 @media (max-width: 900px) {{
@@ -579,7 +703,7 @@ class TradingBot:
             </style>
         </head>
         <body>
-            <div class="header">UHF SCALPER V2.0 / {SYMBOL_CCXT} MONITOR</div>
+            <div class="header">UHF SCALPER V4.0: DEEP MOMENTUM & SMART LIQUIDITY HARVESTING / {SYMBOL_CCXT}</div>
             
             <div class="container">
                 <div class="status-bar {pos_class}">
@@ -593,23 +717,23 @@ class TradingBot:
                     <div>
                         <!-- PNL BLOCK (Dominant) -->
                         <div class="card pnl-block" style="border-left: 4px solid {'var(--success-green)' if unrealized_pnl > 0 else 'var(--danger-red)' if unrealized_pnl < 0 else 'var(--neutral-gray)'};">
-                            <h2>UNREALIZED PNL</h2>
+                            <h2>NET UNREALIZED PNL</h2>
                             <div class="value pnl {pnl_class}">{unrealized_pnl:.6f} USDT</div>
-                            <div class="sub">Required Profit to Close: <span class="success-text">{required_pnl_usd:.6f} USDT</span></div>
+                            <div class="sub">PnL % of Position Value: <span class="{risk_class}">{(pnl_pct_of_value*100):.2f}%</span></div>
                         </div>
                         
                         <!-- AI CONFIDENCE GAUGE -->
                         <div class="card" style="margin-top: 15px;">
-                            <h2>AI CONFIDENCE GAUGE</h2>
+                            <h2>AI DIRECTIONAL CONFIDENCE</h2>
                             <div class="confidence-gauge">
                                 <div class="threshold-marker" style="left: {threshold_pos}%;"></div>
                                 <div class="confidence-fill" style="width: {confidence_width}%;"></div>
                             </div>
                             <div class="gauge-labels">
-                                <span>0%</span>
+                                <span>0% (Noise)</span>
                                 <span>Threshold: {threshold:.1f}%</span>
                                 <span>Confidence: {confidence:.1f}%</span>
-                                <span>100%</span>
+                                <span>100% (Certain)</span>
                             </div>
                         </div>
                     </div>
@@ -620,7 +744,7 @@ class TradingBot:
                         <div class="card">
                             <h2>CURRENT PRICE</h2>
                             <div class="value neutral-text">{price_info['last']:.6f}</div>
-                            <div class="sub">AI Signal: <span style="color: {signal_color}">{ai_signal} ({prediction:.8f})</span></div>
+                            <div class="sub">AI Signal: <span style="color: {signal_color}">{ai_signal} (P: {prediction_val_str})</span></div>
                             
                             <div style="margin-top: 10px;">
                                 <div class="metric-title">TARGET EXIT PRICE</div>
@@ -640,34 +764,33 @@ class TradingBot:
                 <div class="grid-bottom">
                     
                     <div class="card">
+                        <h2>MARKET REGIME (HURST)</h2>
+                        <div class="value {hurst_class}">{hurst_exponent:.4f}</div>
+                        <div class="sub">Regime: {hurst_text}</div>
+                    </div>
+
+                    <div class="card">
+                        <h2>CURRENT VOLATILITY (V4.0 SIZING)</h2>
+                        <div class="value danger-text">{current_volatility:.6f}</div>
+                        <div class="sub">Position size adjusts inversely to this value.</div>
+                    </div>
+                    
+                    <div class="card">
                         <h2>ACCOUNT BALANCE</h2>
                         <div class="value success-text">${wallet:.6f}</div>
                         <div class="sub">Growth YTD: <span class="{growth_class}">{growth_pct:.6f}%</span></div>
                     </div>
                     
                     <div class="card">
-                        <h2>MARKET SPREAD</h2>
-                        <div class="value {spread_class}">{spread:.6f}</div>
-                        <div class="sub">Liquidity Status: {spread_status}</div>
-                    </div>
-                    
-                    <div class="card">
-                        <h2>ML PERFORMANCE</h2>
-                        <div class="value neutral-text">{sim_acc:.2f}%</div>
-                        <div class="sub">Prediction Accuracy (Simulated)</div>
-                    </div>
-                    
-                    <div class="card">
-                        <h2>VOLATILITY / NOISE</h2>
-                        <div class="value neutral-text">{(avg_volatility*100):.6f}%</div>
-                        <div class="sub">Prediction / Noise Ratio: {(abs(prediction) / (avg_volatility + 1e-9)):.2f}x</div>
+                        <h2>ORDER BOOK IMBALANCE</h2>
+                        <div class="value {imbalance_class}">{imbalance:.4f}</div>
+                        <div class="sub">Pressure: {imbalance_text}</div>
                     </div>
                 </div>
             </div>
             
             <script>
-                // Prevents flicker on refresh if the dashboard were to rely on JS animations
-                // Not strictly necessary here but good practice for high-freq updates
+                // Prevents flicker on refresh 
             </script>
         </body>
         </html>
@@ -679,16 +802,18 @@ class TradingBot:
             logger.error(f"Failed to write dashboard: {e}")
 
     def run(self):
-        logger.info("Starting ULTRA-HIGH FREQUENCY SCALPER Bot (Command Center)...")
+        logger.info("Starting UHF SCALPER V4.0: Deep Momentum & Smart Liquidity Harvesting Bot...")
         self.sys.close_all_positions()
         
         initial_wallet = self.sys.get_wallet_balance()
         self.wallet_learner.update_balance(initial_wallet)
+        current_volatility = MIN_VOLATILITY_FACTOR
         
         while self.running:
             try:
                 action_log = "Scanning market for entry signal"
                 action_type = "SCANNING"
+                pnl_pct_of_value = 0.0
                 
                 wallet = self.sys.get_wallet_balance()
                 self.wallet_learner.update_balance(wallet)
@@ -706,11 +831,16 @@ class TradingBot:
                 if self.iteration % TRAINING_INTERVAL == 0:
                     prediction, confidence = self.ai.train_and_predict()
                 else:
-                    prediction = self.ai.last_prediction
+                    prediction = 1 if self.ai.last_prediction_proba > 0.5 else (-1 if self.ai.last_prediction_proba < 0.5 else 0)
                     confidence = self.ai.confidence
                 
                 avg_volatility = self.ai.avg_volatility 
+                hurst_exponent = self.ai.hurst_exponent
                 required_pnl_usd = 0.0
+                
+                # Pre-calculate size based on current market volatility (V4.0)
+                # This only calculates the size target, doesn't execute the trade yet
+                dummy_qty, current_volatility = self.calculate_position_size(wallet, price_data['last']) 
                 
                 # ---------------------------------------------------------
                 # TRADING LOGIC
@@ -720,111 +850,86 @@ class TradingBot:
                     entry = pos_data['entry_price']
                     is_long = qty > 0
                     
-                    # 1. Calculate PnL and Required Profit
-                    if is_long:
-                        current_pnl = (price_data['bid'] - entry) * abs(qty)
-                        price_diff_pct = (price_data['bid'] - entry) / entry
-                    else:
-                        current_pnl = (entry - price_data['ask']) * abs(qty)
-                        price_diff_pct = (entry - price_data['ask']) / entry
-
-                    total_fee = (entry * abs(qty) * FEE_RATE) + (price_data['last'] * abs(qty) * FEE_RATE)
-                    net_pnl = current_pnl - total_fee
+                    net_pnl, required_pnl_usd, pnl_pct_of_value = self.calculate_pnl(qty, entry, price_data)
                     
-                    entry_value = entry * abs(qty)
-                    required_gross_profit = entry_value * TARGET_PROFIT_PCT
-                    required_pnl_usd = required_gross_profit + total_fee
-                    
-                    # Action message for PnL block
                     action_log = f"PnL: {net_pnl:.6f} (Required: {required_pnl_usd:.6f})"
                     action_type = "PROFIT" if net_pnl >= 0 else "RECOVERY"
 
+                    # 1. V3.0 HARD STOP LOSS (Emergency Liquidation)
+                    if pnl_pct_of_value < -MAX_PNL_LOSS_PCT:
+                        logger.critical(f"!!! HARD STOP LOSS TRIGGERED: PNL @ {pnl_pct_of_value*100:.2f}%")
+                        side = 'sell' if is_long else 'buy'
+                        self.sys.place_order(BASE_COIN, abs(qty), side)
+                        action_log = f"STOP LOSS: {pnl_pct_of_value*100:.2f}% loss"
+                        action_type = "STOP_LOSS"
+                        continue 
 
-                    # 1. MAX SPEED SCALP PROFIT TAKER (Full Close)
-                    if current_pnl > required_pnl_usd:
+                    # 2. MAX SPEED SCALP PROFIT TAKER (Full Close)
+                    if net_pnl > 0: 
                         logger.info(f"$$$ MAX SPEED SCALP PROFIT: {net_pnl:.6f}")
                         side = 'sell' if is_long else 'buy'
                         self.sys.place_order(BASE_COIN, abs(qty), side)
                         action_log = f"Closed: +{net_pnl:.6f} Profit"
                         action_type = "CLOSE"
                         
-                    # 2. PARTIAL PROFIT SCALING
-                    elif net_pnl > 0 and (
-                        (is_long and prediction < 0) or (not is_long and prediction > 0)
+                    # 3. AGGRESSIVE PYRAMIDING (Adding to a winning trade)
+                    elif net_pnl > 0 and confidence > 55.0 and (
+                        (is_long and prediction == 1) or (not is_long and prediction == -1)
                     ):
-                        reduce_qty = abs(qty) * 0.25
-                        raw_qty = reduce_qty
-                        reduce_qty = np.floor(raw_qty / MIN_QTY) * MIN_QTY
-                        reduce_qty = max(MIN_QTY, round(reduce_qty, DECIMAL_PRECISION))
+                        # V4.0: Use Volatility-Adjusted Sizing for compounding, but only for the ADDED size
+                        add_qty, _ = self.calculate_position_size(wallet, price_data['last'])
                         
-                        if abs(qty) > reduce_qty: 
-                            side = 'sell' if is_long else 'buy'
-                            self.sys.place_order(BASE_COIN, reduce_qty, side)
-                            action_log = f"Scale Out: -{reduce_qty}"
-                            action_type = "PROFIT"
-                            
-                    # 3. AGGRESSIVE PYRAMIDING
-                    elif net_pnl > 0 and confidence > 55.0:
-                        if (is_long and prediction > 0) or (not is_long and prediction < 0):
-                            usable_wallet = wallet * self.wallet_learner.risk_multiplier
-                            execution_price = price_data['ask'] if is_long else price_data['bid']
-                            current_pos_val = abs(qty) * execution_price 
-                            free_margin = usable_wallet - current_pos_val
-                            
-                            if free_margin > (execution_price * MIN_QTY):
-                                # Use full aggressive multiplier for compounding
-                                raw_qty = (free_margin * INITIAL_ENTRY_SIZE_MULTIPLIER) / execution_price
-                                add_qty = np.floor(raw_qty / MIN_QTY) * MIN_QTY
-                                add_qty = max(MIN_QTY, round(add_qty, DECIMAL_PRECISION)) 
-                                side = 'buy' if is_long else 'sell'
-                                self.sys.place_order(BASE_COIN, add_qty, side)
-                                action_log = f"Compound: +{add_qty} QTY"
-                                action_type = "COMPOUND"
+                        side = 'buy' if is_long else 'sell'
+                        # Check if adding this much pushes us over the wallet limit
+                        if (add_qty * price_data['last'] + abs(qty) * entry) < (wallet * self.wallet_learner.risk_multiplier):
+                            self.sys.place_order(BASE_COIN, add_qty, side)
+                            action_log = f"Compound: +{add_qty} QTY (VAS)"
+                            action_type = "COMPOUND"
                     
-                    # 4. GRID RECOVERY
-                    elif price_diff_pct < -GRID_STEP_PCT:
-                        if (is_long and prediction > 0) or (not is_long and prediction < 0):
-                            usable_wallet = wallet * self.wallet_learner.risk_multiplier
-                            execution_price = price_data['ask'] if is_long else price_data['bid']
-                            current_pos_val = abs(qty) * execution_price 
-                            free_margin = usable_wallet - current_pos_val
+                    # 4. SMARTER GRID RECOVERY (Averaging down into a loss)
+                    elif pnl_pct_of_value < -GRID_STEP_PCT and confidence > RECOVERY_CONFIDENCE_MIN:
+                        if (is_long and prediction == 1) or (not is_long and prediction == -1):
+                            # V4.0: Use Volatility-Adjusted Sizing for recovery, but size it 1.5x larger
+                            recovery_qty, _ = self.calculate_position_size(wallet, price_data['last'])
+                            recovery_qty *= 1.5 # Aggressive size multiplier for recovery
 
-                            if free_margin > (execution_price * MIN_QTY): 
-                                # Use 75% of aggressive multiplier for averaging down
-                                raw_qty = (free_margin * 0.75 * INITIAL_ENTRY_SIZE_MULTIPLIER) / execution_price
-                                recovery_qty = np.floor(raw_qty / MIN_QTY) * MIN_QTY
-                                recovery_qty = max(MIN_QTY, round(recovery_qty, DECIMAL_PRECISION)) 
-                                side = 'buy' if is_long else 'sell'
+                            side = 'buy' if is_long else 'sell'
+                            # Check wallet limit before placing order
+                            if (recovery_qty * price_data['last'] + abs(qty) * entry) < (wallet * self.wallet_learner.risk_multiplier):
                                 self.sys.place_order(BASE_COIN, recovery_qty, side)
-                                action_log = f"Grid Down: +{recovery_qty} QTY"
+                                action_log = f"Grid Down: +{recovery_qty} QTY (VAS)"
                                 action_type = "RECOVERY"
 
                 else:
                     # -----------------------------------------------------
-                    # NEW MIN-QUANTITY ENTRY (MAX-FREQUENCY)
+                    # NEW MIN-QUANTITY ENTRY (V4.0: VAS + LIQUIDITY FILTER)
                     # -----------------------------------------------------
                     if self.ai.is_trained and confidence > dynamic_threshold: 
                         
-                        if prediction > 0:
+                        if prediction == 1:
                             execution_price = price_data['ask']
                             side = 'buy'
-                        elif prediction < 0:
+                        elif prediction == -1:
                             execution_price = price_data['bid']
                             side = 'sell'
                         else:
-                            continue 
+                            continue # Neutral signal
                             
-                        # New Logic: Calculate absolute minimum trade quantity (0.001)
-                        trade_qty = round(MIN_QTY * MIN_TRADE_QTY_FACTOR, DECIMAL_PRECISION)
-                        
-                        # Check if we have enough USDT to cover the smallest trade + fees
+                        # V4.0: Run the Liquidity Sweep Filter
+                        if not self.check_liquidity_sweep(prediction):
+                            action_log = f"Signal held back (No Liquidity Sweep): {ai_signal}"
+                            action_type = "SCANNING"
+                            continue
+                            
+                        # V4.0: Calculate Volatility-Adjusted Size
+                        trade_qty, _ = self.calculate_position_size(wallet, execution_price)
+
                         if (trade_qty * execution_price) < (wallet * self.wallet_learner.risk_multiplier):
                             self.sys.place_order(BASE_COIN, trade_qty, side)
-                            action_log = f"Entry: {side.upper()} {trade_qty} (C:{confidence:.1f}%)"
+                            action_log = f"Entry (VAS+LS): {side.upper()} {trade_qty} (C:{confidence:.1f}%)"
                             action_type = "ENTRY"
                             
                 # --- UPDATE ACTION HISTORY ---
-                # Only log non-scanning actions to keep the log clean
                 if action_type not in ["SCANNING", "NONE"]: 
                     self.action_history.appendleft({
                         'time': datetime.now().strftime('%H:%M:%S.%f')[:-3],
@@ -832,7 +937,7 @@ class TradingBot:
                         'class': action_type.lower()
                     })
 
-                self.generate_dashboard(wallet, pos_data, price_data, prediction, confidence, action_log, action_type, avg_volatility, dynamic_threshold, required_pnl_usd, list(self.action_history))
+                self.generate_dashboard(wallet, pos_data, price_data, prediction, confidence, action_log, action_type, avg_volatility, dynamic_threshold, required_pnl_usd, list(self.action_history), pnl_pct_of_value, current_volatility, hurst_exponent)
                 self.iteration += 1
                 time.sleep(UHF_SLEEP_SECONDS) 
 
