@@ -377,7 +377,7 @@ class TradingBot:
                     entry = pos_data['entry_price']
                     is_long = qty > 0
                     
-                    # Real PnL
+                    # Real PnL calculation
                     if is_long:
                         current_pnl = (price_data['bid'] - entry) * abs(qty)
                         price_diff_pct = (price_data['last'] - entry) / entry
@@ -389,24 +389,42 @@ class TradingBot:
                     net_pnl = current_pnl - total_fee
                     action_log = f"PnL: {net_pnl:.4f}"
 
-                    # 1. FAST PROFIT TAKER (Fees + 5% profit buffer is enough to exit and re-compound)
+                    # 1. FAST PROFIT TAKER (Full Close) - Highest Priority
                     if net_pnl > 0 and net_pnl > (total_fee * 1.05):
                         logger.info(f"$$$ SCALP PROFIT: {net_pnl:.6f}")
                         side = 'sell' if is_long else 'buy'
                         self.sys.place_order(BASE_COIN, abs(qty), side)
-                        action_log = "SCALP CLOSE"
+                        action_log = "SCALP CLOSE (Full)"
 
-                    # 2. AGGRESSIVE PYRAMIDING (Add if green)
-                    elif net_pnl > 0 and confidence > 50.0:
-                        usable_wallet = wallet * self.wallet_learner.risk_multiplier
-                        current_pos_val = abs(qty) * price_data['last']
-                        free_margin = usable_wallet - current_pos_val
+                    # 2. PARTIAL PROFIT SCALING (Decrease Trade) - If profitable, but AI predicts reversal
+                    elif net_pnl > 0 and (
+                        (is_long and prediction < 0) or (not is_long and prediction > 0)
+                    ):
+                        # AI predicts a move against us -> scale out 25% profit
+                        reduce_qty = abs(qty) * 0.25
                         
-                        if free_margin > (price_data['last'] * MIN_QTY):
-                            # AI confirmation check
-                            if (is_long and prediction > 0) or (not is_long and prediction < 0):
+                        # Robust step-based calculation
+                        raw_qty = reduce_qty
+                        reduce_qty = (raw_qty // MIN_QTY) * MIN_QTY
+                        reduce_qty = max(MIN_QTY, round(reduce_qty, 3))
+                        
+                        if abs(qty) > reduce_qty: # Ensure we don't try to reduce more than held
+                            side = 'sell' if is_long else 'buy'
+                            self.sys.place_order(BASE_COIN, reduce_qty, side)
+                            action_log = f"SCALE OUT PROFIT (Qty: {reduce_qty})"
+                            logger.info(action_log)
+
+                    # 3. AGGRESSIVE PYRAMIDING (Increase Trade) - Add if green AND AI confirms more profit ahead
+                    elif net_pnl > 0 and confidence > 50.0:
+                        # Check if AI confirms the direction
+                        if (is_long and prediction > 0) or (not is_long and prediction < 0):
+                            usable_wallet = wallet * self.wallet_learner.risk_multiplier
+                            current_pos_val = abs(qty) * price_data['last']
+                            free_margin = usable_wallet - current_pos_val
+                            
+                            if free_margin > (price_data['last'] * MIN_QTY):
                                 raw_qty = free_margin / price_data['last']
-                                # *** ROBUST STEP-BASED CALCULATION: Floor raw qty to nearest MIN_QTY multiple (0.001) ***
+                                # Robust step-based calculation
                                 add_qty = (raw_qty // MIN_QTY) * MIN_QTY
                                 add_qty = max(MIN_QTY, round(add_qty, 3)) 
                                 side = 'buy' if is_long else 'sell'
@@ -414,17 +432,18 @@ class TradingBot:
                                 action_log = f"COMPOUNDING (Qty: {add_qty})"
                                 logger.info(action_log)
                     
-                    # 3. GRID RECOVERY (If losing) - Use remaining wallet to avg down
+                    # 4. GRID RECOVERY (Increase Trade) - If losing and AI predicts recovery
                     elif price_diff_pct < -GRID_STEP_PCT:
-                        usable_wallet = wallet * self.wallet_learner.risk_multiplier
-                        current_pos_val = abs(qty) * price_data['last']
-                        free_margin = usable_wallet - current_pos_val
+                        # Check if AI confirms the recovery direction
+                        if (is_long and prediction > 0) or (not is_long and prediction < 0):
+                            usable_wallet = wallet * self.wallet_learner.risk_multiplier
+                            current_pos_val = abs(qty) * price_data['last']
+                            free_margin = usable_wallet - current_pos_val
 
-                        if free_margin > (price_data['last'] * MIN_QTY): 
-                            if (is_long and prediction > 0) or (not is_long and prediction < 0):
+                            if free_margin > (price_data['last'] * MIN_QTY): 
                                 # Use 50% of remaining free margin to avg down
                                 raw_qty = (free_margin * 0.5) / price_data['last']
-                                # *** ROBUST STEP-BASED CALCULATION: Floor raw qty to nearest MIN_QTY multiple (0.001) ***
+                                # Robust step-based calculation
                                 recovery_qty = (raw_qty // MIN_QTY) * MIN_QTY
                                 recovery_qty = max(MIN_QTY, round(recovery_qty, 3)) 
                                 side = 'buy' if is_long else 'sell'
@@ -442,7 +461,7 @@ class TradingBot:
                         
                         if max_usd_to_use > (price_data['last'] * MIN_QTY):
                             raw_qty = max_usd_to_use / price_data['last']
-                            # *** ROBUST STEP-BASED CALCULATION: Floor raw qty to nearest MIN_QTY multiple (0.001) ***
+                            # Robust step-based calculation
                             trade_qty = (raw_qty // MIN_QTY) * MIN_QTY
                             trade_qty = max(MIN_QTY, round(trade_qty, 3)) 
                             
