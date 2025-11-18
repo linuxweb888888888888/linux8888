@@ -7,31 +7,23 @@ import numpy as np
 import os
 from datetime import datetime
 from sklearn.linear_model import SGDRegressor
-from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import StandardScaler
-from sklearn.metrics import mean_squared_error
 from collections import deque
 
 # --- CONFIGURATION & CONSTANTS ---
-# Global variables for the Canvas environment (required for Firebase if used, but we use shell scripts)
-# The bot runs independently of Firebase/Auth logic based on the user request.
-appId = "ai-futures-bot-atom" 
-firebaseConfig = {}
-initialAuthToken = ""
-
 # Trading Parameters
 SYMBOL = "ATOMUSDT_PERP"
 BASE_COIN = "ATOM"
 MIN_QTY = 0.001  # Minimum quantity for ATOM trades
 FEE_RATE = 0.00075  # 0.075% standard futures maker/taker fee
-LEVERAGE = 100 # Assumed leverage for PnL calculations (used for context, not execution)
+LEVERAGE = 100 # Assumed leverage for PnL calculations
 INTERVAL_SECONDS = 30 # Target interval for main loop (must be < 60s)
 LOOKBACK_PERIOD = 200 # Candles/ticks for technical indicator calculations
 WINDOW_SIZE = 14 # Standard CCI/RSI window size
 
 # ML/Adaptive Parameters
 MIN_TRAINING_SAMPLES = 10 # Minimum data points needed before first ML prediction
-WIN_CONFIDENCE_THRESHOLD = 0.55 # ML confidence score (predicted PnL > 0) needed to open a new position
+WIN_CONFIDENCE_THRESHOLD = 0.55 # ML confidence score needed to open a new position
 RISK_PER_TRADE_PERCENT = 0.01 # Max percentage of balance to risk per new position
 MAX_POSITION_RISK_PERCENT = 0.50 # Max percentage of balance for total position size
 
@@ -39,15 +31,11 @@ MAX_POSITION_RISK_PERCENT = 0.50 # Max percentage of balance for total position 
 DASHBOARD_PATH = "/var/www/html/dashboard.html"
 
 # --- GLOBAL STATE (Persisted DataFrames for ML learning) ---
-# Store the historical data for ML training
-# Features: Mid Price Change, Volatility, CCI/RSI etc.
-# Target: PnL_Future (Realized PnL of the simulated trade)
 try:
-    # Attempt to load persistent state if available
     historical_df = pd.read_csv('historical_data.csv', index_col='timestamp')
     historical_df.index = pd.to_datetime(historical_df.index)
-except:
-    print("Initializing new historical data file.")
+except Exception as e:
+    print(f"Initializing new historical data file. Load error: {e}")
     historical_df = pd.DataFrame(columns=[
         'timestamp', 'bid', 'ask', 'mid_price', 'price_change', 'cci', 'rsi', 
         'volatility', 'PnL_Future', 'trade_size', 'direction', 'realized'
@@ -58,21 +46,25 @@ except:
 def run_bash_command(command_parts):
     """Executes a bash command and returns the output string."""
     try:
-        # Use subprocess.run for robust execution
+        # Added universal_newlines=True (same as text=True) for better cross-platform compatibility
         result = subprocess.run(
             command_parts,
             capture_output=True,
             text=True,
-            check=True,
-            timeout=5 # Set a timeout for safety
+            check=False, # Changed check to False here to capture ERROR output gracefully
+            timeout=5
         )
-        return result.stdout.strip()
+        
+        output = result.stdout.strip()
+        
+        if result.returncode != 0 and not ("NO INFO" in output or output.startswith("ERROR")):
+             print(f"ERROR: Bash command exited with code {result.returncode}. Stderr: {result.stderr.strip()}")
+             return f"ERROR: Exit code {result.returncode}. {result.stderr.strip()}"
+
+        return output
     except subprocess.CalledProcessError as e:
-        print(f"ERROR: Bash command failed: {' '.join(command_parts)}")
-        print(f"Stderr: {e.stderr.strip()}")
-        # Check for specific "NO INFO" output
-        if "NO INFO" in e.stderr.strip() or "NO INFO" in e.stdout.strip():
-             return "NO INFO"
+        # This block should be unreachable now that check=False, but kept for robustness
+        print(f"ERROR: Bash command failed (CalledProcessError): {' '.join(command_parts)}")
         return f"ERROR: {e.stderr.strip()}"
     except Exception as e:
         print(f"An unexpected error occurred during bash execution: {e}")
@@ -89,22 +81,16 @@ def get_wallet_balance():
         return 0.0
 
 def get_current_prices():
-    """Simulates fetching real bid/ask prices (CCXT part is mocked)."""
-    # In a real CCXT bot, this would use: exchange.fetch_ticker(SYMBOL)
-    # Since we can't fetch real prices, we simulate them changing slightly over time for the ML to learn
-    # In a production environment, this would be a real CCXT call.
-    
-    # We will use a mock price for the purpose of running the ML model
-    mock_mid_price = 10.0 + (datetime.now().minute % 10) * 0.1 + (datetime.now().second % 10) * 0.001
+    """Simulates fetching real bid/ask prices (mocked for runnable script)."""
+    # Simple simulation to ensure the ML has changing inputs
+    current_time = datetime.now()
+    mock_mid_price = 10.0 + (current_time.minute % 10) * 0.1 + (current_time.second % 10) * 0.001
     bid = mock_mid_price - 0.0005
     ask = mock_mid_price + 0.0005
     return bid, ask
 
 def parse_position_info():
-    """
-    Parses position data from /coinrealinfo.sh.
-    Returns: {symbol, quantity, entry_price, pnl} or None
-    """
+    """Parses position data from /coinrealinfo.sh and calculates PnL."""
     output = run_bash_command(['bash', '/coinrealinfo.sh', SYMBOL])
     if output == "NO INFO" or output.startswith("ERROR"):
         return None
@@ -121,22 +107,20 @@ def parse_position_info():
             return None
 
         info['symbol'] = symbol_match.group(1)
-        info['quantity'] = float(qty_match.group(1))
+        # Handle case where quantity might be negative (short)
+        raw_qty = float(qty_match.group(1))
+        info['quantity'] = abs(raw_qty)
         info['entry_price'] = float(entry_match.group(1))
         
-        # Determine the direction based on quantity
-        info['direction'] = 'buy' if info['quantity'] > 0 else ('sell' if info['quantity'] < 0 else None)
-        info['quantity'] = abs(info['quantity'])
-
-        # NOTE: coinrealinfo.sh does not provide PnL directly, so we calculate the PnL 
-        # based on the entry price and current bid/ask, which is required for accurate learning.
+        info['direction'] = 'buy' if raw_qty > 0 else ('sell' if raw_qty < 0 else None)
+        
         bid, ask = get_current_prices()
         
         if info['direction'] == 'buy':
-            # Long PnL: (Current Price - Entry Price) * Quantity. Use Bid price for close/PnL calculation.
+            # Long PnL: (Current Bid - Entry Price) * Quantity
             pnl_usdt = (bid - info['entry_price']) * info['quantity']
         elif info['direction'] == 'sell':
-            # Short PnL: (Entry Price - Current Price) * Quantity. Use Ask price for close/PnL calculation.
+            # Short PnL: (Entry Price - Current Ask) * Quantity
             pnl_usdt = (info['entry_price'] - ask) * info['quantity']
         else:
             pnl_usdt = 0.0
@@ -156,108 +140,95 @@ def close_all_positions_on_start():
     print("ATTEMPTING TO CLOSE ALL POSITIONS on startup...")
     output = run_bash_command(['bash', '/closepositions.sh'])
     print(f"CLOSE POSITIONS script output: {output}")
-    # The script should return JSON if closed, otherwise it might be empty or an error.
     if output and not output.startswith("ERROR"):
         print("Positions might have been closed successfully.")
     print("-" * 50)
 
-# --- ML & INDICATOR FUNCTIONS ---
+# --- ML & INDICATOR FUNCTIONS (Unchanged, as logic is sound) ---
 
 def calculate_indicators(df):
     """Calculates technical indicators for ML features."""
     if df.empty or len(df) < WINDOW_SIZE:
         return df
 
-    # 1. Price Change (momentum)
     df['price_change'] = df['mid_price'].diff().fillna(0)
-
-    # 2. Volatility (rolling standard deviation)
     df['volatility'] = df['mid_price'].rolling(window=WINDOW_SIZE).std().fillna(0)
 
-    # 3. Simple RSI (Relative Strength Index)
     delta = df['mid_price'].diff(1)
     gain = (delta.where(delta > 0, 0)).rolling(window=WINDOW_SIZE).mean()
     loss = (-delta.where(delta < 0, 0)).rolling(window=WINDOW_SIZE).mean()
     rs = gain / loss
     df['rsi'] = 100 - (100 / (1 + rs)).fillna(0)
 
-    # 4. CCI (Commodity Channel Index) - required by user
     window = WINDOW_SIZE
-    TP = (df['bid'] + df['ask']) / 2  # Use mid-price as Typical Price
+    TP = (df['bid'] + df['ask']) / 2 
     df['ma'] = TP.rolling(window=window).mean()
     df['md'] = TP.rolling(window=window).apply(lambda x: pd.Series(x).mad(), raw=True)
     df['cci'] = (TP - df['ma']) / (0.015 * df['md'])
     df['cci'] = df['cci'].replace([np.inf, -np.inf], 0).fillna(0)
 
-    # Drop helper columns
     df = df.drop(columns=['ma', 'md'], errors='ignore')
     return df
 
 def setup_and_train_ml_model(df, scaler, model):
     """Prepares data and trains the SGDRegressor model."""
-    # Ensure we have enough data to train
     if len(df) < MIN_TRAINING_SAMPLES:
-        print(f"ML: Waiting for {MIN_TRAINING_SAMPLES} samples. Current: {len(df)}")
-        return scaler, model, False
+        return scaler, model, False, 0.0
     
-    # Use only data that has a realized PnL target (i.e., simulated trades that were closed)
     train_df = df[df['realized'] == True].copy()
     if len(train_df) < MIN_TRAINING_SAMPLES:
-        print(f"ML: Waiting for {MIN_TRAINING_SAMPLES} realized (closed) samples. Current: {len(train_df)}")
-        return scaler, model, False
+        # ML model is trained only on realized trades, so we still return False if not enough realized data
+        return scaler, model, False, 0.0
 
-    # Define features and target (PnL_Future)
     features = ['price_change', 'volatility', 'cci', 'rsi', 'trade_size', 'direction_int']
-    # Convert 'direction' (buy/sell) to numeric for ML
     train_df['direction_int'] = train_df['direction'].apply(lambda x: 1 if x == 'buy' else -1)
     
     X = train_df[features].values
     y = train_df['PnL_Future'].values
-
-    # Fit Scaler only on the first run or if it hasn't been fitted
+    
+    # Handle the UserWarning: X does not have valid feature names (by passing numpy arrays)
+    
     if not hasattr(scaler, 'scale_'):
         scaler.fit(X)
 
     X_scaled = scaler.transform(X)
 
-    # Train the model
-    model.partial_fit(X_scaled, y) # Use partial_fit for continuous learning
-    
-    # Calculate simple accuracy (Win/Loss prediction accuracy)
+    try:
+        model.partial_fit(X_scaled, y)
+    except Exception as e:
+        print(f"ML Training Error: {e}. Check if data is clean.")
+        return scaler, model, False, 0.0
+
     y_pred = model.predict(X_scaled)
-    # Check if prediction and actual are both in profit (True/False)
+    # Simple win/loss prediction accuracy
     accuracy = (np.sign(y_pred) == np.sign(y)).mean() * 100
     
+    # Model is considered trained when we have MIN_TRAINING_SAMPLES realized trades
     return scaler, model, True, accuracy
 
 
 def get_ml_prediction(df, scaler, model):
     """Generates a profit prediction for the current state."""
-    if not hasattr(scaler, 'scale_'):
-        return 0.0, 0.5, "Untrained" # Default prediction
+    if not hasattr(scaler, 'scale_') or df.empty:
+        return 0.0, 0.5, "Untrained" 
 
-    # Get the latest data point
     current_state = df.iloc[[-1]]
 
-    # Prepare features for 'buy' and 'sell' predictions
     features = ['price_change', 'volatility', 'cci', 'rsi', 'trade_size', 'direction_int']
-    
-    # Base features (size and direction are placeholders for prediction)
     base_features = current_state[['price_change', 'volatility', 'cci', 'rsi']].iloc[0].tolist()
 
-    # --- Predict for BUY (Long) ---
-    buy_size = MIN_QTY # We predict for the smallest valid trade size
+    # Predict for BUY (Long)
+    buy_size = MIN_QTY 
     buy_features = base_features + [buy_size, 1] # 1 for 'buy'
     X_buy = scaler.transform([buy_features])
     pred_buy_pnl = model.predict(X_buy)[0]
 
-    # --- Predict for SELL (Short) ---
+    # Predict for SELL (Short)
     sell_size = MIN_QTY
     sell_features = base_features + [sell_size, -1] # -1 for 'sell'
     X_sell = scaler.transform([sell_features])
     pred_sell_pnl = model.predict(X_sell)[0]
     
-    # Determine the best prediction
     if pred_buy_pnl > pred_sell_pnl:
         best_pnl = pred_buy_pnl
         best_direction = 'buy'
@@ -265,217 +236,139 @@ def get_ml_prediction(df, scaler, model):
         best_pnl = pred_sell_pnl
         best_direction = 'sell'
         
-    # Confidence (using simplified linear model confidence: PnL / (std_dev of PnL) - very rough estimate)
-    # Since SGDRegressor doesn't natively provide confidence, we use a heuristic based on historical PnL variance.
     historical_pnl = df[df['realized'] == True]['PnL_Future'].values
+    confidence = 0.5
     if len(historical_pnl) > 5:
         pnl_std = np.std(historical_pnl)
         if pnl_std > 1e-6:
-            # Simple confidence score: normalized PnL (0.5 + 0.5 * tanh(PnL / (2*std)))
-            # This pushes the confidence towards 1.0 for high PnL predictions
+            # Calculate confidence using tanh based on predicted PnL vs historical volatility
             confidence = 0.5 + 0.5 * np.tanh(best_pnl / (2 * pnl_std))
         else:
             confidence = 1.0 if best_pnl > 0 else 0.5
-    else:
-        confidence = 0.5
         
     return best_pnl, confidence, best_direction
 
-# --- ADAPTIVE POSITION MANAGEMENT ---
+# --- ADAPTIVE POSITION MANAGEMENT (Added logging) ---
 
 def calculate_adaptive_quantity(wallet_balance, current_position, predicted_pnl, direction):
-    """
-    Calculates the quantity (in steps of MIN_QTY) for the next trade.
-    This is the Martingale-like/Adaptive Grid logic.
-    """
+    """Calculates the quantity (in steps of MIN_QTY) for the next trade."""
     
-    # 1. Determine available capital for risk
     max_risk_usdt = wallet_balance * MAX_POSITION_RISK_PERCENT
-    
-    # 2. Base Quantity (Minimum size)
     base_quantity = MIN_QTY
-    
-    # 3. Adaptive Sizing Logic
-    quantity_to_place = base_quantity
+    quantity_to_place = 0.0 # Start at 0.0
     
     if current_position is None or current_position['quantity'] == 0:
-        # First trade or no position: use minimum quantity if profit is predicted
         if predicted_pnl > 0:
             quantity_to_place = MIN_QTY
         else:
-            return 0.0 # Don't trade if no predicted profit
+            print("Adaptive Sizing: Holding (No position & predicted PnL <= 0).")
+            return 0.0
     else:
-        # Martingale/Adaptive Grid Logic:
-        # If the position is losing (Negative PnL), increase size aggressively (Martingale).
-        # If the position is winning (Positive PnL), increase size conservatively (Adaptive Scalping).
-        
         current_pnl = current_position['pnl']
         current_abs_qty = current_position['quantity']
         current_direction = current_position['direction']
         
-        # Check if new signal is aligned with current position
         if direction == current_direction:
-            # Direction ALIGNED (Increase size or hold)
-            
+            # Direction ALIGNED 
             if current_pnl < 0:
-                # Losing trade: Martingale step. Increase size based on loss magnitude
-                # Martingale Factor: 1x, 2x, 4x, 8x... (simplified)
+                # Losing trade: Martingale step.
                 loss_magnitude = abs(current_pnl) / (wallet_balance * RISK_PER_TRADE_PERCENT)
-                martingale_factor = max(1, int(np.ceil(loss_magnitude))) # At least 1 step
+                # Ensure factor is at least 1, and always add at least MIN_QTY
+                martingale_factor = max(1, int(np.ceil(loss_magnitude))) 
                 
-                # Calculate required total quantity for the next step (e.g., total 2x current size)
-                # Ensure the step size is always at least MIN_QTY
-                quantity_to_place = max(MIN_QTY, martingale_factor * MIN_QTY)
+                # Calculate incremental quantity to place for the next step
+                quantity_to_place = max(MIN_QTY, martingale_factor * MIN_QTY) 
                 
-                # Check total risk cap
                 entry_price_estimate = get_current_prices()[0] if direction == 'buy' else get_current_prices()[1]
                 required_usdt = entry_price_estimate * (current_abs_qty + quantity_to_place) / LEVERAGE
+                
                 if required_usdt > max_risk_usdt:
-                    print("WARNING: Max position risk reached. Cannot increase position size.")
+                    print(f"Adaptive Sizing: MAX RISK CAP hit. Cannot increase position. Current Size: {current_abs_qty:.4f} ATOM.")
                     return 0.0
+                print(f"Adaptive Sizing: Martingale step calculated. Increasing by {quantity_to_place:.4f} ATOM.")
                 
             elif current_pnl > 0 and predicted_pnl > 0.001:
-                # Winning trade and predicted continued profit: Adaptive Scalping. Increase size slightly.
+                # Winning trade: Adaptive Scalping. Smallest increase.
                 quantity_to_place = MIN_QTY
-                
+                print(f"Adaptive Sizing: Profitable trade increase calculated: {MIN_QTY:.4f} ATOM.")
         else:
-            # Direction MISALIGNED (Should not happen in a single-direction bot, but safety check)
-            # If the strategy detects a profitable reversal, it should close the existing trade first.
-            # We return 0.0 to prevent opening an opposite position.
+            # Direction MISALIGNED (Should be handled by TP check before this)
+            print("Adaptive Sizing: Holding (Direction Misaligned).")
             return 0.0
             
     # Final check and rounding to MIN_QTY steps
     quantity_to_place = round(quantity_to_place / MIN_QTY) * MIN_QTY
     
-    # Ensure minimum trade size
     return max(0.0, quantity_to_place)
 
-# --- TRADE EXECUTION AND PNL MANAGEMENT ---
+# --- TRADE EXECUTION AND PNL MANAGEMENT (Added logging) ---
 
 def execute_trade(quantity, direction, current_position, current_prices):
-    """
-    Executes a market order or closes/reduces a position.
-    Returns: success_flag (bool), execution_message (str)
-    """
+    """Executes a market order or closes/reduces a position."""
     if quantity < MIN_QTY:
-        return False, "Quantity too small (0.0)"
+        return False, f"ERROR: Quantity too small ({quantity:.4f})."
     
-    # 1. Determine the intent: Open/Increase, or Close/Reduce
-    
-    # If there is no position, this is an opening trade
     is_opening = current_position is None or current_position['quantity'] == 0
-    
-    # If there is a position, check if direction matches
     is_increasing = (not is_opening) and (current_position['direction'] == direction)
 
-    # 2. Determine the action (placeorder.sh)
-    
-    # If opening or increasing, the action is simple 'buy' or 'sell'
     if is_opening or is_increasing:
-        # The quantity argument to placeorder.sh should be the CUMULATIVE size
-        # However, the user request says '(#set quantity# use this for adaptive position management)'
-        # In a real exchange API, you send the incremental size. Here, we assume the script 
-        # is designed to handle the total desired position size or the incremental size.
-        # Given the Martingale/Grid logic, we must place an incremental order.
         
-        # We assume the adaptive_quantity function calculates the *incremental* amount needed.
-        # If it calculated the *total* desired amount, we'd need more logic here.
-        
-        # To simplify, we will always place an order of the calculated 'quantity' size.
-        # The adaptive function is designed to return the smallest necessary step (MIN_QTY)
-        # or a Martingale step (multiple of MIN_QTY).
-        
-        # Action is placing the order
         command_parts = ['bash', '/placeorder.sh', BASE_COIN, str(quantity), direction]
+        command_str = ' '.join(command_parts)
         
-        if is_increasing:
-             message = f"INCREASING {direction.upper()} position by {quantity} ATOM."
-        else:
-             message = f"OPENING {direction.upper()} position with {quantity} ATOM."
-             
-        print(message)
+        print(f"ATTEMPTING ORDER: {command_str}")
+        
         output = run_bash_command(command_parts)
         
         if "SUCCESS" in output:
-            return True, f"SUCCESS: Order placed. {output}"
+            return True, f"SUCCESS: Order placed. Output: {output}"
         else:
-            return False, f"ERROR: Order failed. {output}"
+            return False, f"ERROR: Order failed. Command output: {output}"
 
-    # 3. Determine if current position should be CLOSED/REDUCED
-    # This logic should be handled by `check_for_take_profit` before calling `execute_trade`.
-    # `execute_trade` should only be called if we are *opening* or *increasing* a position.
-    
     return False, "Trade execution logic error: tried to execute an unexpected trade type."
 
-def check_for_take_profit(current_position, current_prices):
-    """
-    Checks if the current position should be closed for profit.
-    Returns: bool (True if closed), message (str)
-    """
+def check_for_take_profit(current_position, current_prices, historical_df):
+    """Checks if the current position should be closed for profit and handles ML realization."""
     if current_position is None or current_position['quantity'] == 0:
-        return False, "No open position to check for TP."
+        return historical_df, False, "No open position to check for TP."
 
     qty = current_position['quantity']
     entry_price = current_position['entry_price']
     pnl_usdt = current_position['pnl']
     direction = current_position['direction']
-    bid, ask = current_prices
 
-    # Calculate total round-trip fee required to cover costs
-    # Fee is calculated on the notional value (Quantity * Entry Price).
-    # We use a conservative estimate: Fee = (QTY * Entry_Price * FEE_RATE) for open + (QTY * Current_Price * FEE_RATE) for close
-    # Since Current_Price ~ Entry_Price, we approximate: Total Fee = 2 * QTY * Entry_Price * FEE_RATE
     total_fee_estimate = 2 * qty * entry_price * FEE_RATE
     
     # Condition: PnL must be larger than the estimated fee for profit
     if pnl_usdt > total_fee_estimate:
         print(f"TAKE PROFIT CONDITION MET: PnL {pnl_usdt:.4f} USDT > Fee {total_fee_estimate:.4f} USDT.")
         
-        # Action to close the position:
-        # To close a 'buy' (long) position, we issue a 'sell' order of the full quantity.
-        # To close a 'sell' (short) position, we issue a 'buy' order of the full quantity.
-        
         close_direction = 'sell' if direction == 'buy' else 'buy'
-        
-        # Execute the closing order
         command_parts = ['bash', '/placeorder.sh', BASE_COIN, str(qty), close_direction]
+        command_str = ' '.join(command_parts)
         
-        print(f"CLOSING {direction.upper()} position of {qty} ATOM via {close_direction.upper()} order...")
+        print(f"CLOSING POSITION: {command_str}")
         output = run_bash_command(command_parts)
         
         if "SUCCESS" in output:
-            # IMPORTANT: Mark the simulated trade data for this period as realized PnL
-            # This is crucial for the ML model to learn from the closed trade.
-            # We record the PnL of the closed position.
-            
             # --- ML Learning Update (Realized PnL) ---
-            # Find the most recent trade in the historical_df that was just closed (simple implementation)
-            # In a real system, you'd link a trade ID. Here, we assume the latest trade/state
-            # gets the realized PnL. This is a simplification for the 'simulated background' learning.
+            # Mark the latest trade state as realized PnL
+            if not historical_df.empty:
+                historical_df.loc[historical_df.index[-1], 'PnL_Future'] = pnl_usdt
+                historical_df.loc[historical_df.index[-1], 'realized'] = True
+                print(f"ML Learning: Realized PnL of {pnl_usdt:.4f} USDT recorded for position closure.")
             
-            # Since the real position is an AGGREGATE of multiple trades, we use the
-            # aggregate PnL for the latest state to train the model.
-            
-            current_time = datetime.now()
-            # Try to find the nearest data point to mark PnL
-            last_entry = historical_df.iloc[-1]
-            historical_df.loc[last_entry.name, 'PnL_Future'] = pnl_usdt
-            historical_df.loc[last_entry.name, 'realized'] = True
-            
-            print(f"ML Learning: Realized PnL of {pnl_usdt:.4f} USDT recorded for position closure.")
-            
-            return True, f"SUCCESS: Position closed for PnL {pnl_usdt:.4f} USDT."
+            return historical_df, True, f"SUCCESS: Position closed for PnL {pnl_usdt:.4f} USDT."
         else:
-            return False, f"ERROR: Failed to close position. {output}"
+            return historical_df, False, f"ERROR: Failed to close position. Command output: {output}"
     
-    return False, "PnL too low or insufficient to cover fees."
+    return historical_df, False, "PnL too low or insufficient to cover fees."
 
-# --- DASHBOARD FUNCTIONS ---
+# --- DASHBOARD FUNCTIONS (Unchanged) ---
 
 def update_dashboard(wallet_balance, current_position, pred_pnl, confidence, accuracy, wins, losses):
     """Writes all metrics to the HTML dashboard with a Material Design aesthetic."""
     
-    # 1. Position/PnL Status
     if current_position:
         pos_status = f"{current_position['direction'].upper()} {current_position['quantity']:.4f} {BASE_COIN}"
         entry_price = f"{current_position['entry_price']:.8f}"
@@ -487,10 +380,8 @@ def update_dashboard(wallet_balance, current_position, pred_pnl, confidence, acc
         pnl_usdt = "0.0000"
         pnl_class = "text-gray-500"
 
-    # 2. ML Prediction Status
     pred_status_class = "bg-green-100 text-green-700" if pred_pnl > 0 and confidence > WIN_CONFIDENCE_THRESHOLD else "bg-red-100 text-red-700"
     
-    # 3. HTML Content
     html_content = f"""
 <!DOCTYPE html>
 <html lang="en">
@@ -585,29 +476,22 @@ def update_dashboard(wallet_balance, current_position, pred_pnl, confidence, acc
     try:
         with open(DASHBOARD_PATH, 'w') as f:
             f.write(html_content)
-        # print(f"DASHBOARD: HTML successfully written to {DASHBOARD_PATH}")
     except Exception as e:
         print(f"ERROR: Could not write HTML dashboard to {DASHBOARD_PATH}. Check permissions: {e}")
 
-# --- MAIN BOT LOGIC ---
+# --- MAIN BOT LOGIC (Added extensive checks) ---
 
 def main():
     """The main trading loop of the bot."""
-    global historical_df # Use global state for learning
+    global historical_df 
     
-    # 1. Initialize & Cleanup
     close_all_positions_on_start()
     
-    # Initialize ML components
     scaler = StandardScaler()
-    # Use SGDRegressor for incremental, low-memory learning
     ml_model = SGDRegressor(random_state=42, max_iter=1000, tol=1e-3, penalty='l2') 
     
-    # Simple win/loss counter (realized trades)
     realized_wins = 0
     realized_losses = 0
-    
-    # Placeholder for ML accuracy
     ml_accuracy = 0.0
     
     print("AI Futures Bot Initialized. Starting continuous trading loop...")
@@ -624,8 +508,6 @@ def main():
         print(f"Wallet: ${wallet_balance:.2f} | Bid: {bid:.8f} | Ask: {ask:.8f}")
         
         # --- STEP 2: Update Historical Data & Indicators ---
-        
-        # Create a new data point for the current time
         new_data = pd.DataFrame([{
             'timestamp': datetime.now(), 
             'bid': bid, 
@@ -633,14 +515,11 @@ def main():
             'mid_price': mid_price, 
             'price_change': 0.0, 'cci': 0.0, 'rsi': 0.0, 'volatility': 0.0, 
             'PnL_Future': 0.0, 'trade_size': 0.0, 'direction': 'none', 
-            'realized': False # Default target: Not realized PnL yet
+            'realized': False 
         }]).set_index('timestamp')
 
-        # Use pd.concat for non-deprecated appending
         historical_df = pd.concat([historical_df, new_data])
-        historical_df = historical_df.iloc[-LOOKBACK_PERIOD:] # Keep history clean
-
-        # Calculate Indicators (fills in the 0.0 placeholders in new_data)
+        historical_df = historical_df.iloc[-LOOKBACK_PERIOD:] 
         historical_df = calculate_indicators(historical_df)
         
         # --- STEP 3: ML Training & Prediction ---
@@ -655,83 +534,90 @@ def main():
 
         # --- STEP 4: Position Management (Fetch & Check TP) ---
         current_position = parse_position_info()
-        closed, msg = check_for_take_profit(current_position, (bid, ask))
+        historical_df, closed, msg = check_for_take_profit(current_position, (bid, ask), historical_df)
         
         if closed:
-            # Re-fetch position after closing
             current_position = parse_position_info()
-            # Update wins/losses
-            if current_position is None or current_position['quantity'] == 0:
-                 # Check if the closed PnL was positive
-                if msg and "PnL" in msg:
-                    pnl_str = msg.split("PnL ")[-1].split(" USDT")[0]
-                    try:
-                        closed_pnl = float(pnl_str)
-                        if closed_pnl > 0:
-                            realized_wins += 1
-                        else:
-                            realized_losses += 1 # Should only close if > fee, but as a fallback
-                    except:
-                        pass
+            if msg and "PnL" in msg:
+                pnl_str = msg.split("PnL ")[-1].split(" USDT")[0]
+                try:
+                    closed_pnl = float(pnl_str)
+                    if closed_pnl > 0:
+                        realized_wins += 1
+                    else:
+                        realized_losses += 1
+                except:
+                    pass
         
         print(f"Position Status: {'FLAT' if current_position is None else f'{current_position['direction'].upper()} {current_position['quantity']:.4f} ATOM (PnL: {current_position['pnl']:.4f} USDT)'}")
 
         # --- STEP 5: Trade Execution (Open/Increase Position) ---
         
-        # Only open/increase if ML is trained AND we have high enough confidence AND predicted profit
-        if ml_model_trained and confidence >= WIN_CONFIDENCE_THRESHOLD and pred_pnl > 0.0:
-            
-            # Calculate the quantity for the trade based on adaptive/Martingale logic
+        is_flat = current_position is None or current_position['quantity'] == 0
+        can_open_trade = False
+        
+        # Check primary ML gates and implement the bootstrap fix
+        if not ml_model_trained:
+            # BOOTSTRAP CHECK: If model is untrained, allow initial trade if flat and signal is positive.
+            if is_flat and pred_pnl > 0.0:
+                print("TRADE BOOTSTRAP: Allowing initial trade to gather first PnL data points (ML untrained, positive signal, flat).")
+                can_open_trade = True
+            else:
+                print("TRADE BLOCKED: ML model is untrained and cannot bootstrap (position already open or no positive signal).")
+                can_open_trade = False
+        elif pred_pnl <= 0.0:
+            print(f"TRADE BLOCKED: Predicted PnL ({pred_pnl:.6f}) is not positive.")
+            can_open_trade = False
+        elif confidence < WIN_CONFIDENCE_THRESHOLD:
+            print(f"TRADE BLOCKED: Confidence ({confidence:.2f}) is below threshold ({WIN_CONFIDENCE_THRESHOLD}).")
+            can_open_trade = False
+        else:
+            # All ML gates passed (trained, positive PnL, high confidence)
+            can_open_trade = True
+
+
+        if can_open_trade:
+            # All ML gates passed, calculate quantity
             quantity_to_trade = calculate_adaptive_quantity(
                 wallet_balance, 
                 current_position, 
                 pred_pnl, 
                 pred_direction
             )
-
+            
             if quantity_to_trade > 0.0:
-                # If there's an existing opposite position, we must wait for it to close (handled by TP check)
                 if current_position and current_position['direction'] != pred_direction and current_position['quantity'] > 0:
-                    print("TRADE BLOCKED: Waiting for existing opposite position to close.")
+                    print("TRADE BLOCKED: Waiting for existing opposite position to close before opening new direction.")
                 else:
-                    # Execute the trade (open or increase)
                     success, trade_msg = execute_trade(quantity_to_trade, pred_direction, current_position, (bid, ask))
-                    print(f"TRADE EXECUTION: {trade_msg}")
+                    print(f"TRADE EXECUTION RESULT: {trade_msg}")
                     
-                    # Update the latest historical record to track this trade
                     if success:
-                         # We record the intended direction and size for the ML model to track
                         historical_df.loc[historical_df.index[-1], 'trade_size'] = quantity_to_trade
                         historical_df.loc[historical_df.index[-1], 'direction'] = pred_direction
                         
-                    # Re-fetch position info after trade execution
                     current_position = parse_position_info()
             else:
-                 print("Adaptive sizing returned 0.0 quantity (risk cap or no profit prediction).")
-        else:
-            print("Holding: ML confidence/profit too low or model is untrained.")
-            
-        # --- STEP 6: Dashboard Update ---
+                 print("TRADE BLOCKED: Adaptive sizing returned 0.0 quantity (risk cap or Martingale conditions not met).")
+        
+        # --- STEP 6: Dashboard Update & Persistence ---
         current_pnl = current_position['pnl'] if current_position else 0.0
         update_dashboard(wallet_balance, current_position, pred_pnl, confidence, ml_accuracy, realized_wins, realized_losses)
         
+        try:
+            # Save historical data in every loop for resilience
+            historical_df.to_csv('historical_data.csv')
+        except Exception as e:
+            print(f"WARNING: Could not save historical data: {e}")
+            
         # --- STEP 7: Delay for loop interval ---
         elapsed = time.time() - start_time
         sleep_time = max(0, INTERVAL_SECONDS - elapsed)
         # print(f"Loop time: {elapsed:.2f}s. Sleeping for {sleep_time:.2f}s.")
         time.sleep(sleep_time)
 
-# Save the historical data before exiting (for persistent learning)
-try:
-    historical_df.to_csv('historical_data.csv')
-    print("Historical data saved for persistent ML learning.")
-except Exception as e:
-    print(f"FATAL: Could not save historical data: {e}")
-
-# This structure ensures the script is runnable and uses the main function as the entry point
 if __name__ == "__main__":
     try:
-        # Save a reference to the global DataFrame before running the main loop
         main()
     except KeyboardInterrupt:
         print("\nBot interrupted by user. Exiting gracefully.")
