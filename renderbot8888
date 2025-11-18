@@ -296,6 +296,9 @@ class TradingBot:
             
         growth_pct = self.wallet_learner.get_growth_pct()
         growth_class = "success-text" if growth_pct >= 0 else "danger-text"
+        
+        ai_signal = 'BUY' if prediction > 0 else 'SELL'
+        signal_color = '#00ff00' if prediction > 0 else ('#ff0000' if prediction < 0 else '#ffffff')
 
         html = f"""
         <!DOCTYPE html>
@@ -303,43 +306,144 @@ class TradingBot:
         <head>
             <meta charset="UTF-8">
             <meta http-equiv="refresh" content="1">
+            <meta name="viewport" content="width=device-width, initial-scale=1.0">
             <title>HitBTC ULTRA AGGRESSIVE</title>
             <style>
-                body {{ font-family: 'Roboto', sans-serif; background-color: #000000; color: #e0e0e0; margin: 0; padding: 20px; }}
-                .container {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 20px; }}
-                .card {{ background-color: #121212; border-radius: 8px; padding: 20px; border: 1px solid #333; }}
-                .card.success {{ border-color: #00ff00; background-color: #051a05; }}
-                .card.danger {{ border-color: #ff0000; background-color: #1a0505; }}
-                .card.info {{ border-color: #0088ff; }}
-                h2 {{ margin-top: 0; font-size: 1.2rem; color: #888; }}
-                .value {{ font-size: 2.5rem; font-weight: 900; }}
-                .sub {{ font-size: 0.9rem; color: #666; }}
-                .success-text {{ color: #00ff00; }}
-                .danger-text {{ color: #ff0000; }}
-                .status-bar {{ background: #222; padding: 15px; margin-bottom: 20px; border-radius: 4px; border-bottom: 2px solid #0088ff; }}
+                @import url('https://fonts.googleapis.com/css2?family=Roboto:wght@100;300;400;700;900&display=swap');
+                
+                :root {{
+                    --bg-dark: #0D1117;
+                    --card-bg: #161B22;
+                    --text-light: #C9D1D9;
+                    --accent-blue: #00A3FF;
+                    --success-green: #2ECC71;
+                    --danger-red: #E74C3C;
+                    --neutral-gray: #7F8C8D;
+                }}
+
+                body {{ 
+                    font-family: 'Roboto', sans-serif; 
+                    background-color: var(--bg-dark); 
+                    color: var(--text-light); 
+                    margin: 0; 
+                    padding: 20px;
+                    transition: all 0.5s ease;
+                }}
+                
+                .header {{
+                    text-align: center;
+                    margin-bottom: 30px;
+                    font-size: 2.5rem;
+                    font-weight: 900;
+                    color: var(--accent-blue);
+                }}
+
+                .container {{ 
+                    display: grid; 
+                    grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); 
+                    gap: 20px; 
+                    max-width: 1200px;
+                    margin: auto;
+                }}
+                
+                .card {{ 
+                    background-color: var(--card-bg); 
+                    border-radius: 12px; 
+                    padding: 25px; 
+                    border: 1px solid #30363D;
+                    box-shadow: 0 4px 12px rgba(0, 0, 0, 0.4);
+                    transition: transform 0.3s ease, box-shadow 0.3s ease;
+                }}
+                
+                .card:hover {{
+                    transform: translateY(-5px);
+                    box-shadow: 0 8px 20px rgba(0, 0, 0, 0.6);
+                }}
+
+                .card.success {{ border-left: 5px solid var(--success-green); }}
+                .card.danger {{ border-left: 5px solid var(--danger-red); }}
+                .card.info {{ border-left: 5px solid var(--accent-blue); }}
+                
+                h2 {{ 
+                    margin-top: 0; 
+                    font-size: 1.1rem; 
+                    color: var(--neutral-gray);
+                    text-transform: uppercase;
+                    letter-spacing: 1px;
+                    border-bottom: 1px solid #30363D;
+                    padding-bottom: 10px;
+                }}
+                
+                .value {{ 
+                    font-size: 2.8rem; 
+                    font-weight: 900; 
+                    margin-top: 10px; 
+                    margin-bottom: 5px;
+                    line-height: 1;
+                }}
+                
+                .sub {{ 
+                    font-size: 0.85rem; 
+                    color: #99A9B9; 
+                    margin-top: 5px;
+                }}
+                
+                .success-text {{ color: var(--success-green); font-weight: 700; }}
+                .danger-text {{ color: var(--danger-red); font-weight: 700; }}
+                
+                .status-bar {{ 
+                    background: #161B22; 
+                    padding: 15px 25px; 
+                    margin-bottom: 30px; 
+                    border-radius: 8px; 
+                    border: 1px solid var(--accent-blue);
+                    font-weight: 700;
+                    box-shadow: 0 2px 8px rgba(0, 163, 255, 0.3);
+                }}
+                
+                .status-bar strong {{ color: var(--accent-blue); margin-right: 10px; }}
+
+                /* Responsive Adjustments */
+                @media (max-width: 600px) {{
+                    body {{ padding: 10px; }}
+                    .header {{ font-size: 2rem; margin-bottom: 20px; }}
+                    .value {{ font-size: 2.2rem; }}
+                }}
             </style>
         </head>
         <body>
+            <div class="header">BOT DASHBOARD</div>
+            
             <div class="status-bar">
-                <strong>STATUS:</strong> {action_msg} | <strong>USAGE:</strong> {self.wallet_learner.risk_multiplier*100:.0f}%
+                <strong>ACTION:</strong> {action_msg} | 
+                <strong>RISK:</strong> {self.wallet_learner.risk_multiplier*100:.0f}%
             </div>
+            
             <div class="container">
+                
+                <!-- WALLET CARD -->
                 <div class="card info">
-                    <h2>WALLET (FULL STACK)</h2>
+                    <h2>USDT BALANCE</h2>
                     <div class="value">${wallet:.2f}</div>
-                    <div class="sub">Growth: <span class="{growth_class}">{growth_pct:.2f}%</span></div>
-                    <div class="sub">Threshold: {self.wallet_learner.dynamic_threshold:.1f}%</div>
+                    <div class="sub">Growth: <span class="{growth_class}">{growth_pct:.2f}%</span> YTD</div>
+                    <div class="sub">Min Conf. Entry: {self.wallet_learner.dynamic_threshold:.1f}%</div>
                 </div>
+                
+                <!-- PNL CARD -->
                 <div class="card {pnl_class}">
-                    <h2>ACTIVE PNL</h2>
-                    <div class="value" style="color: {'#00ff00' if unrealized_pnl > 0 else '#ff0000'}">{unrealized_pnl:.4f}</div>
+                    <h2>UNREALIZED PNL ({SYMBOL_BASH})</h2>
+                    <div class="value" style="color: {'var(--success-green)' if unrealized_pnl > 0 else 'var(--danger-red)' if unrealized_pnl < 0 else 'var(--neutral-gray)'}">{unrealized_pnl:.4f}</div>
                     <div class="sub">Entry: {position['entry_price']} | Qty: {position['qty']}</div>
                 </div>
+                
+                <!-- AI CARD -->
                 <div class="card info">
-                    <h2>AI SIGNAL</h2>
-                    <div class="value">{'BUY' if prediction > 0 else 'SELL'}</div>
-                    <div class="sub">Conf: {confidence:.1f}% | Acc: {sim_acc:.1f}%</div>
+                    <h2>AI SIGNAL ({SYMBOL_CCXT})</h2>
+                    <div class="value" style="color: {signal_color}">{ai_signal}</div>
+                    <div class="sub">Confidence: {confidence:.1f}%</div>
+                    <div class="sub">Sim. Accuracy: {sim_acc:.1f}%</div>
                 </div>
+                
             </div>
         </body>
         </html>
