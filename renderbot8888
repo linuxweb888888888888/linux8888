@@ -147,13 +147,13 @@ class WalletLearner:
             # Winning: Go faster (lower threshold for faster entries)
             self.dynamic_threshold = max(55.0, self.dynamic_threshold - 0.5)
             self.risk_multiplier = 0.99 # Keep pinned at max
-            logger.info(f"PROFIT (+{delta:.4f}) -> MAX VELOCITY")
+            logger.info(f"PROFIT (+{delta:.6f}) -> MAX VELOCITY") # Increased precision
             
         else:
             # Losing: Tighten threshold slightly (higher threshold for safer entries)
             self.dynamic_threshold = min(70.0, self.dynamic_threshold + 1.0)
             self.risk_multiplier = 0.99 # STAY AGGRESSIVE
-            logger.info(f"LOSS ({delta:.4f}) -> RECOVERY MODE (Full Stack)")
+            logger.info(f"LOSS ({delta:.6f}) -> RECOVERY MODE (Full Stack)") # Increased precision
 
     def get_growth_pct(self):
         if self.initial_balance == 0: return 0.0
@@ -434,7 +434,7 @@ class TradingBot:
             
             <div class="status-bar">
                 <strong>ACTION:</strong> {action_msg} | 
-                <strong>RISK:</strong> {self.wallet_learner.risk_multiplier*100:.0f}%
+                <strong>RISK:</strong> {self.wallet_learner.risk_multiplier*100:.6f}%
             </div>
             
             <div class="container">
@@ -442,15 +442,15 @@ class TradingBot:
                 <!-- WALLET CARD -->
                 <div class="card info">
                     <h2>USDT BALANCE</h2>
-                    <div class="value">${wallet:.2f}</div>
-                    <div class="sub">Growth: <span class="{growth_class}">{growth_pct:.2f}%</span> YTD</div>
-                    <div class="sub">Min Conf. Entry: {self.wallet_learner.dynamic_threshold:.1f}%</div>
+                    <div class="value">${wallet:.6f}</div>
+                    <div class="sub">Growth: <span class="{growth_class}">{growth_pct:.6f}%</span> YTD</div>
+                    <div class="sub">Min Conf. Entry: {self.wallet_learner.dynamic_threshold:.6f}%</div>
                 </div>
                 
                 <!-- PNL CARD -->
                 <div class="card {pnl_class}">
                     <h2>UNREALIZED PNL ({SYMBOL_BASH})</h2>
-                    <div class="value" style="color: {'var(--success-green)' if unrealized_pnl > 0 else 'var(--danger-red)' if unrealized_pnl < 0 else 'var(--neutral-gray)'}">{unrealized_pnl:.4f}</div>
+                    <div class="value" style="color: {'var(--success-green)' if unrealized_pnl > 0 else 'var(--danger-red)' if unrealized_pnl < 0 else 'var(--neutral-gray)'}">{unrealized_pnl:.6f}</div>
                     <div class="sub">Entry: {position['entry_price']} | Qty: {position['qty']}</div>
                 </div>
                 
@@ -458,8 +458,8 @@ class TradingBot:
                 <div class="card info">
                     <h2>AI SIGNAL ({SYMBOL_CCXT})</h2>
                     <div class="value" style="color: {signal_color}">{ai_signal}</div>
-                    <div class="sub">Confidence: {confidence:.1f}%</div>
-                    <div class="sub">Sim. Accuracy: {sim_acc:.1f}%</div>
+                    <div class="sub">Confidence: {confidence:.6f}%</div>
+                    <div class="sub">Sim. Accuracy: {sim_acc:.6f}%</div>
                 </div>
                 
             </div>
@@ -516,7 +516,7 @@ class TradingBot:
 
                     total_fee = (entry * abs(qty) * FEE_RATE) + (price_data['last'] * abs(qty) * FEE_RATE)
                     net_pnl = current_pnl - total_fee
-                    action_log = f"PnL: {net_pnl:.4f}"
+                    action_log = f"PnL: {net_pnl:.6f}" # Increased precision
 
                     # 1. FAST PROFIT TAKER (Full Close) - Adjusted to cover fees + 100% profit (Multiplier 2.0)
                     if net_pnl > 0 and net_pnl > (total_fee * PROFIT_TARGET_MULTIPLIER):
