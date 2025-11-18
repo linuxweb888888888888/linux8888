@@ -22,7 +22,7 @@ DASHBOARD_PATH = '/var/www/html/dashboard.html'
 MAX_HISTORY = 200              # Data points for ML training
 TRAINING_INTERVAL = 1          # Train every step for max adaptation
 FEE_RATE = 0.0006              # Est. Taker fee (0.06%)
-PROFIT_TARGET_PCT = 0.001      # Lowered for higher velocity scalping
+PROFIT_TARGET_MULTIPLIER = 2.0 # Target: Cover fees + 100% of fees as profit
 GRID_STEP_PCT = 0.003          # Averaging down closer (0.3%)
 
 # ------------------------------------------------------------------------------
@@ -119,7 +119,8 @@ class WalletLearner:
         self.current_balance = 0.0
         self.previous_balance = 0.0
         self.trade_history = deque(maxlen=50)
-        self.dynamic_threshold = 51.0 # Start extremely aggressive (51%)
+        # Increased starting threshold for higher quality entries
+        self.dynamic_threshold = 60.0 
         self.risk_multiplier = 0.99   # Start MAX usage (99% - leaving 1% for fees)
 
     def update_balance(self, new_balance):
@@ -143,14 +144,14 @@ class WalletLearner:
         Aggressive adaptation: Never reduce risk, only adjust threshold.
         """
         if delta > 0:
-            # Winning: Go faster
-            self.dynamic_threshold = max(50.1, self.dynamic_threshold - 0.5)
+            # Winning: Go faster (lower threshold for faster entries)
+            self.dynamic_threshold = max(55.0, self.dynamic_threshold - 0.5)
             self.risk_multiplier = 0.99 # Keep pinned at max
             logger.info(f"PROFIT (+{delta:.4f}) -> MAX VELOCITY")
             
         else:
-            # Losing: Tighten threshold slightly, but keep MAX wallet usage to recover
-            self.dynamic_threshold = min(60.0, self.dynamic_threshold + 1.0)
+            # Losing: Tighten threshold slightly (higher threshold for safer entries)
+            self.dynamic_threshold = min(70.0, self.dynamic_threshold + 1.0)
             self.risk_multiplier = 0.99 # STAY AGGRESSIVE
             logger.info(f"LOSS ({delta:.4f}) -> RECOVERY MODE (Full Stack)")
 
@@ -217,6 +218,9 @@ class AIEngine:
         # Spread
         df['spread'] = df['ask'] - df['bid']
         
+        # NEW: Fast Moving Average (MA 3) - Added for clearer short-term trend confirmation
+        df['ma_3'] = df['last'].rolling(window=3).mean()
+        
         # Target: Immediate next tick
         df['target'] = df['last'].shift(-1) - df['last']
         
@@ -230,7 +234,8 @@ class AIEngine:
         df = self.calculate_features(self.history)
         if df.empty: return 0, 0
 
-        feature_cols = ['rsi', 'volatility', 'spread', 'momentum']
+        # Include the new 'ma_3' feature
+        feature_cols = ['rsi', 'volatility', 'spread', 'momentum', 'ma_3'] 
         X = df[feature_cols]
         y = df['target']
 
@@ -379,18 +384,20 @@ class TradingBot:
                     
                     # Real PnL calculation
                     if is_long:
+                        # If closing long, we sell at the BID
                         current_pnl = (price_data['bid'] - entry) * abs(qty)
-                        price_diff_pct = (price_data['last'] - entry) / entry
+                        price_diff_pct = (price_data['bid'] - entry) / entry
                     else:
+                        # If closing short, we buy at the ASK
                         current_pnl = (entry - price_data['ask']) * abs(qty)
-                        price_diff_pct = (entry - price_data['last']) / entry
+                        price_diff_pct = (entry - price_data['ask']) / entry
 
                     total_fee = (entry * abs(qty) * FEE_RATE) + (price_data['last'] * abs(qty) * FEE_RATE)
                     net_pnl = current_pnl - total_fee
                     action_log = f"PnL: {net_pnl:.4f}"
 
-                    # 1. FAST PROFIT TAKER (Full Close) - Highest Priority
-                    if net_pnl > 0 and net_pnl > (total_fee * 1.05):
+                    # 1. FAST PROFIT TAKER (Full Close) - Adjusted to cover fees + 100% profit (Multiplier 2.0)
+                    if net_pnl > 0 and net_pnl > (total_fee * PROFIT_TARGET_MULTIPLIER):
                         logger.info(f"$$$ SCALP PROFIT: {net_pnl:.6f}")
                         side = 'sell' if is_long else 'buy'
                         self.sys.place_order(BASE_COIN, abs(qty), side)
@@ -415,15 +422,20 @@ class TradingBot:
                             logger.info(action_log)
 
                     # 3. AGGRESSIVE PYRAMIDING (Increase Trade) - Add if green AND AI confirms more profit ahead
-                    elif net_pnl > 0 and confidence > 50.0:
+                    # Increased confidence requirement to 65.0% for stacking trades
+                    elif net_pnl > 0 and confidence > 65.0:
                         # Check if AI confirms the direction
                         if (is_long and prediction > 0) or (not is_long and prediction < 0):
                             usable_wallet = wallet * self.wallet_learner.risk_multiplier
-                            current_pos_val = abs(qty) * price_data['last']
+                            
+                            # Use Ask for Long (buy cost), Bid for Short (sell cost) to calculate current value
+                            execution_price = price_data['ask'] if is_long else price_data['bid']
+                            current_pos_val = abs(qty) * execution_price 
+                            
                             free_margin = usable_wallet - current_pos_val
                             
-                            if free_margin > (price_data['last'] * MIN_QTY):
-                                raw_qty = free_margin / price_data['last']
+                            if free_margin > (execution_price * MIN_QTY):
+                                raw_qty = free_margin / execution_price
                                 # Robust step-based calculation
                                 add_qty = (raw_qty // MIN_QTY) * MIN_QTY
                                 add_qty = max(MIN_QTY, round(add_qty, 3)) 
@@ -437,12 +449,16 @@ class TradingBot:
                         # Check if AI confirms the recovery direction
                         if (is_long and prediction > 0) or (not is_long and prediction < 0):
                             usable_wallet = wallet * self.wallet_learner.risk_multiplier
-                            current_pos_val = abs(qty) * price_data['last']
+
+                            # Use Ask for Long (buy cost), Bid for Short (sell cost) to calculate current value
+                            execution_price = price_data['ask'] if is_long else price_data['bid']
+                            current_pos_val = abs(qty) * execution_price 
+
                             free_margin = usable_wallet - current_pos_val
 
-                            if free_margin > (price_data['last'] * MIN_QTY): 
-                                # Use 50% of remaining free margin to avg down
-                                raw_qty = (free_margin * 0.5) / price_data['last']
+                            if free_margin > (execution_price * MIN_QTY): 
+                                # Use 75% of remaining free margin to avg down for faster recovery
+                                raw_qty = (free_margin * 0.75) / execution_price
                                 # Robust step-based calculation
                                 recovery_qty = (raw_qty // MIN_QTY) * MIN_QTY
                                 recovery_qty = max(MIN_QTY, round(recovery_qty, 3)) 
@@ -457,21 +473,31 @@ class TradingBot:
                     # -----------------------------------------------------
                     if self.ai.is_trained and confidence > self.wallet_learner.dynamic_threshold: 
                         
+                        
+                        if prediction > 0:
+                            # Buy order for Long entry hits the ASK
+                            execution_price = price_data['ask']
+                            side = 'buy'
+                        elif prediction < 0:
+                            # Sell order for Short entry hits the BID
+                            execution_price = price_data['bid']
+                            side = 'sell'
+                        else:
+                            # No strong prediction
+                            continue 
+                            
                         max_usd_to_use = wallet * self.wallet_learner.risk_multiplier
                         
-                        if max_usd_to_use > (price_data['last'] * MIN_QTY):
-                            raw_qty = max_usd_to_use / price_data['last']
+                        if max_usd_to_use > (execution_price * MIN_QTY):
+                            # Calculate max quantity based on the execution price (Ask or Bid)
+                            raw_qty = max_usd_to_use / execution_price
                             # Robust step-based calculation
                             trade_qty = (raw_qty // MIN_QTY) * MIN_QTY
                             trade_qty = max(MIN_QTY, round(trade_qty, 3)) 
                             
-                            if prediction > 0:
-                                self.sys.place_order(BASE_COIN, trade_qty, 'buy')
-                                action_log = f"MAX ENTRY LONG (Qty: {trade_qty})"
-                            elif prediction < 0:
-                                self.sys.place_order(BASE_COIN, trade_qty, 'sell')
-                                action_log = f"MAX ENTRY SHORT (Qty: {trade_qty})"
-
+                            self.sys.place_order(BASE_COIN, trade_qty, side)
+                            action_log = f"MAX ENTRY {side.upper()} (Qty: {trade_qty})"
+                            
                 self.generate_dashboard(wallet, pos_data, price_data, prediction, confidence, action_log)
                 self.iteration += 1
                 time.sleep(0.1) # 100ms loop
