@@ -5,43 +5,40 @@ import re
 import pandas as pd
 import numpy as np
 import os
-from datetime import datetime
-from sklearn.linear_model import SGDRegressor
+from datetime import datetime, timedelta
+from sklearn.ensemble import HistGradientBoostingClassifier
 from sklearn.preprocessing import StandardScaler
 from collections import deque
 
 # --- CONFIGURATION & CONSTANTS ---
-# Trading Parameters
 SYMBOL = "ATOMUSDT_PERP"
 BASE_COIN = "ATOM"
-MIN_QTY = 0.001  # Minimum quantity for ATOM trades
-FEE_RATE = 0.00075  # 0.075% standard futures maker/taker fee
-LEVERAGE = 100 # Assumed leverage for PnL calculations
-INTERVAL_SECONDS = 30 # Target interval for main loop (must be < 60s)
-LOOKBACK_PERIOD = 200 # Candles/ticks for technical indicator calculations
-WINDOW_SIZE = 14 # Standard CCI/RSI window size
+MIN_QTY = 0.001
+LEVERAGE = 100 
+INTERVAL_SECONDS = 30 
+LOOKBACK_PERIOD = 300 
+WINDOW_SIZE = 14 # Standard size for indicators (RSI, ADX, ROC)
+VOLATILITY_WINDOW = 20 # Window for Volatility check
 
 # ML/Adaptive Parameters
-MIN_TRAINING_SAMPLES = 10 # Minimum data points needed before first ML prediction
-WIN_CONFIDENCE_THRESHOLD = 0.55 # ML confidence score needed to open a new position
-RISK_PER_TRADE_PERCENT = 0.01 # Max percentage of balance to risk per new position
-MAX_POSITION_RISK_PERCENT = 0.50 # Max percentage of balance for total position size
+MIN_TRAINING_SAMPLES = 50 
+BASE_PROBABILITY_THRESHOLD = 0.55 
+PROFIT_TO_TRAIL_PERCENT = 0.003 # 0.3% profit triggers move SL to break-even
 
-# Dashboard path
+# Dynamic SL/TP Multipliers
+ATR_MULTIPLIER_TP = 2.0 
+ATR_MULTIPLIER_SL = 1.0 
+
+# NEW: Time-Based Stop Loss (T-SL)
+MAX_HOLDING_PERIOD_MINUTES = 60 # Close position if held for more than 1 hour
+
+# Paths (Persistence files removed, only dashboard remains)
 DASHBOARD_PATH = "/var/www/html/dashboard.html"
 
-# --- GLOBAL STATE (Persisted DataFrames for ML learning) ---
-try:
-    historical_df = pd.read_csv('historical_data.csv', index_col='timestamp')
-    historical_df.index = pd.to_datetime(historical_df.index)
-except Exception as e:
-    print(f"Initializing new historical data file. Load error: {e}")
-    historical_df = pd.DataFrame(columns=[
-        'timestamp', 'bid', 'ask', 'mid_price', 'price_change', 'cci', 'rsi', 
-        'volatility', 'PnL_Future', 'trade_size', 'direction', 'realized'
-    ]).set_index('timestamp')
+# --- REMOVED: PERSISTENCE FUNCTIONS (load_bot_state, save_bot_state) ---
+# Bot now runs in a purely ephemeral, clean state.
 
-# --- UTILITY FUNCTIONS ---
+# --- UTILITY & BASH FUNCTIONS ---
 
 def run_bash_command(command_parts):
     """Executes a bash command and returns the output string."""
@@ -58,34 +55,23 @@ def run_bash_command(command_parts):
         
         if result.returncode != 0 and not ("NO INFO" in output or output.startswith("ERROR")):
              print(f"ERROR: Bash command exited with code {result.returncode}. Stderr: {result.stderr.strip()}")
-             # Return the error message clearly
              return f"ERROR: Exit code {result.returncode}. {result.stderr.strip()}"
 
         return output
-    except subprocess.CalledProcessError as e:
-        print(f"ERROR: Bash command failed (CalledProcessError): {' '.join(command_parts)}")
-        return f"ERROR: {e.stderr.strip()}"
     except Exception as e:
         print(f"An unexpected error occurred during bash execution: {e}")
         return f"UNEXPECTED ERROR: {e}"
 
 def get_wallet_balance():
-    """Fetches and parses the USDT balance using /wallet.sh. More robust error handling added."""
+    """Fetches and parses the USDT balance using /wallet.sh."""
     output = run_bash_command(['bash', '/wallet.sh'])
-    
-    if output.startswith("ERROR"):
-        print(f"WARNING: Wallet script failed. Assuming 0 balance for safety. Output: {output}")
-        return 0.0
-
     try:
-        # Assumes the first line is the USDT balance and safely converts
+        if output.startswith("ERROR"):
+            return 0.0
+        # Assuming the first line of output is the balance
         balance = float(output.split('\n')[0].strip())
         return balance
-    except ValueError:
-        print(f"WARNING: Could not parse float balance from output: {output}. Returning 0.0.")
-        return 0.0
-    except Exception as e:
-        print(f"WARNING: Unexpected error parsing balance: {e}. Returning 0.0.")
+    except:
         return 0.0
 
 def get_current_prices():
@@ -97,8 +83,8 @@ def get_current_prices():
     ask = mock_mid_price + 0.0005
     return bid, ask
 
-def parse_position_info():
-    """Parses position data from /coinrealinfo.sh and calculates PnL. Enhanced parsing robustness."""
+def parse_position_info(historical_df):
+    """Parses position data and calculates PnL and dynamic risk levels."""
     output = run_bash_command(['bash', '/coinrealinfo.sh', SYMBOL])
     
     if output == "NO INFO" or output.startswith("ERROR"):
@@ -106,14 +92,11 @@ def parse_position_info():
     
     info = {}
     try:
-        # Regex to extract structured info
         symbol_match = re.search(r'Symbol: "([^"]+)"', output)
         qty_match = re.search(r'Quantity: ([\d.e-]+)', output)
         entry_match = re.search(r'Entry Price: ([\d.e-]+)', output)
 
         if not (symbol_match and qty_match and entry_match):
-            # Critical parsing failure
-            print(f"ERROR: Failed to parse required fields from coinrealinfo.sh output. Returning None.")
             return None
 
         info['symbol'] = symbol_match.group(1)
@@ -121,7 +104,6 @@ def parse_position_info():
         info['quantity'] = abs(raw_qty)
         info['entry_price'] = float(entry_match.group(1))
         
-        # If quantity is 0, treat as flat
         if info['quantity'] == 0:
             return None
             
@@ -129,283 +111,371 @@ def parse_position_info():
         
         bid, ask = get_current_prices()
         
-        # PnL calculation based on direction
-        if info['direction'] == 'buy':
-            pnl_usdt = (bid - info['entry_price']) * info['quantity']
-        else: # 'sell'
-            pnl_usdt = (info['entry_price'] - ask) * info['quantity']
-
+        # PnL calculation
+        current_price = bid if info['direction'] == 'buy' else ask
+        pnl_usdt = (current_price - info['entry_price']) * raw_qty
         info['pnl'] = pnl_usdt
+        
+        # --- Dynamic SL/TP calculation based on current Volatility (ATR) ---
+        if historical_df.empty or len(historical_df) < VOLATILITY_WINDOW:
+            volatility = 0.01 # Fallback
+        else:
+             volatility = historical_df['atr'].iloc[-1] # Use ATR as volatility measure
+             
+        # Dynamic Risk Levels (in price change)
+        tp_level_distance = volatility * ATR_MULTIPLIER_TP
+        sl_level_distance = volatility * ATR_MULTIPLIER_SL
+
+        if info['direction'] == 'buy':
+            info['take_profit'] = info['entry_price'] + tp_level_distance
+            info['stop_loss'] = info['entry_price'] - sl_level_distance
+        else: # 'sell'
+            info['take_profit'] = info['entry_price'] - tp_level_distance
+            info['stop_loss'] = info['entry_price'] + sl_level_distance
+            
+        # Store initial SL/TP to track trailing stop effectiveness
+        # Note: Since there is no persistence, initial_stop_loss will be equal to stop_loss on every run
+        info['initial_stop_loss'] = info.get('initial_stop_loss', info['stop_loss'])
+        info['initial_take_profit'] = info.get('initial_take_profit', info['take_profit'])
 
         return info
-    except ValueError as e:
-        print(f"ERROR: Data type conversion failure in parse_position_info: {e}. Output: {output}")
-        return None
     except Exception as e:
-        print(f"An unexpected error occurred in parse_position_info: {e}")
+        print(f"ERROR in parse_position_info: {e}")
         return None
 
 def close_all_positions_on_start():
     """Runs /closepositions.sh at bot startup."""
     print("ATTEMPTING TO CLOSE ALL POSITIONS on startup...")
-    output = run_bash_command(['bash', '/closepositions.sh'])
-    print(f"CLOSE POSITIONS script output: {output}")
-    if output and not output.startswith("ERROR"):
-        print("Positions might have been closed successfully.")
+    run_bash_command(['bash', '/closepositions.sh'])
     print("-" * 50)
+    
+def execute_trade(quantity, direction, current_position, is_time_out=False):
+    """Executes a trade and returns success status and message."""
+    
+    if not is_time_out:
+        print(f"Attempting to PLACE {direction.upper()} order for {quantity:.4f} {BASE_COIN}...")
+        output = run_bash_command(['bash', '/placeorder.sh', BASE_COIN, str(quantity), direction])
+    else:
+        # Time-out exit is a market order close
+        close_direction = 'sell' if direction == 'buy' else 'buy'
+        print(f"T-SL TRIGGER: Closing {current_position['direction'].upper()} position (Held too long). Qty: {quantity:.4f}")
+        output = run_bash_command(['bash', '/placeorder.sh', BASE_COIN, str(quantity), close_direction])
+        
+    if "SUCCESS" in output or "order placed" in output.lower():
+        return True, f"SUCCESS: Order placed for {direction.upper()} {quantity:.4f}."
+    else:
+        return False, f"ERROR: Failed to place order. Output: {output}"
 
-# --- ML & INDICATOR FUNCTIONS (Unchanged) ---
 
-def calculate_indicators(df):
-    """Calculates technical indicators for ML features."""
-    if df.empty or len(df) < WINDOW_SIZE:
+# --- ADVANCED INDICATOR FUNCTIONS (ROC & NVI Added) ---
+
+def calculate_advanced_indicators(df):
+    """Calculates CCI, RSI, MACD, %B, ADX, ROC, and NVI."""
+    
+    # Check for minimal data size before proceeding to calculations
+    if df.empty:
         return df
 
+    # Basic features
+    df['mid_price'] = (df['bid'] + df['ask']) / 2
     df['price_change'] = df['mid_price'].diff().fillna(0)
-    df['volatility'] = df['mid_price'].rolling(window=WINDOW_SIZE).std().fillna(0)
+    df['volatility_std'] = df['mid_price'].rolling(window=VOLATILITY_WINDOW).std().fillna(0)
 
+    # --- True Range (TR) and Average True Range (ATR) Calculation ---
+    # TR calculation uses np.maximum.reduce which returns a NumPy array.
+    # We must assign it to the DataFrame column first before calling pandas methods like fillna().
+    range_elements = [
+        df['ask'] - df['bid'], 
+        abs(df['ask'] - df['ask'].shift(1)), 
+        abs(df['bid'] - df['bid'].shift(1))
+    ]
+    df['tr'] = np.maximum.reduce(range_elements)
+    # The .fillna(0) must be called on the Series df['tr'], not the raw array.
+    df['tr'] = df['tr'].fillna(0) 
+    
+    df['atr'] = df['tr'].ewm(alpha=1/WINDOW_SIZE, adjust=False).mean().fillna(0)
+    
+    # Exit if insufficient data for other WINDOW_SIZE indicators
+    if len(df) < WINDOW_SIZE:
+        return df
+
+
+    # RSI (Relative Strength Index)
     delta = df['mid_price'].diff(1)
     gain = (delta.where(delta > 0, 0)).rolling(window=WINDOW_SIZE).mean()
     loss = (-delta.where(delta < 0, 0)).rolling(window=WINDOW_SIZE).mean()
-    # Avoid division by zero when calculating RS
     rs = gain / loss.replace(0, 1e-6) 
     df['rsi'] = 100 - (100 / (1 + rs)).fillna(0)
 
-    window = WINDOW_SIZE
+    # CCI (Commodity Channel Index)
     TP = (df['bid'] + df['ask']) / 2 
+    window = WINDOW_SIZE
     df['ma'] = TP.rolling(window=window).mean()
     df['md'] = TP.rolling(window=window).apply(lambda x: pd.Series(x).mad(), raw=True)
-    
-    # Avoid division by zero when calculating CCI
     md_safe = df['md'].replace(0, 1e-6)
     df['cci'] = (TP - df['ma']) / (0.015 * md_safe)
     df['cci'] = df['cci'].replace([np.inf, -np.inf], 0).fillna(0)
-
     df = df.drop(columns=['ma', 'md'], errors='ignore')
+
+    # MACD (Moving Average Convergence Divergence)
+    exp1 = df['mid_price'].ewm(span=12, adjust=False).mean()
+    exp2 = df['mid_price'].ewm(span=26, adjust=False).mean()
+    df['macd'] = exp1 - exp2
+    
+    # Bollinger Bands (%B)
+    std_dev = df['mid_price'].rolling(window=VOLATILITY_WINDOW).std()
+    ma = df['mid_price'].rolling(window=VOLATILITY_WINDOW).mean()
+    upper_band = ma + (std_dev * 2)
+    lower_band = ma - (std_dev * 2)
+    band_range_safe = (upper_band - lower_band).replace(0, 1e-6)
+    df['percent_b'] = (df['mid_price'] - lower_band) / band_range_safe
+    df['percent_b'] = df['percent_b'].fillna(0)
+    
+    # ADX (Average Directional Index) - Trend Strength
+    df['dm_plus'] = ((df['ask'] - df['ask'].shift(1)).clip(lower=0)).where( (df['ask'] - df['ask'].shift(1)) > (df['bid'].shift(1) - df['bid']), 0)
+    df['dm_minus'] = ((df['bid'].shift(1) - df['bid']).clip(lower=0)).where( (df['bid'].shift(1) - df['bid']) > (df['ask'] - df['ask'].shift(1)), 0)
+    df['di_plus'] = (df['dm_plus'].ewm(alpha=1/WINDOW_SIZE, adjust=False).mean() / df['atr']).fillna(0)
+    df['di_minus'] = (df['dm_minus'].ewm(alpha=1/WINDOW_SIZE, adjust=False).mean() / df['atr']).fillna(0)
+    df['dx'] = (abs(df['di_plus'] - df['di_minus']) / (df['di_plus'] + df['di_minus'])).replace(np.inf, 1).fillna(0)
+    df['adx'] = df['dx'].ewm(alpha=1/WINDOW_SIZE, adjust=False).mean()
+    df['adx'] = df['adx'] * 100 
+    
+    # NEW FEATURE 1: Rate of Change (ROC) - Momentum
+    roc_period = WINDOW_SIZE
+    df['roc'] = (df['mid_price'].diff(roc_period) / df['mid_price'].shift(roc_period)).fillna(0) * 100 
+    
+    # NEW FEATURE 2: Normalized Volatility Index (NVI) - Current volatility relative to its long-term average
+    # Need sufficient data for long-term rolling mean
+    if len(df) < VOLATILITY_WINDOW * 3:
+        df['nvi'] = 1.0
+    else:
+        df['nvi'] = (df['volatility_std'] / df['volatility_std'].rolling(window=VOLATILITY_WINDOW * 3).mean()).fillna(1)
+    
+    df = df.drop(columns=['bid', 'ask', 'tr', 'dm_plus', 'dm_minus', 'di_plus', 'di_minus', 'dx'], errors='ignore')
+    return df.drop(columns=['volatility_std'], errors='ignore')
+
+# --- ML CLASSIFICATION & TRAINING ---
+
+def create_target_signal(df):
+    """Creates the target variable: 1 (Buy/Long), -1 (Sell/Short), 0 (Hold)."""
+    if len(df) < 4: return df
+    
+    df['future_price'] = df['mid_price'].shift(-3)
+    PROFIT_THRESHOLD = 0.0005 # 0.05% movement (5 BPS)
+
+    price_change_ratio = (df['future_price'] - df['mid_price']) / df['mid_price']
+    
+    # Target encoding: 1=Buy/Long, -1=Sell/Short, 0=Hold
+    df['next_move_signal'] = 0 
+    df.loc[price_change_ratio > PROFIT_THRESHOLD, 'next_move_signal'] = 1
+    df.loc[price_change_ratio < -PROFIT_THRESHOLD, 'next_move_signal'] = -1
+    
+    df = df.drop(columns=['future_price'], errors='ignore')
     return df
 
-def setup_and_train_ml_model(df, scaler, model):
-    """Prepares data and trains the SGDRegressor model."""
-    if len(df) < MIN_TRAINING_SAMPLES:
-        return scaler, model, False, 0.0
+def setup_and_train_ml_model(df, scaler, model, initial_fit_done):
+    """Prepares data, trains the HistGradientBoostingClassifier, and returns accuracy."""
     
-    train_df = df[df['realized'] == True].copy()
+    # Ensure all indicators are calculated and non-NaN
+    features = ['price_change', 'atr', 'cci', 'rsi', 'macd', 'percent_b', 'adx', 'roc', 'nvi']
+    train_df = df.copy().dropna(subset=['next_move_signal'] + features)
+    
     if len(train_df) < MIN_TRAINING_SAMPLES:
         return scaler, model, False, 0.0
 
-    features = ['price_change', 'volatility', 'cci', 'rsi', 'trade_size', 'direction_int']
-    # Use fillna(0) just in case there are NaN in trade_size/direction_int from bad data
-    train_df['direction_int'] = train_df['direction'].apply(lambda x: 1 if x == 'buy' else -1).fillna(0)
-    
     X = train_df[features].values
-    y = train_df['PnL_Future'].values
+    y = train_df['next_move_signal'].values
     
-    if not hasattr(scaler, 'scale_'):
-        scaler.fit(X)
-
+    # Fit or refit scaler if necessary
+    if not initial_fit_done:
+        scaler.partial_fit(X) 
+        initial_fit_done = True
+        
     X_scaled = scaler.transform(X)
-
-    try:
-        model.partial_fit(X_scaled, y)
-    except Exception as e:
-        print(f"ML Training Error: {e}. Check if data is clean.")
-        return scaler, model, False, 0.0
-
-    y_pred = model.predict(X_scaled)
-    accuracy = (np.sign(y_pred) == np.sign(y)).mean() * 100
     
-    return scaler, model, True, accuracy
+    # HistGradientBoosting is fast and replaces partial_fit logic
+    # For speed and continuous learning, we use a fixed, small training set
+    try:
+        # Train on the most recent MIN_TRAINING_SAMPLES
+        X_train = X_scaled[-MIN_TRAINING_SAMPLES:]
+        y_train = y[-MIN_TRAINING_SAMPLES:]
+        
+        # HistGradientBoosting is fast and performs a full fit
+        model.fit(X_train, y_train) 
+    except Exception as e:
+        print(f"ML Training Error (HGB): {e}")
+        return scaler, model, initial_fit_done, 0.0
 
+    # Calculate accuracy on the training set
+    accuracy = model.score(X_train, y_train) * 100
+    
+    return scaler, model, initial_fit_done, accuracy
 
-def get_ml_prediction(df, scaler, model):
-    """Generates a profit prediction for the current state."""
-    # Check for empty dataframe or unscaled scaler
+def get_ml_prediction(df, scaler, model, adaptive_threshold):
+    """Generates a probability prediction for the current state."""
     if not hasattr(scaler, 'scale_') or df.empty or len(df) < 1:
-        return 0.0, 0.5, "none" 
+        return 0.0, 0.0, 0.0, "hold" 
 
     current_state = df.iloc[[-1]]
-
-    features = ['price_change', 'volatility', 'cci', 'rsi', 'trade_size', 'direction_int']
-    # .iloc[0].tolist() is safer for single-row access
+    features = ['price_change', 'atr', 'cci', 'rsi', 'macd', 'percent_b', 'adx', 'roc', 'nvi']
+    
     try:
-        base_features = current_state[['price_change', 'volatility', 'cci', 'rsi']].iloc[0].tolist()
+        X_current = scaler.transform(current_state[features].values)
     except:
-         # Failsafe if indicator calculation failed
-        print("WARNING: Could not extract base features for ML prediction.")
-        return 0.0, 0.5, "none"
+        return 0.0, 0.0, 0.0, "hold"
 
-    # Predict for BUY (Long)
-    buy_size = MIN_QTY 
-    buy_features = base_features + [buy_size, 1] 
-    X_buy = scaler.transform([buy_features])
-    pred_buy_pnl = model.predict(X_buy)[0]
-
-    # Predict for SELL (Short)
-    sell_size = MIN_QTY
-    sell_features = base_features + [sell_size, -1] 
-    X_sell = scaler.transform([sell_features])
-    pred_sell_pnl = model.predict(X_sell)[0]
+    # Predict probabilities for each class (-1, 0, 1)
+    probabilities = model.predict_proba(X_current)[0]
+    classes = model.classes_
     
-    if pred_buy_pnl > pred_sell_pnl:
-        best_pnl = pred_buy_pnl
-        best_direction = 'buy'
+    # Map classes to probabilities
+    prob_map = dict(zip(classes, probabilities))
+    
+    prob_buy = prob_map.get(1, 0.0)
+    prob_sell = prob_map.get(-1, 0.0)
+    
+    if prob_buy > prob_sell and prob_buy >= adaptive_threshold:
+        return prob_buy, prob_sell, prob_map.get(0, 0.0), "buy"
+    elif prob_sell > prob_buy and prob_sell >= adaptive_threshold:
+        return prob_buy, prob_sell, prob_map.get(0, 0.0), "sell"
     else:
-        best_pnl = pred_sell_pnl
-        best_direction = 'sell'
-        
-    historical_pnl = df[df['realized'] == True]['PnL_Future'].values
-    confidence = 0.5
-    if len(historical_pnl) > 5:
-        pnl_std = np.std(historical_pnl)
-        if pnl_std > 1e-6:
-            # Calculate confidence using tanh based on predicted PnL vs historical volatility
-            confidence = 0.5 + 0.5 * np.tanh(best_pnl / (2 * pnl_std))
-        else:
-            confidence = 1.0 if best_pnl > 0 else 0.5
-        
-    return best_pnl, confidence, best_direction
+        return prob_buy, prob_sell, prob_map.get(0, 0.0), "hold"
 
-# --- ADAPTIVE POSITION MANAGEMENT (Robustness added) ---
+# --- ADAPTIVE RISK & POSITION SIZING ---
 
-def calculate_adaptive_quantity(wallet_balance, current_position, predicted_pnl, direction):
-    """Calculates the quantity (in steps of MIN_QTY) for the next trade."""
+def calculate_volatility_quantity(wallet_balance, mid_price, sl_price_level, direction, adaptive_risk_percent):
+    """Calculates the quantity based on max risk (adaptive) and stop-loss distance."""
     
-    if predicted_pnl <= 0:
-         # This should have been filtered by the main loop, but as a defensive check:
-         return 0.0
-         
-    max_risk_usdt = wallet_balance * MAX_POSITION_RISK_PERCENT
-    quantity_to_place = 0.0
-    
-    if current_position is None or current_position['quantity'] == 0:
-        # Opening new position - always minimum size
-        quantity_to_place = MIN_QTY
-        
-    else:
-        # Martingale/Increase logic
-        current_pnl = current_position['pnl']
-        current_abs_qty = current_position['quantity']
-        current_direction = current_position['direction']
-        
-        if direction == current_direction:
-            # Direction ALIGNED 
-            if current_pnl < 0:
-                # Losing trade: Martingale step.
-                loss_magnitude = abs(current_pnl) / (wallet_balance * RISK_PER_TRADE_PERCENT)
-                martingale_factor = max(1, int(np.ceil(loss_magnitude))) 
-                
-                quantity_to_place = max(MIN_QTY, martingale_factor * MIN_QTY) 
-                
-                # Check required margin for the NEW TOTAL position
-                entry_price_estimate = get_current_prices()[0] if direction == 'buy' else get_current_prices()[1]
-                required_usdt = entry_price_estimate * (current_abs_qty + quantity_to_place) / LEVERAGE
-                
-                if required_usdt > max_risk_usdt:
-                    print(f"Adaptive Sizing: MAX RISK CAP hit. Cannot increase position. Current size: {current_abs_qty:.4f} ATOM. Max Risk: {max_risk_usdt:.2f} USDT.")
-                    return 0.0
-                print(f"Adaptive Sizing: Martingale step calculated. Increasing by {quantity_to_place:.4f} ATOM.")
-                
-            elif current_pnl > 0:
-                # Winning trade: Adaptive Scalping. Smallest increase.
-                quantity_to_place = MIN_QTY
-                print(f"Adaptive Sizing: Profitable trade increase calculated: {MIN_QTY:.4f} ATOM.")
-        else:
-            # Direction MISALIGNED (Should be handled by TP check before this)
-            return 0.0
-            
-    # Final check: Must be at least MIN_QTY, and rounded correctly
-    if quantity_to_place < MIN_QTY:
+    if sl_price_level <= 0:
+        print("Sizing Error: SL level is zero or negative.")
         return 0.0
+
+    # Adaptive Max Risk based on ML confidence
+    max_risk_usdt = wallet_balance * adaptive_risk_percent
+
+    # Distance to Stop Loss (Price difference)
+    if direction == 'buy':
+        sl_distance = mid_price - sl_price_level
+    else: # 'sell'
+        sl_distance = sl_price_level - mid_price
         
-    quantity_to_place = round(quantity_to_place / MIN_QTY) * MIN_QTY
+    if sl_distance <= 0:
+        print("Sizing Error: SL distance is zero or negative.")
+        return 0.0
+
+    # Quantity = Max Risk USDT / Distance to SL 
+    raw_quantity = max_risk_usdt / sl_distance
     
-    return max(0.0, quantity_to_place)
-
-# --- TRADE EXECUTION AND PNL MANAGEMENT (Robustness added) ---
-
-def execute_trade(quantity, direction, current_position, current_prices):
-    """Executes a market order or closes/reduces a position."""
-    if quantity < MIN_QTY:
-        return False, f"ERROR: Quantity too small ({quantity:.4f}). Must be >= {MIN_QTY}."
+    # Quantize and enforce minimum
+    quantized_quantity = max(MIN_QTY, round(raw_quantity / MIN_QTY) * MIN_QTY)
     
-    # We only execute opening or increasing trades here
-    is_opening = current_position is None or current_position['quantity'] == 0
-    is_increasing = (not is_opening) and (current_position['direction'] == direction)
+    return quantized_quantity
 
-    if is_opening or is_increasing:
-        
-        command_parts = ['bash', '/placeorder.sh', BASE_COIN, str(quantity), direction]
-        command_str = ' '.join(command_parts)
-        
-        print(f"ATTEMPTING ORDER: {command_str}")
-        
-        output = run_bash_command(command_parts)
-        
-        if "SUCCESS" in output or "order placed" in output.lower():
-            # SUCCESS criteria broadened slightly to catch variations in script output
-            return True, f"SUCCESS: Order placed. Output: {output}"
-        else:
-            # Failed to place order
-            return False, f"ERROR: Order failed. Command output: {output}"
+# --- TRADE EXECUTION AND RISK MANAGEMENT ---
 
-    # Should not happen if Step 5 logic is correct
-    return False, "ERROR: Trade execution logic flow violation (tried to execute an unexpected trade type)."
-
-def check_for_take_profit(current_position, current_prices, historical_df):
-    """Checks if the current position should be closed for profit and handles ML realization."""
+def check_risk_targets(current_position, current_prices, historical_df, current_entry_time):
+    """Checks for TP, SL, Trailing Stop, AND Time-Based Stop Loss (T-SL) logic."""
     if current_position is None or current_position['quantity'] == 0:
-        return historical_df, False, "No open position to check for TP."
+        # Returns current_entry_time (which should be None) if no position is open
+        return historical_df, False, 0, "No open position.", current_entry_time 
 
+    direction = current_position['direction']
     qty = current_position['quantity']
     entry_price = current_position['entry_price']
-    pnl_usdt = current_position['pnl']
-    direction = current_position['direction']
-
-    # Total estimated fee for Round-Trip (Open + Close)
-    total_fee_estimate = 2 * qty * entry_price * FEE_RATE
     
-    # Condition: PnL must be strictly greater than the estimated fee for a real profit
-    if pnl_usdt > total_fee_estimate:
-        print(f"TAKE PROFIT CONDITION MET: PnL {pnl_usdt:.4f} USDT > Fee {total_fee_estimate:.4f} USDT.")
+    current_price = current_prices[0] if direction == 'buy' else current_prices[1]
+
+    # --- 1. Trailing Stop Logic (Move SL to Break-Even + Fees) ---
+    is_profitable = (direction == 'buy' and current_price > entry_price) or \
+                    (direction == 'sell' and current_price < entry_price)
+    
+    profit_usdt_ratio = abs(current_position['pnl']) / (current_position['quantity'] * entry_price / LEVERAGE)
+    fee_buffer = entry_price * PROFIT_TO_TRAIL_PERCENT 
+    
+    new_sl = current_position['stop_loss']
+    trailing_status = "No trail."
+    
+    if is_profitable and profit_usdt_ratio > PROFIT_TO_TRAIL_PERCENT:
+        be_price = entry_price + fee_buffer if direction == 'buy' else entry_price - fee_buffer
         
-        close_direction = 'sell' if direction == 'buy' else 'buy'
-        command_parts = ['bash', '/placeorder.sh', BASE_COIN, str(qty), close_direction]
-        command_str = ' '.join(command_parts)
+        if (direction == 'buy' and be_price > current_position['stop_loss']) or \
+           (direction == 'sell' and be_price < current_position['stop_loss']):
+            new_sl = be_price
+            trailing_status = f"SL moved to BE ({new_sl:.4f})"
+            current_position['stop_loss'] = new_sl # Update for the next checks
+
+    # --- 2. Time-Based Stop Loss (T-SL) ---
+    is_time_out = False
+    time_out_msg = ""
+    if current_entry_time:
+        time_elapsed = datetime.now() - current_entry_time
+        max_hold_delta = timedelta(minutes=MAX_HOLDING_PERIOD_MINUTES)
         
-        print(f"CLOSING POSITION: {command_str}")
-        output = run_bash_command(command_parts)
-        
-        if "SUCCESS" in output or "order placed" in output.lower():
-            # --- ML Learning Update (Realized PnL) ---
-            if not historical_df.empty:
-                # Update the last entry to reflect the realized PnL from this closed trade
-                historical_df.loc[historical_df.index[-1], 'PnL_Future'] = pnl_usdt
-                historical_df.loc[historical_df.index[-1], 'realized'] = True
-                print(f"ML Learning: Realized PnL of {pnl_usdt:.4f} USDT recorded for position closure.")
+        if time_elapsed > max_hold_delta:
+            is_time_out = True
+            time_out_msg = f"T-SL: Held for {int(time_elapsed.total_seconds() / 60)} min (Max {MAX_HOLDING_PERIOD_MINUTES} min)."
             
-            return historical_df, True, f"SUCCESS: Position closed for PnL {pnl_usdt:.4f} USDT."
+    # --- 3. Check for TP, SL, or T-SL hit ---
+    tp_hit = (direction == 'buy' and current_price >= current_position['take_profit']) or \
+             (direction == 'sell' and current_price <= current_position['take_profit'])
+             
+    sl_hit = (direction == 'buy' and current_price <= current_position['stop_loss']) or \
+             (direction == 'sell' and current_price >= current_position['stop_loss'])
+
+    if tp_hit or sl_hit or is_time_out:
+        action_type = "TAKE PROFIT" if tp_hit else ("STOP LOSS" if sl_hit else "TIME OUT")
+        
+        # Close the position using the execution function
+        success, output_msg = execute_trade(qty, direction, current_position, is_time_out)
+
+        if success:
+            # The trade outcome is now determined
+            return historical_df, True, current_position['pnl'], f"SUCCESS: Position closed via {action_type}. {time_out_msg}", None # Reset entry time
         else:
-            return historical_df, False, f"ERROR: Failed to close position. Command output: {output}"
+            return historical_df, False, 0, f"ERROR: Failed to close position via {action_type}. Output: {output_msg}", current_entry_time
     
-    return historical_df, False, f"Holding. PnL {pnl_usdt:.4f} USDT < Fee {total_fee_estimate:.4f} USDT."
+    # Return status if holding
+    hold_msg = f"Holding. PnL {current_position['pnl']:.4f} USDT. Targets: SL {current_position['stop_loss']:.4f} (Actual: {current_position['initial_stop_loss']:.4f}), TP {current_position['take_profit']:.4f}. {trailing_status}"
+    if current_entry_time:
+        time_elapsed = datetime.now() - current_entry_time
+        time_msg = f" | Time Left: {MAX_HOLDING_PERIOD_MINUTES - int(time_elapsed.total_seconds() / 60)} min"
+        hold_msg += time_msg
+        
+    return historical_df, False, 0, hold_msg, current_entry_time
 
-# --- DASHBOARD FUNCTIONS (Unchanged) ---
 
-def update_dashboard(wallet_balance, current_position, pred_pnl, confidence, accuracy, wins, losses):
-    """Writes all metrics to the HTML dashboard with a Material Design aesthetic."""
+# --- DASHBOARD FUNCTIONS ---
+
+def update_dashboard(wallet_balance, current_position, prob_buy, prob_sell, ml_accuracy, wins, losses, adaptive_threshold, adaptive_risk_percent, current_entry_time):
+    """Writes all advanced metrics to the HTML dashboard."""
+    
+    time_held_display = "N/A"
     
     if current_position:
         pos_status = f"{current_position['direction'].upper()} {current_position['quantity']:.4f} {BASE_COIN}"
         entry_price = f"{current_position['entry_price']:.8f}"
         pnl_usdt = f"{current_position['pnl']:.4f}"
         pnl_class = "text-green-500" if current_position['pnl'] >= 0 else "text-red-500"
+        sl_tp_info = f"SL: {current_position['stop_loss']:.4f}, TP: {current_position['take_profit']:.4f}"
+        if current_position['stop_loss'] != current_position['initial_stop_loss']:
+             sl_tp_info += " (TRAILED)"
+             
+        # Calculate time held for dashboard display (using passed entry time)
+        if current_entry_time:
+            time_held = datetime.now() - current_entry_time
+            time_held_display = f"{int(time_held.total_seconds() / 60)} min"
     else:
         pos_status = "FLAT (0.0000 ATOM)"
         entry_price = "N/A"
         pnl_usdt = "0.0000"
         pnl_class = "text-gray-500"
+        sl_tp_info = "N/A"
 
-    pred_status_class = "bg-green-100 text-green-700" if pred_pnl > 0 and confidence > WIN_CONFIDENCE_THRESHOLD else "bg-red-100 text-red-700"
+    best_prob = max(prob_buy, prob_sell)
+    signal = "BUY" if prob_buy == best_prob and prob_buy >= adaptive_threshold else \
+             ("SELL" if prob_buy == best_prob and prob_buy >= adaptive_threshold else "HOLD")
+    
+    pred_status_class = "bg-green-100 text-green-700" if signal in ["BUY", "SELL"] else "bg-gray-100 text-gray-700"
     
     html_content = f"""
 <!DOCTYPE html>
@@ -413,84 +483,84 @@ def update_dashboard(wallet_balance, current_position, pred_pnl, confidence, acc
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>ATOM Futures Bot Dashboard</title>
+    <title>ATOM Advanced Futures Bot Dashboard (V3 - CLEAN START)</title>
     <script src="https://cdn.tailwindcss.com"></script>
     <style>
         @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700&display=swap');
         body {{ font-family: 'Inter', sans-serif; background-color: #f0f2f5; }}
         .card {{ background-color: white; border-radius: 12px; box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.1), 0 2px 4px -2px rgba(0, 0, 0, 0.1); transition: all 0.3s ease; }}
-        .card:hover {{ box-shadow: 0 10px 15px -3px rgba(0, 0, 0, 0.1), 0 4px 6px -4px rgba(0, 0, 0, 0.1); }}
     </style>
 </head>
 <body class="p-4 md:p-8">
 
-    <div class="max-w-4xl mx-auto">
-        <h1 class="text-3xl font-bold text-gray-800 mb-6 border-b-2 pb-2">ATOM Adaptive Futures Bot</h1>
+    <div class="max-w-6xl mx-auto">
+        <h1 class="text-3xl font-bold text-gray-800 mb-6 border-b-2 pb-2">ATOM Adaptive Futures Bot (V3 - CLEAN START/No Persistence)</h1>
         <p class="text-sm text-gray-500 mb-8">Last Updated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}</p>
+        <div class="bg-yellow-100 p-4 rounded-lg mb-6 text-yellow-800 text-sm font-semibold border-l-4 border-yellow-500">
+            NOTICE: This bot is running in non-persistent mode. Wins/Losses/Accuracy reset on every run.
+        </div>
 
-        <div class="grid grid-cols-1 md:grid-cols-3 gap-6 mb-8">
-            <!-- WALLET BALANCE CARD -->
-            <div class="card p-5 border-l-4 border-indigo-500">
-                <p class="text-sm font-medium text-gray-500">USDT Wallet Balance</p>
-                <p class="text-3xl font-bold text-gray-900 mt-1">${wallet_balance:.2f}</p>
-                <p class="text-xs text-gray-400 mt-2">Target: Fast USDT Growth</p>
+        <div class="grid grid-cols-2 md:grid-cols-5 gap-4 mb-8">
+            <div class="card p-4 border-l-4 border-indigo-500">
+                <p class="text-xs font-medium text-gray-500">USDT Wallet Balance</p>
+                <p class="text-2xl font-bold text-gray-900 mt-1">${wallet_balance:.2f}</p>
             </div>
             
-            <!-- TOTAL TRADES CARD -->
-            <div class="card p-5 border-l-4 border-yellow-500">
-                <p class="text-sm font-medium text-gray-500">ML Signal Accuracy</p>
-                <p class="text-3xl font-bold text-gray-900 mt-1">{accuracy:.2f}%</p>
-                <p class="text-xs text-gray-400 mt-2">Predictive Success Rate (Sign of PnL)</p>
+            <div class="card p-4 border-l-4 border-yellow-500">
+                <p class="text-xs font-medium text-gray-500">ML Accuracy (HGB)</p>
+                <p class="text-2xl font-bold text-gray-900 mt-1">{ml_accuracy:.2f}%</p>
             </div>
             
-            <!-- WINS/LOSSES CARD -->
-            <div class="card p-5 border-l-4 border-green-500">
-                <p class="text-sm font-medium text-gray-500">Win / Loss History</p>
-                <p class="text-3xl font-bold text-gray-900 mt-1">
+            <div class="card p-4 border-l-4 border-green-500">
+                <p class="text-xs font-medium text-gray-500">Wins / Losses (Realized)</p>
+                <p class="text-2xl font-bold text-gray-900 mt-1">
                     <span class="text-green-600">{wins}</span> / <span class="text-red-600">{losses}</span>
                 </p>
-                <p class="text-xs text-gray-400 mt-2">Realized Profitable vs. Loss Trades</p>
+            </div>
+             <div class="card p-4 border-l-4 border-pink-500">
+                <p class="text-xs font-medium text-gray-500">Adaptive Risk/Trade</p>
+                <p class="text-2xl font-bold text-gray-900 mt-1">{adaptive_risk_percent * 100:.2f}%</p>
+            </div>
+            <div class="card p-4 border-l-4 border-red-500">
+                <p class="text-xs font-medium text-gray-500">Max Hold Time</p>
+                <p class="text-2xl font-bold text-gray-900 mt-1">{MAX_HOLDING_PERIOD_MINUTES} min</p>
             </div>
         </div>
 
         <!-- CURRENT POSITION STATUS -->
-        <div class="card p-6 mb-8">
-            <h2 class="text-xl font-semibold text-gray-700 mb-4">Current Real Position</h2>
-            <div class="grid grid-cols-2 md:grid-cols-4 gap-4 text-sm">
-                <div><p class="text-gray-500">Symbol</p><p class="font-mono text-lg text-indigo-600">{SYMBOL}</p></div>
+        <div class="card p-6 mb-8 border-t-8 border-blue-500">
+            <h2 class="text-xl font-semibold text-gray-700 mb-4">Current Real Position & Dynamic Risk</h2>
+            <div class="grid grid-cols-2 md:grid-cols-5 gap-4 text-sm">
                 <div><p class="text-gray-500">Status / Size</p><p class="font-bold text-lg">{pos_status}</p></div>
+                <div><p class="text-gray-500">Time Held</p><p class="font-bold text-lg">{time_held_display}</p></div>
                 <div><p class="text-gray-500">Entry Price</p><p class="font-mono text-lg">{entry_price}</p></div>
                 <div><p class="text-gray-500">Unrealized PnL (USDT)</p><p class="font-mono text-lg font-bold {pnl_class}">{pnl_usdt}</p></div>
+                <div><p class="text-gray-500">SL / TP Levels</p><p class="font-mono text-lg text-blue-500">{sl_tp_info}</p></div>
             </div>
         </div>
 
         <!-- AI PREDICTION & NEXT ACTION -->
         <div class="card p-6 {pred_status_class}">
-            <h2 class="text-xl font-bold text-gray-800 mb-4">AI Prediction & Next Action</h2>
-            <div class="grid grid-cols-1 md:grid-cols-3 gap-4 text-sm font-medium">
+            <h2 class="text-xl font-bold text-gray-800 mb-4">HGB Classifier Signal</h2>
+            <div class="grid grid-cols-1 md:grid-cols-4 gap-4 text-sm font-medium">
                 <div>
-                    <p class="text-gray-600">Predicted PnL (Next Trade)</p>
-                    <p class="text-2xl font-bold mt-1 text-gray-900">{pred_pnl:.4f} USDT</p>
+                    <p class="text-gray-600">Buy Probability</p>
+                    <p class="text-2xl font-bold mt-1 text-green-700">{prob_buy:.2f}</p>
                 </div>
                 <div>
-                    <p class="text-gray-600">Confidence Score</p>
-                    <p class="text-2xl font-bold mt-1 text-gray-900">{confidence:.2f}</p>
+                    <p class="text-gray-600">Sell Probability</p>
+                    <p class="text-2xl font-bold mt-1 text-red-700">{prob_sell:.2f}</p>
+                </div>
+                <div>
+                    <p class="text-gray-600">Hold Probability</p>
+                    <p class="text-2xl font-bold mt-1 text-gray-700">{1 - prob_buy - prob_sell:.2f}</p>
                 </div>
                 <div>
                     <p class="text-gray-600">Action Signal</p>
-                    <p class="text-2xl font-bold mt-1 text-indigo-700">{'BUY (LONG)' if pred_pnl > 0 and confidence > WIN_CONFIDENCE_THRESHOLD else 'HOLD / WAIT'}</p>
+                    <p class="text-2xl font-bold mt-1 text-indigo-700">{signal}</p>
                 </div>
             </div>
-            <p class="text-xs mt-4 text-gray-600">Prediction is based on current market state and {len(historical_df)} simulated learning points.</p>
-        </div>
-
-        <!-- BOT LOG/METRICS (Simulated Trades Count) -->
-        <div class="mt-8">
-            <h2 class="text-xl font-semibold text-gray-700 mb-4">Learning Metrics</h2>
-            <div class="card p-6 bg-gray-50">
-                <p class="text-sm text-gray-600">Total Learning Data Points (Simulated Trades): <span class="font-bold">{len(historical_df)}</span></p>
-                <p class="text-sm text-gray-600">Realized (Closed) Learning Trades: <span class="font-bold">{historical_df['realized'].sum()}</span></p>
-            </div>
+            <p class="text-xs mt-4 text-gray-600">Trading only occurs if Buy/Sell probability is >= {adaptive_threshold:.4f}</p>
         </div>
 
     </div>
@@ -504,165 +574,177 @@ def update_dashboard(wallet_balance, current_position, pred_pnl, confidence, acc
     except Exception as e:
         print(f"ERROR: Could not write HTML dashboard to {DASHBOARD_PATH}. Check permissions: {e}")
 
-# --- MAIN BOT LOGIC (Enhanced Robustness) ---
+# --- MAIN BOT LOGIC ---
 
 def main():
-    """The main trading loop of the bot."""
-    global historical_df 
+    """The main trading loop of the advanced bot."""
     
-    close_all_positions_on_start()
-    
-    scaler = StandardScaler()
-    ml_model = SGDRegressor(random_state=42, max_iter=1000, tol=1e-3, penalty='l2') 
-    
+    # --- Non-Persistence Initialization (Clean Start) ---
     realized_wins = 0
     realized_losses = 0
     ml_accuracy = 0.0
+    position_entry_time = None # Tracks time for T-SL (Time-based Stop Loss)
     
-    print("AI Futures Bot Initialized. Starting continuous trading loop...")
+    # Initialize Scaler (No state loaded)
+    scaler = StandardScaler()
+    initial_fit_done = False
+    print("Starting bot in clean, non-persistent mode. State variables are reset.")
 
+    # Initialize historical data as empty
+    global historical_df 
+    # Initialize an empty DataFrame and explicitly set the index name to 'timestamp'.
+    historical_df = pd.DataFrame(columns=['bid', 'ask']).set_index(pd.Index([], name='timestamp'))
+    print("Historical data initialized as empty.")
+
+    # NEW ML Model: HistGradientBoostingClassifier (Faster, more powerful ensemble)
+    ml_model = HistGradientBoostingClassifier(
+        max_iter=100, 
+        max_depth=5, 
+        l2_regularization=0.1,
+        random_state=42,
+        class_weight='balanced' # Helps with class imbalance
+    )
+    # The HGB model needs to be fitted once before prediction. Since we start clean, we must wait 
+    # until MIN_TRAINING_SAMPLES are collected.
+
+    # --- Main Loop ---
     while True:
         start_time = time.time()
+        print(f"\n--- Bot Cycle Start: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} ---")
         
-        # --- STEP 1: Get Real-Time Data & State ---
-        wallet_balance = get_wallet_balance()
-        if wallet_balance <= 0:
-            print("CRITICAL: Wallet balance is 0 or unreadable. Cannot trade. Please fund your account.")
-            time.sleep(INTERVAL_SECONDS)
-            continue
-            
+        # 1. Fetch data
         bid, ask = get_current_prices()
-        mid_price = (bid + ask) / 2
-        
-        print(f"\n--- {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} ---")
-        print(f"Wallet: ${wallet_balance:.2f} | Bid: {bid:.8f} | Ask: {ask:.8f}")
-        
-        # --- STEP 2: Update Historical Data & Indicators ---
-        # *** ROBUSTNESS FIX: Initialize trade_size/direction correctly for new row ***
-        new_data = pd.DataFrame([{
-            'timestamp': datetime.now(), 
-            'bid': bid, 
-            'ask': ask, 
-            'mid_price': mid_price, 
-            'price_change': 0.0, 'cci': 0.0, 'rsi': 0.0, 'volatility': 0.0, 
-            'PnL_Future': 0.0, 
-            'trade_size': 0.0,      # Default size (0.0)
-            'direction': 'none',    # Default direction (none)
-            'realized': False 
-        }]).set_index('timestamp')
+        current_time = datetime.now()
 
-        historical_df = pd.concat([historical_df, new_data])
-        historical_df = historical_df.iloc[-LOOKBACK_PERIOD:] 
-        historical_df = calculate_indicators(historical_df)
+        # Append new data point
+        new_row = pd.DataFrame([{'bid': bid, 'ask': ask}], index=[current_time])
+        new_row.index.name = 'timestamp'
+        historical_df = pd.concat([historical_df, new_row])
+        historical_df = historical_df.iloc[-LOOKBACK_PERIOD:]
         
-        # --- STEP 3: ML Training & Prediction ---
-        ml_model_trained = False
+        # 2. Calculate Indicators & Target
+        historical_df = calculate_advanced_indicators(historical_df)
+        historical_df = create_target_signal(historical_df)
+
+        # 3. ML Training
         if len(historical_df) >= MIN_TRAINING_SAMPLES:
-            scaler, ml_model, ml_model_trained, ml_accuracy = setup_and_train_ml_model(historical_df, scaler, ml_model)
-        
-        pred_pnl, confidence, pred_direction = get_ml_prediction(historical_df, scaler, ml_model)
-        
-        print(f"ML: Pred PnL={pred_pnl:.6f} | Confidence={confidence:.2f} | Signal={pred_direction.upper()}")
-        print(f"ML Accuracy (Realized): {ml_accuracy:.2f}%")
-
-        # --- STEP 4: Position Management (Fetch & Check TP) ---
-        current_position = parse_position_info()
-        historical_df, closed, msg = check_for_take_profit(current_position, (bid, ask), historical_df)
-        
-        if closed:
-            # Must re-read position after a close to ensure state is FLAT
-            current_position = parse_position_info() 
-            if msg and "PnL" in msg:
-                try:
-                    closed_pnl = float(msg.split("PnL ")[-1].split(" USDT")[0])
-                    if closed_pnl > 0:
-                        realized_wins += 1
-                    else:
-                        realized_losses += 1
-                except:
-                    pass # Keep quiet if PnL parsing failed here
-        
-        is_flat = current_position is None or current_position['quantity'] == 0
-        
-        # *** SYNTAX FIX: Resolved f-string quote nesting by creating a temporary message string. ***
-        position_msg = ('FLAT' if is_flat 
-                        else f"{current_position['direction'].upper()} {current_position['quantity']:.4f} ATOM (PnL: {current_position['pnl']:.4f} USDT)")
-        print(f"Position Status: {position_msg}")
-
-        # --- STEP 5: Trade Execution (Open/Increase Position) ---
-        
-        can_open_trade = False
-        
-        if not ml_model_trained:
-            # BOOTSTRAP CHECK (FIXED PREVIOUSLY)
-            if is_flat and pred_pnl > 0.0:
-                print("TRADE BOOTSTRAP: Allowing initial trade to gather first PnL data points (ML untrained, positive signal, flat).")
-                can_open_trade = True
-            else:
-                # *** CLARIFIED LOGGING ***
-                print("TRADE BLOCKED: ML model is untrained and cannot bootstrap (position already open or no positive signal).")
-                can_open_trade = False
-        elif pred_pnl <= 0.0:
-            # *** CLARIFIED LOGGING ***
-            print(f"TRADE BLOCKED: Predicted PnL ({pred_pnl:.6f}) is not positive.")
-            can_open_trade = False
-        elif confidence < WIN_CONFIDENCE_THRESHOLD:
-            # *** CLARIFIED LOGGING ***
-            print(f"TRADE BLOCKED: Confidence ({confidence:.2f}) is below threshold ({WIN_CONFIDENCE_THRESHOLD}).")
-            can_open_trade = False
-        else:
-            # All ML gates passed (trained, positive PnL, high confidence)
-            can_open_trade = True
-
-
-        if can_open_trade:
-            # All ML gates passed, calculate quantity
-            quantity_to_trade = calculate_adaptive_quantity(
-                wallet_balance, 
-                current_position, 
-                pred_pnl, 
-                pred_direction
+            scaler, ml_model, initial_fit_done, ml_accuracy = setup_and_train_ml_model(
+                historical_df, scaler, ml_model, initial_fit_done
             )
-            
-            if quantity_to_trade > 0.0:
-                # *** Direction Conflict Check (Important Gate) ***
-                if not is_flat and current_position['direction'] != pred_direction:
-                    print("TRADE BLOCKED: Cannot reverse. Waiting for existing opposite position to close before opening new direction.")
-                else:
-                    success, trade_msg = execute_trade(quantity_to_trade, pred_direction, current_position, (bid, ask))
-                    print(f"TRADE EXECUTION RESULT: {trade_msg}")
-                    
-                    if success:
-                        # *** ROBUSTNESS FIX: Only update historical_df upon successful execution ***
-                        historical_df.loc[historical_df.index[-1], 'trade_size'] = quantity_to_trade
-                        historical_df.loc[historical_df.index[-1], 'direction'] = pred_direction
-                        # Re-read position immediately after successful open/increase
-                        current_position = parse_position_info()
-                    
-            else:
-                 # *** CLARIFIED LOGGING (Risk Cap/Sizing Hold) ***
-                 print("TRADE BLOCKED: Adaptive sizing returned 0.0 quantity (Risk cap, margin, or Martingale conditions not met).")
-        
-        # --- STEP 6: Dashboard Update & Persistence ---
-        current_pnl = current_position['pnl'] if current_position else 0.0
-        update_dashboard(wallet_balance, current_position, pred_pnl, confidence, ml_accuracy, realized_wins, realized_losses)
-        
-        try:
-            # Save historical data in every loop for resilience
-            historical_df.to_csv('historical_data.csv')
-        except Exception as e:
-            print(f"WARNING: Could not save historical data: {e}")
-            
-        # --- STEP 7: Delay for loop interval ---
-        elapsed = time.time() - start_time
-        sleep_time = max(0, INTERVAL_SECONDS - elapsed)
-        # print(f"Loop time: {elapsed:.2f}s. Sleeping for {sleep_time:.2f}s.")
-        time.sleep(sleep_time)
+            print(f"ML Model Trained (Accuracy: {ml_accuracy:.2f}%)")
 
-if __name__ == "__main__":
+        # --- Adaptive Threshold Calculation ---
+        # The higher the accuracy, the lower the required probability can be, 
+        # allowing the bot to trade more frequently with high-confidence models.
+        # Linearly scales between BASE_PROBABILITY_THRESHOLD (at 100% accuracy) 
+        # and 0.99 (at 0% accuracy).
+        accuracy_ratio = max(0.0, min(1.0, ml_accuracy / 100.0))
+        # The threshold gets tighter (closer to 0.99) as accuracy drops toward 0.
+        adaptive_threshold = 0.99 - (0.99 - BASE_PROBABILITY_THRESHOLD) * accuracy_ratio
+        
+        # 4. Get Prediction
+        prob_buy, prob_sell, prob_hold, signal = get_ml_prediction(
+            historical_df, scaler, ml_model, adaptive_threshold
+        )
+        print(f"Prediction: {signal.upper()} | Prob Buy: {prob_buy:.4f}, Prob Sell: {prob_sell:.4f} (Required: {adaptive_threshold:.4f})")
+        
+        # --- Adaptive Risk Management ---
+        # Risk scales with confidence: Max risk at 100% accuracy (e.g., 2%), Min risk at 0% (e.g., 0.5%)
+        MAX_RISK_PERCENT = 0.02 # 2.0%
+        MIN_RISK_PERCENT = 0.005 # 0.5%
+        adaptive_risk_percent = MIN_RISK_PERCENT + (MAX_RISK_PERCENT - MIN_RISK_PERCENT) * accuracy_ratio
+        
+        # 5. Position Management
+        wallet_balance = get_wallet_balance()
+        current_position = parse_position_info(historical_df)
+        
+        # Check for SL/TP/T-SL hit
+        historical_df, position_closed, pnl_realized, status_msg, position_entry_time = check_risk_targets(
+            current_position, (bid, ask), historical_df, position_entry_time
+        )
+        print(f"Risk Check Status: {status_msg}")
+        
+        if position_closed:
+            # Update realized stats
+            if pnl_realized > 0:
+                realized_wins += 1
+                print(f"POSITION CLOSED: WIN (+{pnl_realized:.4f} USDT) | Total Wins/Losses: {realized_wins}/{realized_losses}")
+            else:
+                realized_losses += 1
+                print(f"POSITION CLOSED: LOSS ({pnl_realized:.4f} USDT) | Total Wins/Losses: {realized_wins}/{realized_losses}")
+            current_position = None
+            position_entry_time = None # Ensure entry time is reset
+        
+        # 6. Execute New Trade
+        if current_position is None:
+            if signal in ['buy', 'sell']:
+                # Need sufficient data for ATR-based SL/TP calculation
+                if len(historical_df) < VOLATILITY_WINDOW:
+                     print("WAITING: Insufficient data for dynamic risk sizing.")
+                     continue
+                     
+                mid_price = (bid + ask) / 2
+                
+                # Use a mock volatility measure for initial sizing before parse_position_info runs after trade
+                if historical_df.empty or 'atr' not in historical_df.columns:
+                    print("WAITING: ATR not yet calculated for sizing.")
+                    continue
+                
+                # Mock a stop loss distance for sizing calculation
+                volatility_atr = historical_df['atr'].iloc[-1]
+                sl_distance_mock = volatility_atr * ATR_MULTIPLIER_SL
+                
+                # Mock SL price level based on current mid_price and distance
+                if signal == 'buy':
+                    sl_price_level_mock = mid_price - sl_distance_mock
+                else:
+                    sl_price_level_mock = mid_price + sl_distance_mock
+                    
+                quantity_to_trade = calculate_volatility_quantity(
+                    wallet_balance, mid_price, sl_price_level_mock, signal, adaptive_risk_percent
+                )
+                
+                if quantity_to_trade > MIN_QTY:
+                    success, msg = execute_trade(quantity_to_trade, signal, current_position)
+                    print(msg)
+                    if success:
+                        # Set entry time for T-SL tracking if trade was successful
+                        position_entry_time = datetime.now()
+                else:
+                    print(f"HOLD: Calculated quantity {quantity_to_trade:.4f} is too small.")
+            else:
+                print("HOLD: No high-confidence signal.")
+
+        # 7. Update Dashboard
+        update_dashboard(
+            wallet_balance, 
+            current_position, 
+            prob_buy, 
+            prob_sell, 
+            ml_accuracy, 
+            realized_wins, 
+            realized_losses, 
+            adaptive_threshold, 
+            adaptive_risk_percent,
+            position_entry_time # Pass the entry time explicitly
+        )
+
+        # 8. Wait for next cycle
+        end_time = time.time()
+        elapsed = end_time - start_time
+        sleep_duration = max(0, INTERVAL_SECONDS - elapsed)
+        print(f"Cycle finished in {elapsed:.2f}s. Sleeping for {sleep_duration:.2f}s.")
+        time.sleep(sleep_duration)
+
+if __name__ == '__main__':
+    # Initial setup before the main loop starts
+    close_all_positions_on_start()
+    
+    # Run the main bot logic
     try:
         main()
     except KeyboardInterrupt:
-        print("\nBot interrupted by user. Exiting gracefully.")
+        print("\nBot stopped by user (KeyboardInterrupt).")
     except Exception as e:
-        print(f"CRITICAL ERROR in main loop: {e}")
+        print(f"\nCRITICAL BOT FAILURE: {e}")
+        time.sleep(5) # Wait before exiting to allow console visibility
