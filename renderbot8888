@@ -22,20 +22,21 @@ MIN_QTY = 0.001
 MIN_TRADE_QTY_FACTOR = 1       
 DECIMAL_PRECISION = len(str(MIN_QTY).split('.')[-1]) 
 DASHBOARD_PATH = '/var/www/html/dashboard.html'
-MAX_HISTORY = 400              # Increased data points for better Hurst/GBM training
-TRAINING_INTERVAL = 1          # Train every step for max adaptation
-FEE_RATE = 0.0006              # Est. Taker fee (0.06%)
+MAX_HISTORY = 400              
+TRAINING_INTERVAL = 1          
+FEE_RATE = 0.0006              
 
-# V4.0 Strategy Parameters
+# V5.0 Strategy Parameters
 TARGET_PROFIT_PCT = 0.00015    
 GRID_STEP_PCT = 0.001          
-INITIAL_ENTRY_RISK_CAP = 0.005 # Cap initial entry risk at 0.5% of total wallet
+INITIAL_ENTRY_RISK_CAP = 0.005 
 UHF_SLEEP_SECONDS = 0.05 
 
-# V4.0 Risk Management Parameters
-MAX_PNL_LOSS_PCT = 0.05        # Hard Stop Loss: Max 5% unrealized loss on position value
-RECOVERY_CONFIDENCE_MIN = 60.0 # Higher confidence required for averaging down
-MIN_VOLATILITY_FACTOR = 0.0001 # A baseline volatility measure for size scaling
+# V5.0 Risk Management Parameters
+RECOVERY_CONFIDENCE_MIN = 60.0 
+MIN_VOLATILITY_FACTOR = 0.0001 
+ATR_MULTIPLIER = 2.0           # V5.0: Dynamic Stop Loss is 2.0 * ATR
+ATR_PERIOD = 10                # V5.0: Period for ATR calculation
 
 # Dashboard Configuration
 SPREAD_TIGHT_THRESHOLD = 0.0005 
@@ -52,27 +53,22 @@ logger = logging.getLogger()
 
 def calculate_hurst_exponent(series, max_lag=20):
     """V4.0: Calculates the Hurst Exponent (H) using Rescaled Range (R/S) analysis."""
+    # (Implementation remains the same as V4.0 for continuity)
     lags = range(2, max_lag)
-    # 1. Calculate the standard deviation of differences
     tau = [np.std(series.diff().dropna())]
-    if tau[0] == 0: return 0.5 # Handle zero volatility
+    if tau[0] == 0: return 0.5 
     
-    # 2. Calculate the Rescaled Range (R/S) for each lag
     rs_data = []
     for lag in lags:
-        # Split series into chunks of size 'lag'
         chunks = [series.iloc[i:i + lag] for i in range(0, len(series) - lag + 1, lag)]
         if not chunks: continue
         
-        # Calculate R/S for each chunk
         rs_values = []
         for chunk in chunks:
             if len(chunk) < lag: continue
             mean = chunk.mean()
-            # Calculate deviation and cumulative deviation (Y_t)
             y_t = (chunk - mean).cumsum()
             
-            # Calculate Range (R) and Standard Deviation (S)
             R = y_t.max() - y_t.min()
             S = chunk.std()
             if S > 0:
@@ -81,19 +77,17 @@ def calculate_hurst_exponent(series, max_lag=20):
         if rs_values:
             rs_data.append(np.mean(rs_values))
 
-    # 3. Fit linear regression on log(R/S) vs log(lag)
-    if len(rs_data) < 5: return 0.5 # Not enough data points
+    if len(rs_data) < 5: return 0.5 
     
-    # Remove logs of zero
     log_lags = np.log(list(lags)[:len(rs_data)])
     log_rs = np.log(rs_data)
 
     if len(log_lags) > 1 and len(log_lags) == len(log_rs):
         model = OLS(log_rs, log_lags).fit()
         H = model.params[0]
-        return max(0.0, min(1.0, H)) # Clamp H between 0 and 1
+        return max(0.0, min(1.0, H)) 
         
-    return 0.5 # Default to random walk
+    return 0.5 
 
 # ------------------------------------------------------------------------------
 # SYSTEM INTERFACE (Bash Scripts)
@@ -101,8 +95,8 @@ def calculate_hurst_exponent(series, max_lag=20):
 class SystemInterface:
     @staticmethod
     def run_command(command_list):
+        # (Implementation remains the same as V4.0)
         try:
-            # Command logic remains the same as V3.0
             result = subprocess.run(command_list, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=3)
             return result.stdout.strip()
         except Exception as e:
@@ -173,6 +167,7 @@ class SystemInterface:
 # WALLET LEARNER (ADAPTIVE RISK MODE)
 # ------------------------------------------------------------------------------
 class WalletLearner:
+    # (Implementation remains the same as V4.0)
     def __init__(self):
         self.initial_balance = 0.0
         self.current_balance = 0.0
@@ -194,7 +189,6 @@ class WalletLearner:
             self.adapt_strategy(delta)
 
     def adapt_strategy(self, delta):
-        # V3.0 Adaptive risk logic maintained
         growth_pct = self.get_growth_pct()
 
         if delta > 0:
@@ -227,10 +221,13 @@ class AIEngine:
         self.last_prediction_proba = 0.5
         self.confidence = 0.0
         self.avg_volatility = 0.0 
-        self.hurst_exponent = 0.5 # V4.0: New feature
+        self.hurst_exponent = 0.5 
+        self.current_atr = 0.0 # V5.0: New feature
 
     def fetch_price(self):
+        """V5.0: Fetching Order Book with limit=5 for BAPI calculation."""
         try:
+            # We fetch up to 5 levels to ensure L1, L2, L3 are available for BAPI
             ob = self.exchange.fetch_order_book(SYMBOL_CCXT, limit=5)
             ticker = self.exchange.fetch_ticker(SYMBOL_CCXT)
             
@@ -239,8 +236,8 @@ class AIEngine:
                 'ask': ticker['ask'],
                 'last': ticker['last'],
                 'timestamp': datetime.now(),
-                'bid_vol': sum([q for p, q in ob['bids']]),
-                'ask_vol': sum([q for p, q in ob['asks']]),
+                'bids': ob['bids'][:3], # Top 3 levels for BAPI
+                'asks': ob['asks'][:3], # Top 3 levels for BAPI
             }
         except Exception as e:
             logger.error(f"CCXT Error: {e}")
@@ -248,6 +245,13 @@ class AIEngine:
 
     def update_data(self, price_data):
         new_row = pd.DataFrame([price_data])
+        
+        # Extract L1 volume for compatibility with old imbalance feature
+        bid_vol = new_row['bids'].apply(lambda x: x[0][1] if x and len(x[0])>1 else 0).iloc[0]
+        ask_vol = new_row['asks'].apply(lambda x: x[0][1] if x and len(x[0])>1 else 0).iloc[0]
+        new_row['bid_vol'] = bid_vol
+        new_row['ask_vol'] = ask_vol
+
         if self.history.empty:
             self.history = new_row
         else:
@@ -258,30 +262,56 @@ class AIEngine:
 
     def calculate_features(self, df):
         df = df.copy()
-        
         df['mid_price'] = (df['bid'] + df['ask']) / 2
         
-        # V4.0: Time Decay EWMA Features (Faster reaction)
+        # V4.0 Features (EWMA, Imbalance, RSI, Momentum)
         df['ewma_3'] = df['mid_price'].ewm(span=3, adjust=False).mean()
         df['ewma_5'] = df['mid_price'].ewm(span=5, adjust=False).mean()
-        
         df['total_vol'] = df['bid_vol'] + df['ask_vol']
         df['imbalance'] = (df['bid_vol'] - df['ask_vol']) / df['total_vol'].replace(0, 1)
 
         delta = df['mid_price'].diff()
-        gain = (delta.where(delta > 0, 0)).ewm(span=5, adjust=False).mean() # V4.0 EWMA
-        loss = (-delta.where(delta < 0, 0)).ewm(span=5, adjust=False).mean() # V4.0 EWMA
+        gain = (delta.where(delta > 0, 0)).ewm(span=5, adjust=False).mean()
+        loss = (-delta.where(delta < 0, 0)).ewm(span=5, adjust=False).mean()
         rs = gain / loss
         df['rsi'] = 100 - (100 / (1 + rs))
-        df['volatility'] = df['mid_price'].pct_change().ewm(span=5, adjust=False).std() # V4.0 EWMA
+        df['volatility'] = df['mid_price'].pct_change().ewm(span=5, adjust=False).std()
         df['momentum'] = df['mid_price'] - df['mid_price'].shift(3)
         df['spread'] = df['ask'] - df['bid']
         df['spread_change'] = df['spread'].diff()
         
-        # V4.0: Hurst Exponent Calculation
+        # V4.0: Hurst Exponent
         if len(df) >= 20:
              self.hurst_exponent = calculate_hurst_exponent(df['mid_price'].iloc[-20:])
-        df['hurst'] = self.hurst_exponent # Broadcast the Hurst value to the feature column
+        df['hurst'] = self.hurst_exponent 
+        
+        # V5.0: Bid/Ask Pressure Index (BAPI)
+        # Weights: L1=3, L2=2, L3=1
+        def calculate_bapi(row):
+            bids = row['bids']
+            asks = row['asks']
+            
+            # Extract volumes for L1, L2, L3 (default to 0 if not present)
+            b_v = [b[1] if b and len(b)==2 else 0 for b in bids]
+            a_v = [a[1] if a and len(a)==2 else 0 for a in asks]
+
+            bid_pressure = (b_v[0] * 3) + (b_v[1] * 2) + (b_v[2] * 1) if len(b_v) >= 3 else 0
+            ask_pressure = (a_v[0] * 3) + (a_v[1] * 2) + (a_v[2] * 1) if len(a_v) >= 3 else 0
+            
+            total_pressure = bid_pressure + ask_pressure
+            if total_pressure == 0: return 0.0
+            
+            return (bid_pressure - ask_pressure) / total_pressure
+
+        # Apply BAPI calculation only to the most recent row efficiently
+        last_bapi = calculate_bapi(df.iloc[-1]) if not df.empty else 0.0
+        df['bapi'] = last_bapi # Broadcast for training
+        
+        # V5.0: Average True Range (ATR)
+        # Using High and Low based on the Mid Price plus/minus half the spread
+        df['true_range'] = df['spread']
+        df['atr'] = df['true_range'].ewm(span=ATR_PERIOD, adjust=False).mean()
+        self.current_atr = df['atr'].iloc[-1] if not df.empty and 'atr' in df.columns else 0.0
         
         # TARGET - Predict Direction (1: up, -1: down)
         target_returns = df['mid_price'].pct_change().shift(-1)
@@ -298,9 +328,9 @@ class AIEngine:
         
         if df_all.empty: return 0, 0
 
-        # V4.0: Added 'hurst' to features
+        # V5.0: Added 'bapi' to features
         feature_cols = ['ewma_3', 'ewma_5', 'imbalance', 'rsi', 'volatility', 
-                        'spread', 'momentum', 'spread_change', 'hurst'] 
+                        'spread', 'momentum', 'spread_change', 'hurst', 'bapi'] 
         
         X_current = df_all.iloc[[-1]][feature_cols]
         df_train = df_all.iloc[:-1]
@@ -316,7 +346,7 @@ class AIEngine:
         
         if len(y_filtered) < 10: return 0, 0 
 
-        # Update simulation performance logic remains the same
+        # Update simulation performance (maintained from V4.0)
         if self.is_trained:
             X_prev = df_all.iloc[[-2]][feature_cols]
             actual_signal = df_all.iloc[-2]['signal']
@@ -368,7 +398,7 @@ class TradingBot:
         self.action_history = deque(maxlen=5) 
 
     def calculate_pnl(self, qty, entry, price_info):
-        # PnL calculation remains the same as V3.0
+        # PnL calculation remains the same
         is_long = qty > 0
         curr_price = price_info['bid'] if is_long else price_info['ask']
         
@@ -390,27 +420,19 @@ class TradingBot:
 
     def calculate_position_size(self, wallet, execution_price):
         """V4.0: Calculates position size based on Volatility-Adjusted Sizing (VAS)."""
+        # (Implementation remains the same as V4.0)
         current_volatility = self.ai.history['volatility'].iloc[-1] if not self.ai.history.empty and 'volatility' in self.ai.history.columns else MIN_VOLATILITY_FACTOR
         current_volatility = max(current_volatility, MIN_VOLATILITY_FACTOR)
 
-        # Base size is calculated inversely to volatility
-        # We cap the risk on the entry to a small percentage of the wallet
         base_size_usd = wallet * INITIAL_ENTRY_RISK_CAP
         
-        # Volatility factor: lower volatility gives a bigger multiplier
-        vol_factor = 1 / (current_volatility * 1000) # Scaling factor based on typical UHF volatility
+        vol_factor = 1 / (current_volatility * 1000) 
         
-        # Maximize size but respect wallet risk and minimum quantity
-        raw_qty = (base_size_usd * vol_factor) / execution_price
-        
-        # Apply the overall risk multiplier from the WalletLearner
         usable_wallet_usd = wallet * self.wallet_learner.risk_multiplier
         max_qty_based_on_wallet = usable_wallet_usd / execution_price
         
-        # Final quantity is the minimum of Volatility-Adjusted and Wallet-Capped size
-        final_qty = min(raw_qty, max_qty_based_on_wallet)
+        final_qty = min((base_size_usd * vol_factor) / execution_price, max_qty_based_on_wallet)
         
-        # Ensure it's correctly rounded to minimum tick size
         trade_qty = np.floor(final_qty / MIN_QTY) * MIN_QTY
         trade_qty = max(MIN_QTY, round(trade_qty, DECIMAL_PRECISION)) 
         
@@ -418,31 +440,33 @@ class TradingBot:
 
     def check_liquidity_sweep(self, prediction):
         """V4.0: Checks for a recent liquidity sweep (short-term reversal signal)."""
+        # (Implementation remains the same as V4.0)
         if len(self.ai.history) < 5:
             return False
             
         prices = self.ai.history['mid_price'].iloc[-5:].values
         
         if prediction == 1: # Predicted LONG: Check for recent low sweep
-            # If the current price is near the 5-tick low, it suggests a bottom sweep
             if prices[-1] <= prices.min() * 1.00005: 
                 return True
         
         elif prediction == -1: # Predicted SHORT: Check for recent high sweep
-            # If the current price is near the 5-tick high, it suggests a top sweep
             if prices[-1] >= prices.max() * 0.99995: 
                 return True
                 
         return False
 
 
-    def generate_dashboard(self, wallet, position, price_info, prediction, confidence, action_msg, action_type, avg_volatility, dynamic_threshold, required_pnl_usd, action_history, pnl_pct_of_value, current_volatility, hurst_exponent):
-        # Dashboard logic remains largely the same, with added V4.0 stats
+    def generate_dashboard(self, wallet, position, price_info, prediction, confidence, action_msg, action_type, avg_volatility, dynamic_threshold, required_pnl_usd, action_history, pnl_pct_of_value, current_volatility, hurst_exponent, current_atr):
+        # Dashboard logic updated for V5.0
         unrealized_pnl = 0.0
         target_price = 0.0
+        stop_loss_price = 0.0
         
         pos_dir = "FLAT"
         pos_qty_display = "0.000"
+        
+        bapi = self.ai.history['bapi'].iloc[-1] if not self.ai.history.empty and 'bapi' in self.ai.history.columns else 0.0
         
         if position['has_position']:
             net_pnl, _, _ = self.calculate_pnl(position['qty'], position['entry_price'], price_info)
@@ -456,10 +480,15 @@ class TradingBot:
             pos_qty_display = f"{abs(qty):.{DECIMAL_PRECISION}f}"
             
             if abs(qty) > 0:
+                # Target price calculation remains the same (fixed profit target)
                 if is_long:
                     target_price = entry + (required_pnl_usd / abs(qty))
+                    # V5.0 Dynamic Stop Loss: Entry - (ATR * Multiplier)
+                    stop_loss_price = entry - (current_atr * ATR_MULTIPLIER) 
                 else:
                     target_price = entry - (required_pnl_usd / abs(qty))
+                    # V5.0 Dynamic Stop Loss: Entry + (ATR * Multiplier)
+                    stop_loss_price = entry + (current_atr * ATR_MULTIPLIER)
         
         pnl_class = "neutral-text"
         if unrealized_pnl > 0: pnl_class = "success-text"
@@ -509,13 +538,12 @@ class TradingBot:
         if not history_html:
             history_html = "<div class='log-entry neutral-pos'>Awaiting first action...</div>"
 
-        imbalance = price_info.get('imbalance', 0)
-        imbalance_class = 'success-text' if imbalance > 0.1 else ('danger-text' if imbalance < -0.1 else 'neutral-text')
-        imbalance_text = 'BUY Pressure' if imbalance > 0 else ('SELL Pressure' if imbalance < 0 else 'Balanced')
+        # BAPI Display (V5.0)
+        bapi_class = 'success-text' if bapi > 0.1 else ('danger-text' if bapi < -0.1 else 'neutral-text')
+        bapi_text = 'BUY Pressure' if bapi > 0.1 else ('SELL Pressure' if bapi < -0.1 else 'Balanced')
         
         risk_class = 'danger-text' if pnl_pct_of_value < -0.01 else 'success-text'
         
-        # V4.0: Hurst Exponent Display
         hurst_class = 'success-text' if hurst_exponent > 0.55 else ('danger-text' if hurst_exponent < 0.45 else 'neutral-text')
         hurst_text = 'Trending' if hurst_exponent > 0.55 else ('Mean-Reverting' if hurst_exponent < 0.45 else 'Random Walk')
 
@@ -526,9 +554,9 @@ class TradingBot:
             <meta charset="UTF-8">
             <meta http-equiv="refresh" content="0.5"> 
             <meta name="viewport" content="width=device-width, initial-scale=1.0">
-            <title>UHF SCALPER COMMAND CENTER V4.0</title>
+            <title>UHF SCALPER COMMAND CENTER V5.0</title>
             <style>
-                @import url('https://fonts.googleapis.com/css2?family=Orbitron:wght@400;700;900&family=Roboto+Mono:wght[300;400;700}&display=swap');
+                @import url('https://fonts.googleapis.com/css2?family=Orbitron:wght@400;700;900&family=Roboto+Mono:wght@300;400;700&display=swap');
                 
                 :root {{
                     --bg-dark: #070D12;
@@ -703,7 +731,7 @@ class TradingBot:
             </style>
         </head>
         <body>
-            <div class="header">UHF SCALPER V4.0: DEEP MOMENTUM & SMART LIQUIDITY HARVESTING / {SYMBOL_CCXT}</div>
+            <div class="header">UHF SCALPER V5.0: ORDER FLOW SYNTHESIS & MICROSECOND OPTIMIZATION / {SYMBOL_CCXT}</div>
             
             <div class="container">
                 <div class="status-bar {pos_class}">
@@ -720,6 +748,7 @@ class TradingBot:
                             <h2>NET UNREALIZED PNL</h2>
                             <div class="value pnl {pnl_class}">{unrealized_pnl:.6f} USDT</div>
                             <div class="sub">PnL % of Position Value: <span class="{risk_class}">{(pnl_pct_of_value*100):.2f}%</span></div>
+                            <div class="sub" style="margin-top: 10px;">DYNAMIC STOP LOSS PRICE: <span class="danger-text">{stop_loss_price:.6f}</span></div>
                         </div>
                         
                         <!-- AI CONFIDENCE GAUGE -->
@@ -764,27 +793,27 @@ class TradingBot:
                 <div class="grid-bottom">
                     
                     <div class="card">
-                        <h2>MARKET REGIME (HURST)</h2>
-                        <div class="value {hurst_class}">{hurst_exponent:.4f}</div>
-                        <div class="sub">Regime: {hurst_text}</div>
+                        <h2>ORDER FLOW (BAPI V5.0)</h2>
+                        <div class="value {bapi_class}">{bapi:.4f}</div>
+                        <div class="sub">Pressure: {bapi_text} (Top 3 Levels)</div>
                     </div>
 
                     <div class="card">
-                        <h2>CURRENT VOLATILITY (V4.0 SIZING)</h2>
-                        <div class="value danger-text">{current_volatility:.6f}</div>
-                        <div class="sub">Position size adjusts inversely to this value.</div>
+                        <h2>AVERAGE TRUE RANGE (ATR)</h2>
+                        <div class="value neutral-text">{current_atr:.6f}</div>
+                        <div class="sub">Stop Loss Width: {current_atr * ATR_MULTIPLIER:.6f}</div>
+                    </div>
+                    
+                    <div class="card">
+                        <h2>MARKET REGIME (HURST)</h2>
+                        <div class="value {hurst_class}">{hurst_exponent:.4f}</div>
+                        <div class="sub">Regime: {hurst_text}</div>
                     </div>
                     
                     <div class="card">
                         <h2>ACCOUNT BALANCE</h2>
                         <div class="value success-text">${wallet:.6f}</div>
                         <div class="sub">Growth YTD: <span class="{growth_class}">{growth_pct:.6f}%</span></div>
-                    </div>
-                    
-                    <div class="card">
-                        <h2>ORDER BOOK IMBALANCE</h2>
-                        <div class="value {imbalance_class}">{imbalance:.4f}</div>
-                        <div class="sub">Pressure: {imbalance_text}</div>
                     </div>
                 </div>
             </div>
@@ -802,12 +831,13 @@ class TradingBot:
             logger.error(f"Failed to write dashboard: {e}")
 
     def run(self):
-        logger.info("Starting UHF SCALPER V4.0: Deep Momentum & Smart Liquidity Harvesting Bot...")
+        logger.info("Starting UHF SCALPER V5.0: Order Flow Synthesis & Microsecond Optimization Bot...")
         self.sys.close_all_positions()
         
         initial_wallet = self.sys.get_wallet_balance()
         self.wallet_learner.update_balance(initial_wallet)
         current_volatility = MIN_VOLATILITY_FACTOR
+        current_atr = 0.0
         
         while self.running:
             try:
@@ -815,6 +845,7 @@ class TradingBot:
                 action_type = "SCANNING"
                 pnl_pct_of_value = 0.0
                 
+                # --- LOW LATENCY DATA FETCH ---
                 wallet = self.sys.get_wallet_balance()
                 self.wallet_learner.update_balance(wallet)
                 dynamic_threshold = self.wallet_learner.dynamic_threshold
@@ -828,6 +859,7 @@ class TradingBot:
 
                 self.ai.update_data(price_data)
                 
+                # --- AI DECISION BLOCK ---
                 if self.iteration % TRAINING_INTERVAL == 0:
                     prediction, confidence = self.ai.train_and_predict()
                 else:
@@ -836,10 +868,10 @@ class TradingBot:
                 
                 avg_volatility = self.ai.avg_volatility 
                 hurst_exponent = self.ai.hurst_exponent
+                current_atr = self.ai.current_atr # V5.0 ATR
                 required_pnl_usd = 0.0
                 
                 # Pre-calculate size based on current market volatility (V4.0)
-                # This only calculates the size target, doesn't execute the trade yet
                 dummy_qty, current_volatility = self.calculate_position_size(wallet, price_data['last']) 
                 
                 # ---------------------------------------------------------
@@ -855,12 +887,22 @@ class TradingBot:
                     action_log = f"PnL: {net_pnl:.6f} (Required: {required_pnl_usd:.6f})"
                     action_type = "PROFIT" if net_pnl >= 0 else "RECOVERY"
 
-                    # 1. V3.0 HARD STOP LOSS (Emergency Liquidation)
-                    if pnl_pct_of_value < -MAX_PNL_LOSS_PCT:
-                        logger.critical(f"!!! HARD STOP LOSS TRIGGERED: PNL @ {pnl_pct_of_value*100:.2f}%")
+                    # 1. V5.0 DYNAMIC TRAILING STOP LOSS (Volatility-Adjusted Exit)
+                    stop_loss_trigger = current_atr * ATR_MULTIPLIER
+                    
+                    # Calculate current loss based on ATR distance
+                    if is_long:
+                        loss_usd = entry - price_data['bid'] 
+                    else:
+                        loss_usd = price_data['ask'] - entry
+
+                    loss_pct_of_entry = loss_usd / entry 
+
+                    if loss_pct_of_entry > stop_loss_trigger / entry:
+                        logger.critical(f"!!! DYNAMIC STOP LOSS TRIGGERED: ATR Loss {loss_usd:.6f}")
                         side = 'sell' if is_long else 'buy'
                         self.sys.place_order(BASE_COIN, abs(qty), side)
-                        action_log = f"STOP LOSS: {pnl_pct_of_value*100:.2f}% loss"
+                        action_log = f"STOP LOSS: {loss_pct_of_entry*100:.2f}% (ATR Exit)"
                         action_type = "STOP_LOSS"
                         continue 
 
@@ -876,11 +918,9 @@ class TradingBot:
                     elif net_pnl > 0 and confidence > 55.0 and (
                         (is_long and prediction == 1) or (not is_long and prediction == -1)
                     ):
-                        # V4.0: Use Volatility-Adjusted Sizing for compounding, but only for the ADDED size
                         add_qty, _ = self.calculate_position_size(wallet, price_data['last'])
                         
                         side = 'buy' if is_long else 'sell'
-                        # Check if adding this much pushes us over the wallet limit
                         if (add_qty * price_data['last'] + abs(qty) * entry) < (wallet * self.wallet_learner.risk_multiplier):
                             self.sys.place_order(BASE_COIN, add_qty, side)
                             action_log = f"Compound: +{add_qty} QTY (VAS)"
@@ -889,12 +929,10 @@ class TradingBot:
                     # 4. SMARTER GRID RECOVERY (Averaging down into a loss)
                     elif pnl_pct_of_value < -GRID_STEP_PCT and confidence > RECOVERY_CONFIDENCE_MIN:
                         if (is_long and prediction == 1) or (not is_long and prediction == -1):
-                            # V4.0: Use Volatility-Adjusted Sizing for recovery, but size it 1.5x larger
                             recovery_qty, _ = self.calculate_position_size(wallet, price_data['last'])
-                            recovery_qty *= 1.5 # Aggressive size multiplier for recovery
+                            recovery_qty *= 1.5 
 
                             side = 'buy' if is_long else 'sell'
-                            # Check wallet limit before placing order
                             if (recovery_qty * price_data['last'] + abs(qty) * entry) < (wallet * self.wallet_learner.risk_multiplier):
                                 self.sys.place_order(BASE_COIN, recovery_qty, side)
                                 action_log = f"Grid Down: +{recovery_qty} QTY (VAS)"
@@ -902,16 +940,21 @@ class TradingBot:
 
                 else:
                     # -----------------------------------------------------
-                    # NEW MIN-QUANTITY ENTRY (V4.0: VAS + LIQUIDITY FILTER)
+                    # NEW MIN-QUANTITY ENTRY (V5.0: ATR+LS+BAPI)
                     # -----------------------------------------------------
                     if self.ai.is_trained and confidence > dynamic_threshold: 
                         
                         if prediction == 1:
                             execution_price = price_data['ask']
                             side = 'buy'
+                            # V5.0: Check if BAPI confirms long pressure
+                            if self.ai.history['bapi'].iloc[-1] < 0.1: continue
+                            
                         elif prediction == -1:
                             execution_price = price_data['bid']
                             side = 'sell'
+                            # V5.0: Check if BAPI confirms short pressure
+                            if self.ai.history['bapi'].iloc[-1] > -0.1: continue
                         else:
                             continue # Neutral signal
                             
@@ -926,7 +969,7 @@ class TradingBot:
 
                         if (trade_qty * execution_price) < (wallet * self.wallet_learner.risk_multiplier):
                             self.sys.place_order(BASE_COIN, trade_qty, side)
-                            action_log = f"Entry (VAS+LS): {side.upper()} {trade_qty} (C:{confidence:.1f}%)"
+                            action_log = f"Entry (V5.0/BAPI): {side.upper()} {trade_qty} (C:{confidence:.1f}%)"
                             action_type = "ENTRY"
                             
                 # --- UPDATE ACTION HISTORY ---
@@ -936,8 +979,10 @@ class TradingBot:
                         'message': action_log,
                         'class': action_type.lower()
                     })
-
-                self.generate_dashboard(wallet, pos_data, price_data, prediction, confidence, action_log, action_type, avg_volatility, dynamic_threshold, required_pnl_usd, list(self.action_history), pnl_pct_of_value, current_volatility, hurst_exponent)
+                
+                # --- DASHBOARD GENERATION (Low Priority) ---
+                self.generate_dashboard(wallet, pos_data, price_data, prediction, confidence, action_log, action_type, avg_volatility, dynamic_threshold, required_pnl_usd, list(self.action_history), pnl_pct_of_value, current_volatility, hurst_exponent, current_atr)
+                
                 self.iteration += 1
                 time.sleep(UHF_SLEEP_SECONDS) 
 
