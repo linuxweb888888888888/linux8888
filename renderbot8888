@@ -34,6 +34,9 @@ INITIAL_ENTRY_SIZE_MULTIPLIER = 2.0
 # MAX SPEED: Time to wait between loop iterations (50ms)
 UHF_SLEEP_SECONDS = 0.05 
 
+# Dashboard Configuration
+SPREAD_TIGHT_THRESHOLD = 0.0005 # Max spread considered 'tight' for display
+
 # ------------------------------------------------------------------------------
 # LOGGING SETUP
 # ------------------------------------------------------------------------------
@@ -299,20 +302,32 @@ class TradingBot:
         self.running = True
         self.iteration = 0
 
-    def generate_dashboard(self, wallet, position, price_info, prediction, confidence, action_msg, avg_volatility):
+    def generate_dashboard(self, wallet, position, price_info, prediction, confidence, action_msg, action_type, avg_volatility, dynamic_threshold, required_pnl_usd):
         unrealized_pnl = 0.0
-        pnl_class = "neutral"
+        target_price = 0.0
         
         if position['has_position']:
             qty = position['qty']
             entry = position['entry_price']
-            curr_price = price_info['bid'] if qty > 0 else price_info['ask']
             
-            if qty > 0: unrealized_pnl = (curr_price - entry) * qty
+            # 1. PNL Calculation
+            is_long = qty > 0
+            curr_price = price_info['bid'] if is_long else price_info['ask']
+            
+            if is_long: unrealized_pnl = (curr_price - entry) * abs(qty)
             else: unrealized_pnl = (entry - curr_price) * abs(qty)
-                
-            if unrealized_pnl > 0: pnl_class = "success"
-            elif unrealized_pnl < 0: pnl_class = "danger"
+            
+            # 2. Target Price Calculation
+            if abs(qty) > 0:
+                if is_long:
+                    target_price = entry + (required_pnl_usd / abs(qty))
+                else:
+                    target_price = entry - (required_pnl_usd / abs(qty))
+        
+        # Style Definitions
+        pnl_class = "neutral"
+        if unrealized_pnl > 0: pnl_class = "success"
+        elif unrealized_pnl < 0: pnl_class = "danger"
 
         sim_acc = 0
         if self.ai.simulation_total > 0:
@@ -324,27 +339,42 @@ class TradingBot:
         ai_signal = 'LONG' if prediction > 0 else 'SHORT'
         signal_color = 'var(--success-green)' if prediction > 0 else ('var(--danger-red)' if prediction < 0 else 'var(--neutral-gray)')
         
-        prediction_val_str = f"{prediction * 10000:.4f} pips" # Show prediction value in pips for clarity
+        prediction_val_str = f"{prediction:.8f}"
+        
+        spread = price_info['ask'] - price_info['bid']
+        spread_status = "Tight" if spread <= SPREAD_TIGHT_THRESHOLD else "Wide"
+        spread_class = "success-text" if spread_status == "Tight" else "danger-text"
+
+        # Action bar style based on action_type
+        action_style = {
+            "SCANNING": "cyan-bar",
+            "ENTRY": "blue-bar",
+            "PROFIT": "success-bar",
+            "RECOVERY": "danger-bar",
+            "COMPOUND": "success-bar",
+            "CLOSE": "success-bar"
+        }.get(action_type, "cyan-bar")
+
 
         html = f"""
         <!DOCTYPE html>
         <html lang="en">
         <head>
             <meta charset="UTF-8">
-            <meta http-equiv="refresh" content="1">
+            <meta http-equiv="refresh" content="0.5"> <!-- Faster refresh for UHF feel -->
             <meta name="viewport" content="width=device-width, initial-scale=1.0">
-            <title>UHF SCALPER DASHBOARD</title>
+            <title>UHF SCALPER COMMAND CENTER</title>
             <style>
-                @import url('https://fonts.googleapis.com/css2?family=Roboto+Mono:wght@300;400;700&display=swap');
+                @import url('https://fonts.googleapis.com/css2?family=Orbitron:wght@400;700;900&family=Roboto+Mono:wght@300;400;700&display=swap');
                 
                 :root {{
-                    --bg-dark: #0A141A;
+                    --bg-dark: #070D12;
                     --card-bg: #101F2B;
-                    --border-color: #00FF99;
-                    --text-light: #E0FFEF;
                     --success-green: #00FF99; /* Neon Green */
                     --danger-red: #FF3366; /* Neon Red */
+                    --accent-blue: #00BFFF; /* Deep Cyan/Blue */
                     --neutral-gray: #4A6D7C;
+                    --text-light: #E0FFEF;
                 }}
 
                 body {{ 
@@ -352,36 +382,41 @@ class TradingBot:
                     background-color: var(--bg-dark); 
                     color: var(--text-light); 
                     margin: 0; 
-                    padding: 20px;
-                    transition: all 0.5s ease;
+                    padding: 15px;
+                    overflow-x: hidden;
                 }}
                 
                 .header {{
+                    font-family: 'Orbitron', sans-serif;
                     text-align: center;
-                    margin-bottom: 20px;
-                    font-size: 1.8rem;
-                    font-weight: 700;
+                    margin-bottom: 25px;
+                    font-size: 2rem;
+                    font-weight: 900;
                     color: var(--success-green);
-                    text-shadow: 0 0 5px var(--success-green);
+                    text-shadow: 0 0 8px rgba(0, 255, 153, 0.7);
                 }}
 
-                /* High-Visibility Action Bar */
+                /* Dynamic Action Bar */
                 .action-bar {{
-                    background: linear-gradient(90deg, #101F2B, #1A3A4A, #101F2B);
-                    border: 2px solid var(--border-color);
+                    border: 2px solid;
                     border-radius: 8px;
                     padding: 15px;
                     margin-bottom: 20px;
                     text-align: center;
                     font-size: 1.2rem;
                     font-weight: 700;
-                    box-shadow: 0 0 10px rgba(0, 255, 153, 0.5);
-                    animation: pulse 1s infinite alternate;
+                    box-shadow: 0 0 10px;
+                    animation: flicker 0.2s infinite alternate;
                 }}
 
-                @keyframes pulse {{
-                    from {{ opacity: 0.9; box-shadow: 0 0 5px var(--success-green); }}
-                    to {{ opacity: 1.0; box-shadow: 0 0 15px var(--success-green); }}
+                .success-bar {{ border-color: var(--success-green); color: var(--success-green); box-shadow-color: rgba(0, 255, 153, 0.5); }}
+                .danger-bar {{ border-color: var(--danger-red); color: var(--danger-red); box-shadow-color: rgba(255, 51, 102, 0.5); }}
+                .cyan-bar {{ border-color: var(--accent-blue); color: var(--accent-blue); box-shadow-color: rgba(0, 191, 255, 0.5); }}
+                .blue-bar {{ border-color: var(--accent-blue); color: var(--accent-blue); box-shadow-color: rgba(0, 191, 255, 0.5); }}
+
+                @keyframes flicker {{
+                    from {{ opacity: 0.98; }}
+                    to {{ opacity: 1.0; }}
                 }}
                 
                 .container {{ 
@@ -397,42 +432,47 @@ class TradingBot:
                     border-radius: 8px; 
                     padding: 20px; 
                     border: 1px solid var(--neutral-gray);
-                    box-shadow: 0 4px 8px rgba(0, 0, 0, 0.5);
-                    transition: border 0.3s ease;
+                    box-shadow: 0 4px 10px rgba(0, 0, 0, 0.6);
+                    overflow: hidden;
                 }}
 
-                .card.success {{ border-color: var(--success-green); }}
-                .card.danger {{ border-color: var(--danger-red); }}
+                .card.pnl-block {{ border-left: 4px solid {'var(--success-green)' if unrealized_pnl > 0 else 'var(--danger-red)' if unrealized_pnl < 0 else 'var(--neutral-gray)'}; }}
                 
                 h2 {{ 
+                    font-family: 'Orbitron', sans-serif;
                     margin-top: 0; 
-                    font-size: 0.9rem; 
+                    font-size: 0.8rem; 
                     color: var(--success-green);
                     text-transform: uppercase;
-                    letter-spacing: 2px;
+                    letter-spacing: 3px;
                     border-bottom: 1px dashed var(--neutral-gray);
                     padding-bottom: 5px;
                     margin-bottom: 10px;
                 }}
                 
                 .value {{ 
-                    font-size: 2.0rem; 
+                    font-size: 1.8rem; 
                     font-weight: 700; 
                     margin-top: 10px; 
                     line-height: 1.1;
-                    word-break: break-all;
                 }}
                 
                 .sub {{ 
                     font-size: 0.8rem; 
                     color: var(--neutral-gray); 
                     margin-top: 5px;
+                    line-height: 1.3;
                 }}
                 
                 .success-text {{ color: var(--success-green); }}
                 .danger-text {{ color: var(--danger-red); }}
-                .neutral-text {{ color: var(--neutral-gray); }}
-                
+                .neutral-text {{ color: var(--accent-blue); }}
+
+                /* Custom Metric Style */
+                .metric-title {{ font-size: 0.75rem; color: var(--neutral-gray); text-transform: uppercase; margin-top: 10px; }}
+                .metric-value {{ font-size: 1rem; font-weight: 700; }}
+                .metric-grid {{ display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-top: 15px; }}
+
                 /* Responsive Adjustments */
                 @media (max-width: 600px) {{
                     body {{ padding: 10px; }}
@@ -442,56 +482,93 @@ class TradingBot:
             </style>
         </head>
         <body>
-            <div class="header">GREENCRYPTO UHF SCALPER BOT</div>
+            <div class="header">UHF SCALPER COMMAND CENTER</div>
             
-            <div class="action-bar">
+            <div class="action-bar {action_style}">
                 {action_msg}
             </div>
             
             <div class="container">
                 
-                <!-- WALLET CARD -->
-                <div class="card success">
-                    <h2>USDT BALANCE & GROWTH</h2>
-                    <div class="value success-text">${wallet:.6f}</div>
-                    <div class="sub">Growth (YTD): <span class="{growth_class}">{growth_pct:.6f}%</span></div>
-                    <div class="sub">Min Entry Conf: {self.wallet_learner.dynamic_threshold:.2f}%</div>
-                </div>
-                
-                <!-- PNL CARD -->
-                <div class="card {pnl_class}">
-                    <h2>UNREALIZED PNL ({SYMBOL_BASH})</h2>
-                    <div class="value" style="color: {'var(--success-green)' if unrealized_pnl > 0 else 'var(--danger-red)' if unrealized_pnl < 0 else 'var(--neutral-gray)'}">{unrealized_pnl:.6f}</div>
-                    <div class="sub">Entry: {position['entry_price']} | Qty: {position['qty']}</div>
-                    <div class="sub">Current Price: {price_info['last']}</div>
-                </div>
-                
-                <!-- AI SIGNAL CARD -->
+                <!-- 1. MARKET DATA / SPREAD CARD -->
                 <div class="card">
-                    <h2>ML SIGNAL & CONFIDENCE</h2>
-                    <div class="value" style="color: {signal_color}">{ai_signal}</div>
-                    <div class="sub">Confidence: <span class="{'success-text' if confidence >= 50 else 'danger-text'}">{confidence:.2f}%</span></div>
-                    <div class="sub">Prediction: {prediction_val_str}</div>
+                    <h2>MARKET LIQUIDITY ({SYMBOL_CCXT})</h2>
+                    <div class="value neutral-text">{price_info['last']:.6f}</div>
+                    <div class="sub">LAST PRICE</div>
+                    
+                    <div class="metric-grid">
+                        <div>
+                            <div class="metric-title">Bid / Ask Spread</div>
+                            <div class="metric-value {spread_class}">{spread:.6f} ({spread_status})</div>
+                        </div>
+                        <div>
+                            <div class="metric-title">Prediction vs. Noise</div>
+                            <div class="metric-value {'success-text' if prediction / avg_volatility > 1 else 'danger-text'}">{(prediction / avg_volatility) if avg_volatility else 0.0:.2f}x</div>
+                        </div>
+                    </div>
+                </div>
+                
+                <!-- 2. PNL & TARGET CARD -->
+                <div class="card pnl-block">
+                    <h2>UNREALIZED PNL & TARGET</h2>
+                    <div class="value" style="color: {'var(--success-green)' if unrealized_pnl > 0 else 'var(--danger-red)' if unrealized_pnl < 0 else 'var(--neutral-gray)'}">{unrealized_pnl:.6f}</div>
+                    <div class="sub">Required PnL: <span class="success-text">{required_pnl_usd:.6f} USDT</span></div>
+                    
+                    <div class="metric-grid">
+                        <div>
+                            <div class="metric-title">Entry Price</div>
+                            <div class="metric-value neutral-text">{position['entry_price']:.6f}</div>
+                        </div>
+                        <div>
+                            <div class="metric-title">Target Exit Price</div>
+                            <div class="metric-value success-text">{target_price:.6f}</div>
+                        </div>
+                    </div>
+                </div>
+                
+                <!-- 3. WALLET & RISK CARD -->
+                <div class="card">
+                    <h2>ACCOUNT & RISK CONTROL</h2>
+                    <div class="value success-text">${wallet:.6f}</div>
+                    <div class="sub">Growth YTD: <span class="{growth_class}">{growth_pct:.6f}%</span></div>
+
+                    <div class="metric-grid">
+                        <div>
+                            <div class="metric-title">Risk Multiplier</div>
+                            <div class="metric-value danger-text">{self.wallet_learner.risk_multiplier*100:.2f}%</div>
+                        </div>
+                        <div>
+                            <div class="metric-title">Entry Threshold</div>
+                            <div class="metric-value neutral-text">{dynamic_threshold:.2f}%</div>
+                        </div>
+                    </div>
                 </div>
 
-                <!-- METRICS CARD -->
+                <!-- 4. AI & PERFORMANCE CARD -->
                 <div class="card">
-                    <h2>PERFORMANCE METRICS</h2>
-                    <div class="value neutral-text">{sim_acc:.2f}%</div>
-                    <div class="sub">Sim. Accuracy</div>
-                    <div class="sub">Avg. Volatility: {avg_volatility:.6f}</div>
-                    <div class="sub">Risk Multiplier: {self.wallet_learner.risk_multiplier*100:.2f}%</div>
+                    <h2>ML CORE METRICS</h2>
+                    <div class="value" style="color: {signal_color}">{ai_signal}</div>
+                    <div class="sub">Prediction Value: <span class="neutral-text">{prediction_val_str}</span></div>
+                    
+                    <div class="metric-grid">
+                        <div>
+                            <div class="metric-title">Confidence Level</div>
+                            <div class="metric-value {'success-text' if confidence >= dynamic_threshold else 'danger-text'}">{confidence:.2f}%</div>
+                        </div>
+                        <div>
+                            <div class="metric-title">Sim. Accuracy</div>
+                            <div class="metric-value neutral-text">{sim_acc:.2f}%</div>
+                        </div>
+                    </div>
                 </div>
-                
             </div>
             
             <script>
-                // This script is purely for visual effect on the dashboard
-                // It ensures the action bar animation is visible on refresh
+                // Flicker animation reset (necessary for iframe environments)
                 const actionBar = document.querySelector('.action-bar');
                 actionBar.style.animation = 'none';
-                void actionBar.offsetWidth; // Trigger reflow
-                actionBar.style.animation = null; 
+                void actionBar.offsetWidth; 
+                actionBar.style.animation = 'flicker 0.2s infinite alternate';
             </script>
         </body>
         </html>
@@ -503,7 +580,7 @@ class TradingBot:
             logger.error(f"Failed to write dashboard: {e}")
 
     def run(self):
-        logger.info("Starting ULTRA-HIGH FREQUENCY SCALPER Bot (Green Matrix Mode)...")
+        logger.info("Starting ULTRA-HIGH FREQUENCY SCALPER Bot (Command Center)...")
         self.sys.close_all_positions()
         
         initial_wallet = self.sys.get_wallet_balance()
@@ -511,30 +588,30 @@ class TradingBot:
         
         while self.running:
             try:
-                action_log = "Scanning Market..."
-                wallet = self.sys.get_wallet_balance()
+                action_log = "SCANNING FOR ENTRY SIGNAL"
+                action_type = "SCANNING"
                 
+                wallet = self.sys.get_wallet_balance()
                 self.wallet_learner.update_balance(wallet)
+                dynamic_threshold = self.wallet_learner.dynamic_threshold
                 
                 pos_data = self.sys.get_real_position(SYMBOL_BASH)
                 price_data = self.ai.fetch_price()
                 
                 if not price_data:
-                    # MAX SPEED: Continue faster if price data fetch fails
                     time.sleep(0.01) 
                     continue
 
                 self.ai.update_data(price_data)
                 
-                # Check if we should retrain based on a very fast, continuous interval (1 == every loop)
                 if self.iteration % TRAINING_INTERVAL == 0:
                     prediction, confidence = self.ai.train_and_predict()
                 else:
                     prediction = self.ai.last_prediction
                     confidence = self.ai.confidence
                 
-                # Get volatility for dashboard display
                 avg_volatility = self.ai.avg_volatility 
+                required_pnl_usd = 0.0
                 
                 # ---------------------------------------------------------
                 # TRADING LOGIC
@@ -544,7 +621,7 @@ class TradingBot:
                     entry = pos_data['entry_price']
                     is_long = qty > 0
                     
-                    # Real PnL calculation
+                    # 1. Calculate PnL and Required Profit
                     if is_long:
                         current_pnl = (price_data['bid'] - entry) * abs(qty)
                         price_diff_pct = (price_data['bid'] - entry) / entry
@@ -555,20 +632,23 @@ class TradingBot:
                     total_fee = (entry * abs(qty) * FEE_RATE) + (price_data['last'] * abs(qty) * FEE_RATE)
                     net_pnl = current_pnl - total_fee
                     
-                    action_log = f"UNREALIZED NET PnL: {net_pnl:.6f} USDT"
-
                     entry_value = entry * abs(qty)
                     required_gross_profit = entry_value * TARGET_PROFIT_PCT
                     required_pnl_usd = required_gross_profit + total_fee
+                    
+                    action_log = f"UNREALIZED NET PnL: {net_pnl:.6f} USDT"
+                    action_type = "PROFIT" if net_pnl >= 0 else "RECOVERY"
+
 
                     # 1. MAX SPEED SCALP PROFIT TAKER (Full Close)
                     if current_pnl > required_pnl_usd:
-                        logger.info(f"$$$ MAX SPEED SCALP PROFIT (Target {TARGET_PROFIT_PCT*100:.4f}% + Fees): {net_pnl:.6f}")
+                        logger.info(f"$$$ MAX SPEED SCALP PROFIT: {net_pnl:.6f}")
                         side = 'sell' if is_long else 'buy'
                         self.sys.place_order(BASE_COIN, abs(qty), side)
-                        action_log = f"CLOSED: PROFIT {net_pnl:.6f} USDT"
+                        action_log = f"CLOSED POSITION: +{net_pnl:.6f} PROFIT"
+                        action_type = "CLOSE"
                         
-                    # 2. PARTIAL PROFIT SCALING (Decrease Trade) - If profitable, but AI predicts reversal
+                    # 2. PARTIAL PROFIT SCALING
                     elif net_pnl > 0 and (
                         (is_long and prediction < 0) or (not is_long and prediction > 0)
                     ):
@@ -580,10 +660,10 @@ class TradingBot:
                         if abs(qty) > reduce_qty: 
                             side = 'sell' if is_long else 'buy'
                             self.sys.place_order(BASE_COIN, reduce_qty, side)
-                            action_log = f"SCALE OUT PROFIT (-{reduce_qty})"
-                            logger.info(action_log)
-
-                    # 3. AGGRESSIVE PYRAMIDING (Increase Trade) - Add if green AND AI confirms more profit ahead
+                            action_log = f"SCALING OUT PROFIT: -{reduce_qty}"
+                            action_type = "PROFIT"
+                            
+                    # 3. AGGRESSIVE PYRAMIDING
                     elif net_pnl > 0 and confidence > 55.0:
                         if (is_long and prediction > 0) or (not is_long and prediction < 0):
                             usable_wallet = wallet * self.wallet_learner.risk_multiplier
@@ -597,10 +677,10 @@ class TradingBot:
                                 add_qty = max(MIN_QTY, round(add_qty, DECIMAL_PRECISION)) 
                                 side = 'buy' if is_long else 'sell'
                                 self.sys.place_order(BASE_COIN, add_qty, side)
-                                action_log = f"COMPOUNDING (Add +{add_qty})"
-                                logger.info(action_log)
+                                action_log = f"COMPOUNDING POSITION: +{add_qty}"
+                                action_type = "COMPOUND"
                     
-                    # 4. GRID RECOVERY (Increase Trade) - If losing and AI predicts recovery
+                    # 4. GRID RECOVERY
                     elif price_diff_pct < -GRID_STEP_PCT:
                         if (is_long and prediction > 0) or (not is_long and prediction < 0):
                             usable_wallet = wallet * self.wallet_learner.risk_multiplier
@@ -614,14 +694,14 @@ class TradingBot:
                                 recovery_qty = max(MIN_QTY, round(recovery_qty, DECIMAL_PRECISION)) 
                                 side = 'buy' if is_long else 'sell'
                                 self.sys.place_order(BASE_COIN, recovery_qty, side)
-                                action_log = f"GRID RECOVERY (Avg Down +{recovery_qty})"
-                                logger.info(action_log)
+                                action_log = f"GRID RECOVERY: AVG DOWN +{recovery_qty}"
+                                action_type = "RECOVERY"
 
                 else:
                     # -----------------------------------------------------
                     # NEW ENTRY (MAX-FREQUENCY)
                     # -----------------------------------------------------
-                    if self.ai.is_trained and confidence > self.wallet_learner.dynamic_threshold: 
+                    if self.ai.is_trained and confidence > dynamic_threshold: 
                         
                         if prediction > 0:
                             execution_price = price_data['ask']
@@ -640,11 +720,11 @@ class TradingBot:
                             trade_qty = max(MIN_QTY, round(trade_qty, DECIMAL_PRECISION)) 
                             
                             self.sys.place_order(BASE_COIN, trade_qty, side)
-                            action_log = f"NEW ENTRY: {side.upper()} {trade_qty}"
+                            action_log = f"NEW MAX ENTRY: {side.upper()} {trade_qty}"
+                            action_type = "ENTRY"
                             
-                self.generate_dashboard(wallet, pos_data, price_data, prediction, confidence, action_log, avg_volatility)
+                self.generate_dashboard(wallet, pos_data, price_data, prediction, confidence, action_log, action_type, avg_volatility, dynamic_threshold, required_pnl_usd)
                 self.iteration += 1
-                # MAX SPEED: Reduce sleep time to 50ms for hyper-responsiveness
                 time.sleep(UHF_SLEEP_SECONDS) 
 
             except KeyboardInterrupt:
