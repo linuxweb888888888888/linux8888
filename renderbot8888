@@ -5,837 +5,644 @@ import re
 import pandas as pd
 import numpy as np
 import os
-import sys 
+import ccxt # Added ccxt for price fetching
 from datetime import datetime, timedelta
 from sklearn.ensemble import HistGradientBoostingClassifier
 from sklearn.preprocessing import StandardScaler
 from collections import deque
+from typing import Dict, Any, Tuple, Optional
 
 # --- CONFIGURATION & CONSTANTS ---
 SYMBOL = "ATOMUSDT_PERP"
 BASE_COIN = "ATOM"
+QUOTE_COIN = "USDT" # Assuming USDT is the quote currency
 MIN_QTY = 0.001
-LEVERAGE = 100 
-INTERVAL_SECONDS = 60 # Set to 1 minute (60 seconds) for signal generation
-LOOKBACK_PERIOD = 300 
-WINDOW_SIZE = 14 
-VOLATILITY_WINDOW = 20 
+LEVERAGE = 100
+INTERVAL_SECONDS = 30 # Signal check every 30 seconds
+LOOKBACK_PERIOD = 300 # Number of bars to look back for historical data (e.g., 5-minute bars)
+WINDOW_SIZE = 14 # Standard size for indicators (RSI, ADX, ROC)
+VOLATILITY_WINDOW = 20 # Window for Volatility check (e.g., ATR)
 
 # ML/Adaptive Parameters
-MIN_TRAINING_SAMPLES = 50 
-BASE_PROBABILITY_THRESHOLD = 0.55 
+MIN_TRAINING_SAMPLES = 50
+BASE_PROBABILITY_THRESHOLD = 0.55 # Minimum confidence for a trade
+BASE_RISK_PERCENT = 0.005 # Base percentage of wallet balance risked per trade (0.5%)
 
-# Time-Based Stop Loss (T-SL)
-MAX_HOLDING_PERIOD_MINUTES = 60 
+# Dynamic SL/TP Multipliers based on ATR
+ATR_MULTIPLIER_TP = 2.5 # Take Profit is 2.5 * ATR
+ATR_MULTIPLIER_SL = 1.2 # Stop Loss is 1.2 * ATR
+
+# NEW: Time-Based Stop Loss (T-SL) - Max hold time in minutes
+MAX_HOLDING_PERIOD_MINUTES = 60
 
 # Paths
-DASHBOARD_PATH = "/var/www/html/dashboard.html" 
-WALLET_SCRIPT = "/wallet.sh"
-COIN_INFO_SCRIPT = "/coinrealinfo.sh"
-PLACE_ORDER_SCRIPT = "/placeorder.sh"
-CLOSE_POSITIONS_SCRIPT = "/closepositions.sh"
+DASHBOARD_PATH = "/var/www/html/dashboard.html"
 
-# Global state variables (in-memory)
-ml_model = None
-scaler = None
-initial_fit_done = False
+# Exchange Setup (using HitBTC)
+try:
+    exchange = ccxt.hitbtc({'enableRateLimit': True})
+except Exception as e:
+    print(f"Error initializing ccxt: {e}. Bot will run with limited functionality.")
+    exchange = None
 
-# --- UTILITY & BASH FUNCTIONS (ADAPTED FOR YOUR SCRIPTS) ---
+# Global State for Persistence (Simulated)
+# In a real-world app, this state would be persisted via Firestore or another database
+bot_state = {
+    'current_position': 0.0, # Quantity: >0 for Long, <0 for Short, 0 for Flat
+    'wallet_balance': 1000.0, # Starting simulated balance for calculations
+    'realized_wins': 0,
+    'realized_losses': 0,
+    'position_entry_price': 0.0,
+    'position_entry_time': None,
+}
 
-def run_bash_command(command, print_output=False):
-    """Executes a bash command and returns the raw output string and success status."""
+# Data Storage (using deque for efficient history management)
+# We mock historical OHLCV data as the platform cannot fetch large external files/data sets
+historical_data = deque(maxlen=LOOKBACK_PERIOD)
+scaler = StandardScaler()
+model = HistGradientBoostingClassifier(random_state=42, max_depth=5, learning_rate=0.1)
+
+# --- UTILITY & BASH FUNCTIONS ---
+
+def run_bash_command(command: str) -> Tuple[str, bool]:
+    """Execute a bash command and return its output and success status."""
     try:
-        # Check=True will raise CalledProcessError for non-zero exit codes
         result = subprocess.run(
-            command, 
+            command,
             shell=True,
-            check=True, 
-            capture_output=True, 
+            check=True,
+            capture_output=True,
             text=True
         )
-        output_str = result.stdout.strip()
-        
-        if print_output:
-            print(f"Command Output ({command}):\n{output_str}\n---")
-        
-        return output_str, True 
-
+        return result.stdout.strip(), True
     except subprocess.CalledProcessError as e:
-        print(f"ERROR: Command execution failed. Command: '{command}'")
-        print(f"Stdout: {e.stdout.strip()}")
-        print(f"Stderr: {e.stderr.strip()}")
-        return e.stdout.strip(), False
+        print(f"BASH ERROR (Code {e.returncode}): Command '{e.cmd}' failed. Stderr: {e.stderr.strip()}")
+        return e.stderr.strip(), False
+    except FileNotFoundError:
+        print(f"BASH ERROR: Command not found. Is the path correct?")
+        return "Command not found", False
     except Exception as e:
-        print(f"An unexpected error occurred in run_bash_command: {e}")
-        return None, False
+        print(f"An unexpected error occurred: {e}")
+        return str(e), False
 
-def get_current_state():
-    """
-    Fetches account balance, position details, and historical data.
-    Uses custom shell scripts for real-time data.
-    """
-    
-    # 1. Fetch wallet balance from /wallet.sh
-    balance_output, success = run_bash_command(WALLET_SCRIPT, print_output=True) 
-    wallet_balance = 0.0
+def run_wallet_sh() -> Optional[float]:
+    """Get the latest USDT balance from the wallet script."""
+    output, success = run_bash_command(f"bash /wallet.sh get real {QUOTE_COIN} balance from this")
     if success:
+        # Assuming the output is a float number, potentially with prefix text
+        match = re.search(r"(\d+(\.\d+)?)", output)
+        if match:
+            try:
+                balance = float(match.group(0))
+                return balance
+            except ValueError:
+                print(f"Could not parse float balance from: {output}")
+                return None
+    return None
+
+def run_place_order(quantity: float, side: str) -> Tuple[str, bool]:
+    """Place a market order using the bash script."""
+    qty_str = f"{abs(quantity):.8f}" # Ensure high precision
+    command = f"bash /placeorder.sh {BASE_COIN} {qty_str} {side}"
+    output, success = run_bash_command(command)
+    return output, success
+
+def run_close_positions_sh() -> Tuple[str, bool]:
+    """Execute the close positions script."""
+    print("Attempting to close all open positions at bot start...")
+    output, success = run_bash_command("bash /closepositions.sh")
+    if success:
+        print("Positions closed successfully.")
+    else:
+        print(f"Failed to close positions: {output}")
+    return output, success
+
+def get_unrealized_pnl(symbol: str, current_price: float) -> Tuple[float, Optional[Dict[str, Any]]]:
+    """
+    Parses coinrealinfo.sh output and calculates Unrealized PnL.
+    Assumes quantity is absolute and side is determined by the global position state.
+    """
+    output, success = run_bash_command(f"bash /coinrealinfo.sh {symbol} layout")
+    position_info = {
+        'quantity': 0.0,
+        'entry_price': 0.0,
+        'side': 'Flat'
+    }
+    unrealized_pnl = 0.0
+
+    if not success or "NO INFO" in output:
+        # If the script fails or returns NO INFO, we treat it as flat
+        bot_state['current_position'] = 0.0
+        return 0.0, None
+
+    # Parsing the output
+    lines = output.split('\n')
+    data = {}
+    for line in lines:
+        if ':' in line:
+            key, value = line.split(':', 1)
+            data[key.strip()] = value.strip()
+
+    try:
+        quantity = float(data.get('Quantity', 0.0))
+        entry_price = float(data.get('Entry Price', 0.0))
+
+        if quantity > 0 and entry_price > 0:
+            # Determine side from bot state since /coinrealinfo.sh doesn't provide it
+            side_multiplier = np.sign(bot_state['current_position'])
+            position_info['quantity'] = quantity
+            position_info['entry_price'] = entry_price
+            position_info['side'] = 'Long' if side_multiplier > 0 else 'Short'
+
+            # PnL Calculation: PnL = (Current Price - Entry Price) * Quantity * Side Multiplier
+            unrealized_pnl = (current_price - entry_price) * quantity * side_multiplier
+
+    except (ValueError, TypeError) as e:
+        print(f"PnL Parsing Error: Could not convert data to float. {e}")
+
+    return unrealized_pnl, position_info
+
+# --- DATA AND INDICATOR FUNCTIONS ---
+
+def fetch_ticker_and_historical_data() -> Tuple[Optional[pd.DataFrame], Optional[float], Optional[float]]:
+    """
+    Fetches real-time ticker data (bid/ask) and mocks historical OHLCV data.
+    """
+    bid = None
+    ask = None
+
+    if exchange:
         try:
-            # Assumes /wallet.sh outputs a single number (USDT balance)
-            wallet_balance = float(balance_output.split()[0].replace(',', '').strip())
-        except ValueError:
-            print(f"FATAL: Could not parse wallet balance from '{balance_output}'. Using default 0.0.")
+            ticker = exchange.fetch_ticker(SYMBOL)
+            bid = ticker['bid']
+            ask = ticker['ask']
+        except Exception as e:
+            print(f"CCXT Error fetching ticker: {e}. Using simulated data.")
 
-    # 2. Fetch position details and current prices from /coinrealinfo.sh
-    coin_info_output, success = run_bash_command(f"{COIN_INFO_SCRIPT} {SYMBOL}", print_output=True)
-    
-    current_position = {'size': 0.0, 'side': 'NONE', 'entry_price': 0.0}
-    bid_price = 0.0
-    ask_price = 0.0
-    
-    if success and coin_info_output:
-        # Define regex to extract key information
-        # Note: Added parsing for Bid and Ask which were often missing in previous outputs
-        size_match = re.search(r'Quantity:\s*([\d.]+)', coin_info_output)
-        entry_match = re.search(r'Entry Price:\s*([\d.]+)', coin_info_output)
-        bid_match = re.search(r'Bid:\s*([\d.]+)', coin_info_output)
-        ask_match = re.search(r'Ask:\s*([\d.]+)', coin_info_output)
-        
-        if bid_match:
-            bid_price = float(bid_match.group(1))
-        if ask_match:
-            ask_price = float(ask_match.group(1))
-
-        if 'NO INFO' not in coin_info_output:
-            # Position is open
-            if size_match and entry_match:
-                current_position['size'] = float(size_match.group(1))
-                current_position['entry_price'] = float(entry_match.group(1))
-                # The 'side' is tracked globally in 'main' after a successful trade execution.
-                pass 
-
-    # 3. Fetch historical data (assuming hitbtc get_history command still works for candles)
-    history_output, hist_success = run_bash_command(f"hitbtc get_history {SYMBOL} 1m {LOOKBACK_PERIOD + 100}", print_output=True)
-    historical_data = []
-    if hist_success and isinstance(history_output, str):
-        try:
-             # Attempt to parse the string output as JSON
-             history_json = json.loads(history_output)
-             historical_data = history_json.get('result', []) if isinstance(history_json, dict) else []
-        except json.JSONDecodeError:
-            print("FATAL: Historical data command output was not valid JSON.")
-
+    # --- SIMULATE HISTORICAL DATA GENERATION ---
+    # In a live bot, you would use ccxt.fetch_ohlcv here.
+    # We must generate mock data to calculate indicators like ATR.
     if not historical_data:
-        # Fallback if historical data fetch failed
-        if ask_price > 0:
-            latest_price = ask_price # Use the real-time ask as a fallback
-        else:
-            # If no price is available, we can't continue the TA logic
-            print("ERROR: Failed to fetch historical data and real-time prices are 0. Cannot generate DF.")
-            df = pd.DataFrame()
-            return wallet_balance, current_position, df, bid_price, ask_price
-        
-        # Create a single row DF based on the latest available price for prediction input
-        df = pd.DataFrame([{
-            'Close': latest_price, 'High': latest_price, 'Low': latest_price, 
-            'Open': latest_price, 'Volume': 0.0
-        }])
-        
-    else:
-        # Process historical data
-        df = pd.DataFrame(historical_data)
-        df = df.rename(columns={'close': 'Close', 'high': 'High', 'low': 'Low', 'open': 'Open', 'volume': 'Volume'})
-        for col in ['Close', 'High', 'Low', 'Open', 'Volume']:
-            df[col] = pd.to_numeric(df[col], errors='coerce')
-        
-        df = df.dropna(subset=['Close', 'High', 'Low', 'Open', 'Volume'])
-        df = df.iloc[::-1].reset_index(drop=True)
-        df = df.iloc[-LOOKBACK_PERIOD:]
+        # Initialize with a base set of data points
+        base_price = 7.0 if not bid else (bid + ask) / 2
+        for i in range(LOOKBACK_PERIOD):
+            # Generate slightly randomized data
+            close_price = base_price + np.random.uniform(-0.1, 0.1)
+            open_price = close_price + np.random.uniform(-0.05, 0.05)
+            high_price = max(open_price, close_price) + np.random.uniform(0.01, 0.03)
+            low_price = min(open_price, close_price) - np.random.uniform(0.01, 0.03)
+            volume = np.random.uniform(100, 500)
+            historical_data.append([
+                time.time() - (LOOKBACK_PERIOD - i) * 60 * 5, # Mock timestamp (5 min bars)
+                open_price, high_price, low_price, close_price, volume
+            ])
 
-    return wallet_balance, current_position, df, bid_price, ask_price
+    # Update with a new bar if time elapsed is sufficient (mocking a 5-minute interval)
+    # The current best price (mid_price) is used as the new closing price
+    mid_price = (bid + ask) / 2 if bid and ask else (historical_data[-1][4] * 1.0001)
 
-def calculate_unrealized_pnl(position, bid_price, ask_price):
-    """Calculates Unrealized PnL in decimal places."""
-    pnl = 0.0
-    size = position['size']
-    entry = position['entry_price']
-    side = position.get('side', 'NONE')
+    # Mock the latest bar data based on the real-time bid/ask
+    new_data = [
+        time.time(),
+        historical_data[-1][4], # Open = previous close
+        mid_price + abs(mid_price - historical_data[-1][4]) * 0.5, # Mock High
+        mid_price - abs(mid_price - historical_data[-1][4]) * 0.5, # Mock Low
+        mid_price, # Close = Mid-Price
+        historical_data[-1][5] * np.random.uniform(0.9, 1.1) # Mock Volume
+    ]
 
-    if size > 0:
-        if side == 'BUY':
-            # Long position: PnL is (Bid Price - Entry Price) * Quantity. Use Bid price for exit valuation.
-            pnl = (bid_price - entry) * size
-        elif side == 'SELL':
-            # Short position: PnL is (Entry Price - Ask Price) * Quantity. Use Ask price for exit valuation.
-            pnl = (entry - ask_price) * size
-            
-    return pnl
+    historical_data.append(new_data)
+    df = pd.DataFrame(historical_data, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
 
-def execute_trade(side, quantity, current_position):
-    """Executes a trade using the custom shell script /placeorder.sh."""
-    if quantity < MIN_QTY:
-        print(f"Trade skipped: Quantity {quantity:.8f} is less than MIN_QTY {MIN_QTY}")
-        return False, None
+    return df.tail(LOOKBACK_PERIOD).reset_index(drop=True), bid, ask
 
-    # Determine if an opposing position exists and needs closing
-    is_opposing_trade = (side == 'Buy' and current_position.get('side') == 'SELL') or \
-                        (side == 'Sell' and current_position.get('side') == 'BUY')
-    
-    if current_position['size'] > 0 and current_position.get('side') != 'NONE' and is_opposing_trade:
-        # Close existing position first
-        print(f"Attempting to close existing {current_position.get('side')} position via {CLOSE_POSITIONS_SCRIPT}...")
-        close_output, success = run_bash_command(CLOSE_POSITIONS_SCRIPT, print_output=True)
-        if not success or 'SUCCESS' not in close_output.upper():
-            print("Failed to close position. Aborting new trade.")
-            return False, None
-        time.sleep(1.0) # Give exchange time to process closure
-        
-    # Place new order
-    quantity_str = f"{quantity:.8f}"
-    order_command = f"{PLACE_ORDER_SCRIPT} {BASE_COIN} {quantity_str} {side}"
-    print(f"Executing trade: {order_command}")
-    
-    order_output, success = run_bash_command(order_command, print_output=True)
-    
-    if success and 'SUCCESS' in order_output.upper():
-        print("Order placement successful.")
-        return True, side # Return success and the side placed
-    else:
-        print(f"Order placement failed. Output: {order_output}")
-        return False, None
+def calculate_indicators(df: pd.DataFrame) -> pd.DataFrame:
+    """Calculate technical indicators including ATR for volatility and features for ML."""
 
-def close_all_positions_on_start():
-    """Tries to close any open positions at bot start using /closepositions.sh."""
-    print("Checking for and closing any residual open positions...")
-    
-    close_output, success = run_bash_command(CLOSE_POSITIONS_SCRIPT, print_output=True)
-    
-    if success and 'SUCCESS' in close_output.upper():
-        print("Successfully sent close command for all positions.")
-    else:
-        print("Position closure script failed or returned error. Bot may start with an open position.")
+    # 1. Average True Range (ATR) - For adaptive risk
+    def calculate_atr(df, window=VOLATILITY_WINDOW):
+        high_low = df['high'] - df['low']
+        high_prev_close = np.abs(df['high'] - df['close'].shift(1))
+        low_prev_close = np.abs(df['low'] - df['close'].shift(1))
+        true_range = pd.concat([high_low, high_prev_close, low_prev_close], axis=1).max(axis=1)
+        return true_range.rolling(window=window).mean()
 
-# --- INDICATOR CALCULATION ---
+    df['ATR'] = calculate_atr(df)
+    df['ATR_pct'] = df['ATR'] / df['close'] * 100 # ATR as a percentage of price
 
-def calculate_wilders_smoothing(series, period):
-    return series.ewm(alpha=1/period, adjust=False).mean()
+    # 2. Relative Strength Index (RSI) - Momentum feature
+    delta = df['close'].diff()
+    gain = (delta.where(delta > 0, 0)).rolling(window=WINDOW_SIZE).mean()
+    loss = (-delta.where(delta < 0, 0)).rolling(window=WINDOW_SIZE).mean()
+    RS = gain / loss
+    df['RSI'] = 100 - (100 / (1 + RS))
 
-def calculate_advanced_indicators(historical_df):
-    """Calculates technical indicators using vectorized operations."""
-    df = historical_df.copy()
-    window = WINDOW_SIZE
-    vol_window = VOLATILITY_WINDOW
+    # 3. Rate of Change (ROC) - Momentum feature
+    df['ROC'] = df['close'].pct_change(periods=WINDOW_SIZE) * 100
 
-    # True Range (TR)
-    df['High-Low'] = df['High'] - df['Low']
-    df['High-PrevClose'] = abs(df['High'] - df['Close'].shift(1))
-    df['Low-PrevClose'] = abs(df['Low'] - df['Close'].shift(1))
-    df['TR'] = df[['High-Low', 'High-PrevClose', 'Low-PrevClose']].max(axis=1)
+    # 4. Standard Deviation (Volatility Feature)
+    df['Volatility'] = df['close'].rolling(window=WINDOW_SIZE).std()
 
-    # 1. Average True Range (ATR)
-    df['ATR'] = calculate_wilders_smoothing(df['TR'], window)
+    # 5. Volatility Ratio (Mean Reversion Feature)
+    df['VolRatio'] = df['Volatility'] / df['ATR']
 
-    # 2. Relative Strength Index (RSI)
-    df['Change'] = df['Close'].diff()
-    df['Gain'] = np.where(df['Change'] > 0, df['Change'], 0)
-    df['Loss'] = np.where(df['Change'] < 0, abs(df['Change']), 0)
-    
-    df['AvgGain'] = calculate_wilders_smoothing(df['Gain'], window)
-    df['AvgLoss'] = calculate_wilders_smoothing(df['Loss'], window)
-    
-    df['RS'] = df['AvgGain'] / df['AvgLoss']
-    df['RSI'] = 100 - (100 / (1 + df['RS']))
+    # 6. Target Variable (Shift 1 bar forward to predict the next bar)
+    # Target 1 (Buy Signal): Next bar's close is higher than current close
+    df['Target'] = np.where(df['close'].shift(-1) > df['close'], 1, 0)
+    # The last row's Target will be NaN, which is what we need for prediction
 
-    # 3. Commodity Channel Index (CCI)
-    TP = (df['High'] + df['Low'] + df['Close']) / 3
-    df['SMA_TP'] = TP.rolling(window=window).mean()
-    def mean_deviation(x):
-        return np.mean(np.abs(x - np.mean(x)))
-    df['MD'] = TP.rolling(window=window).apply(mean_deviation, raw=True)
-    df['CCI'] = (TP - df['SMA_TP']) / (0.015 * df['MD'])
-
-    # 4. Average Directional Index (ADX)
-    df['+DM'] = np.where((df['High'] > df['High'].shift(1)) & (df['High'] - df['High'].shift(1) > df['Low'].shift(1) - df['Low']), df['High'] - df['High'].shift(1), 0)
-    df['-DM'] = np.where((df['Low'].shift(1) > df['Low']) & (df['Low'].shift(1) - df['Low'] > df['High'] - df['High'].shift(1)), df['Low'].shift(1) - df['Low'], 0)
-    
-    df['+DI'] = calculate_wilders_smoothing(df['+DM'], window) / df['ATR'] * 100
-    df['-DI'] = calculate_wilders_smoothing(df['+DI'], window) / df['ATR'] * 100 
-    
-    df['DX'] = abs(df['+DI'] - df['-DI']) / (df['+DI'] + df['-DI']) * 100
-    df['ADX'] = calculate_wilders_smoothing(df['DX'], window)
-
-    # 5. Rate of Change (ROC)
-    df['ROC'] = df['Close'].pct_change(periods=window) * 100
-
-    # 6. Negative Volume Index (NVI)
-    nvi_series = np.full(len(df), 1000.0)
-    
-    for i in range(1, len(df)):
-        if df['Volume'].iloc[i] < df['Volume'].iloc[i-1]:
-            price_change_percent = (df['Close'].iloc[i] - df['Close'].iloc[i-1]) / df['Close'].iloc[i-1]
-            nvi_series[i] = nvi_series[i-1] + (price_change_percent * nvi_series[i-1])
-        else:
-            nvi_series[i] = nvi_series[i-1]
-            
-    df['NVI'] = nvi_series
-    
-    # 7. Volatility (Log Returns Standard Deviation)
-    df['Log_Returns'] = np.log(df['Close'] / df['Close'].shift(1))
-    df['Volatility'] = df['Log_Returns'].rolling(window=vol_window).std() * np.sqrt(252)
-
-    # Drop intermediate columns
-    cols_to_drop = ['High-Low', 'High-PrevClose', 'Low-PrevClose', 'TR', 'Change', 'Gain', 'Loss', 
-                    'AvgGain', 'AvgLoss', 'RS', 'SMA_TP', 'MD', '+DM', '-DM', '+DI', '-DI', 
-                    'DX', 'Log_Returns']
-    df = df.drop(columns=[col for col in cols_to_drop if col in df.columns], errors='ignore')
-    
-    df = df.dropna()
-    
+    df.dropna(inplace=True)
     return df
 
-# --- MACHINE LEARNING & ADAPTIVE LOGIC ---
+# --- ADAPTIVE STRATEGY & ML FUNCTIONS ---
 
-def create_target_variable(df):
-    df['Target'] = np.where(df['Close'].shift(-1) > df['Close'], 1, 0)
-    return df.dropna()
+def prepare_and_train_model(df: pd.DataFrame) -> Optional[float]:
+    """Prepares features, trains the ML model, and returns current accuracy."""
+    features = ['ATR_pct', 'RSI', 'ROC', 'Volatility', 'VolRatio']
 
-def get_feature_cols():
-    return ['ATR', 'RSI', 'CCI', 'ADX', 'ROC', 'NVI', 'Volatility']
+    if len(df) < MIN_TRAINING_SAMPLES:
+        print(f"WARNING: Insufficient data for training ({len(df)}/{MIN_TRAINING_SAMPLES}).")
+        return None
 
-def setup_and_train_ml_model(historical_df):
-    """
-    Prepares data, trains the model, and updates the scaler if necessary.
-    Uses global variables for ml_model, scaler, and initial_fit_done.
-    """
-    # FIX: Remove model, scaler, initial_fit_done from parameters to resolve SyntaxError.
-    global ml_model, initial_fit_done, scaler 
+    X = df[features].values
+    y = df['Target'].values
 
-    feature_cols = get_feature_cols()
-    
-    if len(historical_df) < MIN_TRAINING_SAMPLES:
-        if len(historical_df) > 0 and not initial_fit_done:
-             print("Warning: Insufficient historical data for full training. Skipping ML training.")
-             return 0.5
-        
-        if len(historical_df) == 0:
-            raise ValueError("Not enough data to train ML model.")
+    # Scale features
+    X_scaled = scaler.fit_transform(X)
 
-    train_df = historical_df.iloc[-MIN_TRAINING_SAMPLES:].copy()
-    X_train = train_df[feature_cols]
-    y_train = train_df['Target']
+    # Train model (use all data for the latest model)
+    model.fit(X_scaled, y)
 
-    if not initial_fit_done:
-        scaler = StandardScaler()
-        scaler.fit(X_train)
-        initial_fit_done = True
-
-    X_train_scaled = scaler.transform(X_train)
-    ml_model = HistGradientBoostingClassifier(random_state=42, max_iter=100)
-    ml_model.fit(X_train_scaled, y_train)
-    accuracy = ml_model.score(X_train_scaled, y_train)
-    
+    # Calculate model accuracy on the training set
+    accuracy = model.score(X_scaled, y)
     return accuracy
 
-def get_ml_prediction(historical_df):
+def generate_signal(df: pd.DataFrame) -> Tuple[float, float, str]:
     """
-    Generates the probability prediction for the next bar.
-    Uses global variables for ml_model and scaler.
+    Generates a trade signal based on the latest trained model.
+    Returns: (Prob_Buy, Prob_Sell, Signal)
     """
-    # FIX: Remove model and scaler from parameters for consistency.
-    global ml_model, scaler 
-    
-    if ml_model is None or scaler is None or len(historical_df) == 0:
-        return 0.5, 0.5
+    features = ['ATR_pct', 'RSI', 'ROC', 'Volatility', 'VolRatio']
 
-    feature_cols = get_feature_cols()
-    
-    X_predict = historical_df.iloc[[-1]][feature_cols]
-    
-    # Ensure all required features are present
-    if X_predict.shape[1] != len(feature_cols):
-        print("Warning: Missing features for prediction. Using default 50/50 probability.")
-        return 0.5, 0.5
-        
-    X_predict_scaled = scaler.transform(X_predict)
+    # Prepare the latest bar for prediction
+    latest_bar_features = df[features].iloc[[-1]].values
+    X_pred = scaler.transform(latest_bar_features)
 
-    proba = ml_model.predict_proba(X_predict_scaled)[0]
-    prob_buy = proba[1]
-    prob_sell = proba[0]
-    
-    return prob_buy, prob_sell
+    # Get probability prediction
+    probabilities = model.predict_proba(X_pred)[0]
+    prob_sell = probabilities[0]
+    prob_buy = probabilities[1]
 
-def calculate_adaptive_threshold(ml_accuracy, base_threshold):
-    """Adjusts the probability threshold based on the model's performance."""
-    accuracy_factor = (ml_accuracy - 0.5) * 0.5
-    adaptive_threshold = max(0.51, base_threshold - accuracy_factor)
-    return adaptive_threshold
+    signal = 'HOLD'
+    if prob_buy > BASE_PROBABILITY_THRESHOLD:
+        signal = 'BUY'
+    elif prob_sell > BASE_PROBABILITY_THRESHOLD:
+        signal = 'SELL'
 
-def calculate_adaptive_risk(ml_accuracy, max_risk_percent=0.01):
-    """Adjusts the risk percentage (trade size) based on model confidence."""
-    min_risk = 0.0025
-    if ml_accuracy < 0.5:
-        return min_risk
-        
-    scale = (ml_accuracy - 0.5) * 2 
-    adaptive_risk_percent = min_risk + (max_risk_percent - min_risk) * scale
-    
-    return adaptive_risk_percent
+    return prob_buy, prob_sell, signal
 
-# --- DASHBOARD FUNCTIONS & HTML TEMPLATE ---
+def adaptive_position_sizing(wallet_balance: float, current_price: float, atr: float, prob_buy: float, prob_sell: float) -> float:
+    """
+    Calculates adaptive position quantity based on ATR, Wallet Balance, and ML Confidence.
 
-HTML_DASHBOARD_TEMPLATE = """
-<!DOCTYPE html>
-<html lang="en">
-<head>
-    <meta charset="UTF-8">
-    <meta http-equiv="refresh" content="60"> <!-- Refresh every 60 seconds (1 minute) -->
-    <title>AI-Driven Trading Bot Dashboard</title>
-    <style>
-        body {{
-            font-family: 'Inter', sans-serif;
-            margin: 0;
-            padding: 20px;
-            background-color: #121212;
-            color: #E0E0E0;
-        }}
-        .container {{
-            max-width: 1000px;
-            margin: auto;
-            background-color: #1E1E1E;
-            padding: 30px;
-            border-radius: 16px;
-            box-shadow: 0 8px 20px rgba(0, 0, 0, 0.6);
-        }}
-        h1 {{
-            color: #4CAF50;
-            border-bottom: 3px solid #4CAF50;
-            padding-bottom: 10px;
-            margin-bottom: 25px;
-            font-size: 2em;
-        }}
-        .metrics-grid {{
-            display: grid;
-            grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
-            gap: 15px;
-            margin-bottom: 30px;
-        }}
-        .metric-card {{
-            background-color: #2A2A2A;
-            padding: 20px;
-            border-radius: 10px;
-            text-align: center;
-            box-shadow: 0 4px 8px rgba(0, 0, 0, 0.4);
-        }}
-        .label {{
-            font-size: 0.8em;
-            color: #9E9E9E;
-            margin-bottom: 5px;
-            text-transform: uppercase;
-        }}
-        .value {{
-            font-size: 1.6em;
-            font-weight: bold;
-            color: #FFFFFF;
-        }}
-        .value.positive {{ color: #4CAF50; }}
-        .value.negative {{ color: #F44336; }}
-        .value.neutral {{ color: #FFEB3B; }}
+    Position Sizing (Risk-based):
+    Position_USD = (Wallet Balance * Effective_Risk_Percent) / (ATR * ATR_MULTIPLIER_SL)
+    Quantity_ATOM = Position_USD / Current Price
+    """
+    # 1. Determine confidence multiplier
+    if prob_buy >= prob_sell:
+        confidence = max(0, prob_buy - 0.5) * 2 # Scale 0.5 to 1.0 to 0 to 1.0
+    else:
+        confidence = max(0, prob_sell - 0.5) * 2
 
-        .price-grid {{
-            display: grid;
-            grid-template-columns: 1fr 1fr;
-            gap: 15px;
-            margin-bottom: 25px;
-        }}
-        .price-card {{
-            background-color: #333333;
-            padding: 15px;
-            border-radius: 10px;
-            text-align: center;
-        }}
-        
-        .signal-grid {{
-            display: flex;
-            justify-content: space-around;
-            text-align: center;
-            margin-bottom: 30px;
-        }}
-        .signal {{
-            flex: 1;
-            padding: 20px;
-            border-radius: 10px;
-            margin: 0 8px;
-            box-shadow: 0 2px 5px rgba(0, 0, 0, 0.5);
-        }}
-        .buy {{ background-color: #1f3a2d; border: 1px solid #4CAF50; }}
-        .sell {{ background-color: #3a1f1f; border: 1px solid #F44336; }}
-        .signal .value {{ font-size: 2.2em; }}
+    # 2. Calculate Effective Risk Percent
+    # Confident trades take a larger risk size, up to 3x BASE_RISK_PERCENT
+    # The effective risk is capped by the high probability, but floored at 1x BASE_RISK_PERCENT
+    effective_risk_percent = BASE_RISK_PERCENT * (1.0 + confidence * 2.0)
+    effective_risk_percent = min(0.03, effective_risk_percent) # Cap at 3% risk
 
-        .position-status {{
-            padding: 20px;
-            border-radius: 12px;
-            margin-top: 25px;
-            font-size: 1.2em;
-            font-weight: bold;
-            text-align: center;
-        }}
-        .status-BUY {{ background-color: #2E7D32; color: #fff; }}
-        .status-SELL {{ background-color: #D32F2F; color: #fff; }}
-        .status-NONE {{ background-color: #546E7A; color: #fff; }}
-    </style>
-</head>
-<body>
-    <div class="container">
-        <h1>Adaptive AI Trading Bot: {SYMBOL}</h1>
-        
-        <div class="price-grid">
-            <div class="price-card">
-                <div class="label">Bid Price (Liquidation/Sell Exit)</div>
-                <div class="value">{BID_PRICE}</div>
-            </div>
-            <div class="price-card">
-                <div class="label">Ask Price (Entry/Buy Exit)</div>
-                <div class="value">{ASK_PRICE}</div>
-            </div>
-        </div>
-        
-        <div class="position-status status-{POSITION_SIDE_UPPER}">
-            <div style="font-size: 0.7em; color: #E0E0E0;">Position Details:</div>
-            CURRENT POSITION: {POSITION_SIDE} ({POSITION_SIZE} {BASE_COIN}) 
-            <br>
-            Entry Price: ${ENTRY_PRICE} | Unrealized PnL: <span class="value {PNL_CLASS}">{UNREALIZED_PNL_USD}</span>
-            <br>
-            {POSITION_ENTRY_TIME_MSG}
-        </div>
+    # 3. Calculate Risk Per Trade (in QUOTE_COIN)
+    # The risk is the potential loss up to the Stop Loss level.
+    risk_per_trade_usdt = wallet_balance * effective_risk_percent
 
-        <h2>AI Strategy & Risk</h2>
-        <div class="metrics-grid">
-            <div class="metric-card">
-                <div class="label">USDT Balance (Real)</div>
-                <div class="value">${WALLET_BALANCE}</div>
-            </div>
-            <div class="metric-card">
-                <div class="label">ML Accuracy (Train)</div>
-                <div class="value">{ML_ACCURACY}</div>
-            </div>
-            <div class="metric-card">
-                <div class="label">Adaptive Threshold</div>
-                <div class="value">{ADAPTIVE_THRESHOLD}</div>
-            </div>
-            <div class="metric-card">
-                <div class="label">Adaptive Risk %</div>
-                <div class="value">{ADAPTIVE_RISK_PERCENT}</div>
-            </div>
-        </div>
+    # 4. Calculate volatility-based risk in price terms (Stop Loss distance)
+    # Stop Loss distance in price: ATR * SL_Multiplier
+    sl_distance = atr * ATR_MULTIPLIER_SL
 
-        <div class="signal-grid">
-            <div class="signal buy">
-                <div class="label">LONG PROBABILITY</div>
-                <div class="value">{PROB_BUY}</div>
-            </div>
-            <div class="signal sell">
-                <div class="label">SHORT PROBABILITY</div>
-                <div class="value">{PROB_SELL}</div>
-            </div>
-        </div>
+    # 5. Calculate Position Size (in BASE_COIN quantity)
+    if sl_distance <= 0:
+        return 0.0
 
-        <h2>Execution & Performance</h2>
-        <div class="metrics-grid">
-            <div class="metric-card">
-                <div class="label">Trade Interval</div>
-                <div class="value">{INTERVAL_SECONDS}s</div>
-            </div>
-            <div class="metric-card">
-                <div class="label">Last Cycle Time</div>
-                <div class="value">{LAST_CYCLE_TIME}s</div>
-            </div>
-        </div>
-        <p style="text-align: center; font-size: 0.7em; color: #666; margin-top: 30px;">
-            Last Updated: {CURRENT_TIME} (Refreshes every {INTERVAL_SECONDS} seconds)
-        </p>
-    </div>
-</body>
-</html>
-"""
+    # Quantity = Risk (in USDT) / Stop Loss Distance (in Price)
+    # Then multiply by LEVERAGE (futures trading assumption)
+    position_quantity_atom = (risk_per_trade_usdt / sl_distance) * LEVERAGE
+
+    # Final check: Must be greater than MIN_QTY
+    return position_quantity_atom if position_quantity_atom >= MIN_QTY else 0.0
+
+# --- DASHBOARD & MAIN LOOP ---
 
 def update_dashboard(
-    wallet_balance, 
-    current_position, 
-    prob_buy, 
-    prob_sell, 
-    ml_accuracy, 
-    adaptive_threshold, 
-    adaptive_risk_percent,
-    position_entry_time,
-    bid_price,
-    ask_price,
-    unrealized_pnl,
-    last_cycle_time
+    wallet_balance: float,
+    current_position: float,
+    prob_buy: float,
+    prob_sell: float,
+    ml_accuracy: float,
+    unrealized_pnl: float,
+    position_entry_time: Optional[datetime],
+    target_price: float,
+    stop_price: float
 ):
-    """Generates the HTML dashboard and saves it to the specified path."""
-    
-    # Format metrics
-    position_size = f"{current_position.get('size', 0.0):.8f}"
-    position_side = current_position.get('side', 'NONE').upper()
-    position_side_upper = position_side if position_side in ['BUY', 'SELL'] else 'NONE'
-    entry_price = f"{current_position.get('entry_price', 0.0):.8f}"
-    
-    # PnL Formatting
-    unrealized_pnl_usd = f"{unrealized_pnl:,.4f} USDT"
-    pnl_class = 'neutral'
-    if unrealized_pnl > 0.0001:
-        pnl_class = 'positive'
-    elif unrealized_pnl < -0.0001:
-        pnl_class = 'negative'
+    """Generates the HTML dashboard file."""
+    # Format data for display
+    current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
-    # Format entry time message
-    position_entry_time_msg = "No Open Position Duration"
-    if current_position.get('size', 0) > 0 and position_entry_time:
-        duration = datetime.now() - position_entry_time
-        total_seconds = int(duration.total_seconds())
-        hours, remainder = divmod(total_seconds, 3600)
-        minutes, seconds = divmod(remainder, 60)
-        
-        position_entry_time_msg = f"Duration: {hours:02d}h {minutes:02d}m {seconds:02d}s"
+    # Determine Position Status and Side
+    if current_position > 0:
+        status_text = f"LONG ({abs(current_position):.8f} {BASE_COIN})"
+        status_color = 'bg-green-600'
+    elif current_position < 0:
+        status_text = f"SHORT ({abs(current_position):.8f} {BASE_COIN})"
+        status_color = 'bg-red-600'
+    else:
+        status_text = "FLAT"
+        status_color = 'bg-gray-600'
 
-    
-    # Fill template variables
-    html_content = HTML_DASHBOARD_TEMPLATE.format(
-        SYMBOL=SYMBOL,
-        BASE_COIN=BASE_COIN,
-        WALLET_BALANCE=f"{wallet_balance:,.2f}",
-        BID_PRICE=f"{bid_price:,.8f}",
-        ASK_PRICE=f"{ask_price:,.8f}",
-        ENTRY_PRICE=entry_price,
-        UNREALIZED_PNL_USD=unrealized_pnl_usd,
-        PNL_CLASS=pnl_class,
-        ML_ACCURACY=f"{ml_accuracy:.2%}",
-        ADAPTIVE_THRESHOLD=f"{adaptive_threshold:.4f}",
-        ADAPTIVE_RISK_PERCENT=f"{adaptive_risk_percent:.2%}",
-        PROB_BUY=f"{prob_buy:.4f}",
-        PROB_SELL=f"{prob_sell:.4f}",
-        POSITION_SIDE=position_side,
-        POSITION_SIDE_UPPER=position_side_upper,
-        POSITION_SIZE=position_size,
-        POSITION_ENTRY_TIME_MSG=position_entry_time_msg,
-        INTERVAL_SECONDS=INTERVAL_SECONDS,
-        LAST_CYCLE_TIME=f"{last_cycle_time:.2f}",
-        CURRENT_TIME=datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    )
+    pnl_color = 'text-green-400' if unrealized_pnl >= 0 else 'text-red-400'
 
-    # Robustly write to file (Check permissions)
+    entry_time_display = position_entry_time.strftime("%H:%M:%S") if position_entry_time else 'N/A'
+
+    # Get the contents of the dashboard HTML file
+    dashboard_content = f"""
+        <!-- Generated at {current_time} -->
+        <div class="p-6 max-w-4xl mx-auto bg-gray-900 shadow-2xl rounded-xl">
+            <h1 class="text-3xl font-extrabold text-blue-400 mb-6 border-b border-gray-700 pb-2">
+                AI Adaptive Futures Bot Status
+            </h1>
+            <div class="grid grid-cols-1 md:grid-cols-3 gap-4 mb-6">
+                <!-- Wallet Balance -->
+                <div class="p-4 bg-gray-800 rounded-lg">
+                    <p class="text-sm font-medium text-gray-400">USDT Wallet Balance</p>
+                    <p class="text-2xl font-bold text-white">${wallet_balance:,.2f}</p>
+                </div>
+                <!-- Current Position -->
+                <div class="{status_color} p-4 rounded-lg text-white">
+                    <p class="text-sm font-medium">Position Status</p>
+                    <p class="text-2xl font-bold">{status_text}</p>
+                </div>
+                <!-- Unrealized PnL -->
+                <div class="p-4 bg-gray-800 rounded-lg">
+                    <p class="text-sm font-medium text-gray-400">Unrealized PnL</p>
+                    <p class="text-2xl font-bold {pnl_color}">${unrealized_pnl:,.4f}</p>
+                </div>
+            </div>
+
+            <!-- Trade Metrics -->
+            <div class="grid grid-cols-2 gap-4 mb-6">
+                <div class="p-4 bg-gray-800 rounded-lg">
+                    <p class="text-sm font-medium text-gray-400">Target Price (TP)</p>
+                    <p class="text-xl font-semibold text-cyan-400">{target_price:.8f} USDT</p>
+                </div>
+                <div class="p-4 bg-gray-800 rounded-lg">
+                    <p class="text-sm font-medium text-gray-400">Stop Loss Price (SL)</p>
+                    <p class="text-xl font-semibold text-pink-400">{stop_price:.8f} USDT</p>
+                </div>
+            </div>
+
+            <h2 class="text-xl font-semibold text-gray-300 mt-6 mb-4 border-b border-gray-700 pb-2">
+                AI Signal Confidence & Metrics
+            </h2>
+            <div class="grid grid-cols-3 gap-4">
+                <div class="p-4 bg-gray-800 rounded-lg">
+                    <p class="text-sm font-medium text-gray-400">ML Buy Confidence</p>
+                    <p class="text-2xl font-bold text-green-400">{(prob_buy * 100):.2f}%</p>
+                </div>
+                <div class="p-4 bg-gray-800 rounded-lg">
+                    <p class="text-sm font-medium text-gray-400">ML Sell Confidence</p>
+                    <p class="text-2xl font-bold text-red-400">{(prob_sell * 100):.2f}%</p>
+                </div>
+                <div class="p-4 bg-gray-800 rounded-lg">
+                    <p class="text-sm font-medium text-gray-400">Model Accuracy</p>
+                    <p class="text-2xl font-bold text-yellow-400">{(ml_accuracy * 100):.2f}%</p>
+                </div>
+            </div>
+
+            <h2 class="text-xl font-semibold text-gray-300 mt-6 mb-4 border-b border-gray-700 pb-2">
+                Position Details
+            </h2>
+            <div class="grid grid-cols-2 gap-4">
+                <div class="p-4 bg-gray-800 rounded-lg">
+                    <p class="text-sm font-medium text-gray-400">Entry Time</p>
+                    <p class="text-lg font-semibold text-white">{entry_time_display}</p>
+                </div>
+                <div class="p-4 bg-gray-800 rounded-lg">
+                    <p class="text-sm font-medium text-gray-400">Leverage</p>
+                    <p class="text-lg font-semibold text-white">{LEVERAGE}x</p>
+                </div>
+            </div>
+
+            <p class="text-xs text-gray-500 mt-6 text-center">
+                Last Update: {current_time} | Symbol: {SYMBOL}
+            </p>
+        </div>
+    """
+
     try:
-        # Ensure the directory exists
-        os.makedirs(os.path.dirname(DASHBOARD_PATH) or '.', exist_ok=True)
+        # Check permissions and write to file
         with open(DASHBOARD_PATH, "w") as f:
-            f.write(html_content)
-        print(f"Dashboard successfully updated to {DASHBOARD_PATH}")
-    except Exception as e:
-        print(f"CRITICAL ERROR: Could not write dashboard to {DASHBOARD_PATH}. Check path and permissions. Error: {e}")
-
-# --- MAIN BOT LOGIC ---
+            f.write(dashboard_content)
+        # print(f"Dashboard successfully updated at {DASHBOARD_PATH}")
+        # Note: Do not print success message repeatedly in the loop.
+    except IOError as e:
+        print(f"ERROR: Could not write to dashboard file {DASHBOARD_PATH}. Check permissions: {e}")
 
 def main():
-    global ml_model, scaler, initial_fit_done
-
-    # State variables for dashboard and trade tracking
-    position_entry_time = None 
+    """The main trading bot loop."""
+    global bot_state
     
-    # Initialize dashboard variables (used for dashboard update on first cycle)
-    wallet_balance = 0.0
-    current_position = {'size': 0.0, 'side': 'NONE', 'entry_price': 0.0}
-    bid_price = 0.0
-    ask_price = 0.0
-    ml_accuracy = 0.5
-    prob_buy = 0.5
-    prob_sell = 0.5
-    adaptive_threshold = BASE_PROBABILITY_THRESHOLD
-    adaptive_risk_percent = calculate_adaptive_risk(ml_accuracy)
-    unrealized_pnl = 0.0
-    last_cycle_time = 0.0
-    
-    # --- Initial Setup ---
-    try:
-        # Initial fetch to get data for ML training
-        wallet_balance, current_position, historical_df, bid_price, ask_price = get_current_state()
-        
-        # Initial position 'side' must be inferred or manually set if position exists on start
-        if current_position['size'] > 0:
-            print("WARNING: Existing position detected. Setting side to BUY placeholder.")
-            current_position['side'] = 'BUY' 
-            position_entry_time = datetime.now() # Assume current time as entry time
-            
-        if historical_df.empty:
-            print("FATAL: Cannot initialize due to empty historical data DataFrame.")
-            sys.exit(1)
+    # Placeholder for the latest calculated ATR and price
+    latest_atr = 0.0
+    latest_price = 0.0
 
-        historical_df = create_target_variable(historical_df)
-        historical_df = calculate_advanced_indicators(historical_df)
-        
-        # Train model for the first time
-        # FIX: Pass only historical_df, as globals are accessed directly inside the function
-        ml_accuracy = setup_and_train_ml_model(historical_df)
-        print("Initial ML model trained successfully.")
-    except Exception as e:
-        print(f"FATAL: Initial setup failed. Ensure all custom scripts are executable and return expected data. Error: {e}")
-        sys.exit(1)
+    # Initial ML training flag
+    is_model_trained = False
+    ml_accuracy = 0.0
 
+    print(f"--- AI Adaptive Bot Initializing for {SYMBOL} ---")
 
     while True:
         start_time = time.time()
-        elapsed = 0.0
+        print(f"\n--- Cycle Start: {datetime.now().strftime('%H:%M:%S')} ---")
 
-        try:
-            # 1. Get current market and account state
-            wallet_balance, current_position_new, historical_df, bid_price, ask_price = get_current_state()
-            
-            # Preserve 'side' and 'entry_time' if position is still open, otherwise reset
-            if current_position_new['size'] > 0:
-                # If size > 0, update size/entry_price but keep the currently tracked side
-                current_position.update({
-                    'size': current_position_new['size'], 
-                    'entry_price': current_position_new['entry_price']
-                })
-                
-                # If side is still 'NONE' but size is positive, assume BUY as a fail-safe
-                if current_position['side'] == 'NONE':
-                    current_position['side'] = 'BUY' 
-                    if position_entry_time is None:
-                        position_entry_time = datetime.now()
-
-            else:
-                 # Position closed or never opened
-                 current_position = {'size': 0.0, 'side': 'NONE', 'entry_price': 0.0}
-                 position_entry_time = None
-
-
-            # 2. Update Data and Indicators
-            if historical_df.empty:
-                 print("ERROR: Historical data is empty, skipping cycle.")
-                 raise Exception("Empty historical data.")
-                 
-            historical_df = create_target_variable(historical_df)
-            historical_df = calculate_advanced_indicators(historical_df)
-            
-            # 3. Retrain ML Model (for adaptive learning)
-            # FIX: Pass only historical_df
-            ml_accuracy = setup_and_train_ml_model(historical_df)
-
-            # 4. Get Prediction
-            # FIX: Pass only historical_df
-            prob_buy, prob_sell = get_ml_prediction(historical_df)
-            
-            # 5. Adaptive Strategy
-            adaptive_threshold = calculate_adaptive_threshold(ml_accuracy, BASE_PROBABILITY_THRESHOLD)
-            adaptive_risk_percent = calculate_adaptive_risk(ml_accuracy)
-            
-            # 6. PnL and Position Management
-
-            unrealized_pnl = calculate_unrealized_pnl(current_position, bid_price, ask_price)
-            print(f"Unrealized PnL: {unrealized_pnl:.4f} USDT")
-
-            # T-SL check
-            if current_position['size'] > 0 and position_entry_time:
-                holding_duration = datetime.now() - position_entry_time
-                if holding_duration.total_seconds() > MAX_HOLDING_PERIOD_MINUTES * 60:
-                    print(f"T-SL triggered: Held for over {MAX_HOLDING_PERIOD_MINUTES}m. Closing position via {CLOSE_POSITIONS_SCRIPT}.")
-                    
-                    # Execute closure
-                    run_bash_command(CLOSE_POSITIONS_SCRIPT)
-                    
-                    # Reset position tracking
-                    current_position['size'] = 0.0
-                    current_position['side'] = 'NONE'
-                    position_entry_time = None
-                    print("T-SL executed. Position closed.")
-            
-            # Trade Signal Generation
-            trade_action = 'HOLD'
-            trade_side = None
-            
-            if prob_buy >= adaptive_threshold and prob_buy > prob_sell:
-                trade_action = 'OPEN_LONG'
-                trade_side = 'Buy'
-            elif prob_sell >= adaptive_threshold and prob_sell > prob_buy:
-                trade_action = 'OPEN_SHORT'
-                trade_side = 'Sell'
-            
-            
-            if trade_action != 'HOLD':
-                # Use Ask for Long entry, Bid for Short entry (conservative entry)
-                current_market_price = ask_price if trade_side == 'Buy' else bid_price
-                
-                if current_market_price == 0.0:
-                    print("HOLD: Market price is zero. Cannot execute trade.")
-                else:
-                    risk_amount = wallet_balance * adaptive_risk_percent
-                    # Calculate quantity based on risk and leverage
-                    quantity_to_trade = (risk_amount * LEVERAGE) / current_market_price
-                    
-                    if quantity_to_trade >= MIN_QTY:
-                        msg = f"SIGNAL: {trade_action} ({trade_side}). Prob: {prob_buy:.4f}/{prob_sell:.4f}. Qty: {quantity_to_trade:.8f}"
-                        print(msg)
-                        
-                        success, executed_side = execute_trade(trade_side, quantity_to_trade, current_position)
-                        
-                        if success:
-                             # Position details and entry time are set ONLY if trade is successful
-                             
-                             # Wait a moment and re-fetch real info to update current_position details
-                             time.sleep(1.0) 
-                             # Re-fetch the *size* and *entry_price* from the script output after the trade
-                             _, current_position_info, _, _, _ = get_current_state()
-                             
-                             current_position.update({
-                                 'size': current_position_info.get('size', 0.0),
-                                 'entry_price': current_position_info.get('entry_price', 0.0),
-                                 'side': executed_side.upper() # Update the side to the executed side
-                             })
-                             
-                             print(f"Trade successful. New position: {current_position}")
-                             position_entry_time = datetime.now() 
-                             
-                        else:
-                            print("Trade execution failed. Continuing...")
-                            
-                    else:
-                        print(f"HOLD: Calculated quantity {quantity_to_trade:.8f} is too small.")
-            else:
-                print("HOLD: No high-confidence signal.")
-
-        except Exception as e:
-            import traceback
-            print(f"ERROR: Cycle failed due to exception: {e}")
-            traceback.print_exc()
-
-        # 7. Update Dashboard (always run, even on error)
-        end_time = time.time()
-        elapsed = end_time - start_time
-        last_cycle_time = elapsed # Use 'elapsed' as the 'last_cycle_time'
+        # 1. Fetch Data
+        data_frame, bid, ask = fetch_ticker_and_historical_data()
+        current_price = (bid + ask) / 2 if bid and ask else data_frame['close'].iloc[-1]
         
+        if bid is None or ask is None:
+            print("WARNING: Could not fetch real-time bid/ask from ccxt. Skipping this cycle.")
+            time.sleep(INTERVAL_SECONDS)
+            continue
+
+        latest_price = current_price
+
+        # 2. Calculate Indicators
+        df_indicators = calculate_indicators(data_frame.copy())
+        if not df_indicators.empty:
+            latest_atr = df_indicators['ATR'].iloc[-1]
+            print(f"Latest Price: {current_price:.8f} | ATR: {latest_atr:.8f}")
+        else:
+            print("ERROR: Indicators could not be calculated. Skipping cycle.")
+            time.sleep(INTERVAL_SECONDS)
+            continue
+
+
+        # 3. Train ML Model
+        ml_accuracy = prepare_and_train_model(df_indicators) or ml_accuracy
+        if ml_accuracy:
+            is_model_trained = True
+            print(f"Model Trained. Accuracy: {ml_accuracy * 100:.2f}%")
+        else:
+            is_model_trained = False
+
+        # 4. Get Latest Wallet Balance (critical for sizing)
+        wallet_balance = run_wallet_sh()
+        if wallet_balance is not None:
+            bot_state['wallet_balance'] = wallet_balance
+        else:
+            wallet_balance = bot_state['wallet_balance'] # Use simulated balance as fallback
+            print(f"WARNING: Could not fetch real wallet balance. Using fallback: ${wallet_balance:.2f}")
+
+
+        # --- Adaptive Signal Generation and Execution ---
+
+        prob_buy, prob_sell, signal = 0.0, 0.0, 'HOLD'
+        target_price, stop_price = 0.0, 0.0
+
+        if is_model_trained:
+            prob_buy, prob_sell, signal = generate_signal(df_indicators)
+            print(f"AI Signal: {signal} | Conf: B={prob_buy:.4f} S={prob_sell:.4f}")
+
+        # 5. Position Management (Exit/Take Profit/Stop Loss)
+
+        # Get the true position info from the bash script (updates bot_state['current_position'])
+        unrealized_pnl, position_info = get_unrealized_pnl(SYMBOL, latest_price)
+        current_position = bot_state['current_position']
+        entry_price = position_info.get('entry_price', bot_state['position_entry_price'])
+        position_side = position_info.get('side', 'Flat')
+        
+        # Recalculate T/SL based on latest ATR and Entry Price if a position is open
+        if current_position != 0.0 and entry_price > 0 and latest_atr > 0:
+            
+            # Recalculate dynamic T/SL prices based on current ATR and position side
+            if position_side == 'Long':
+                target_price = entry_price + (latest_atr * ATR_MULTIPLIER_TP)
+                stop_price = entry_price - (latest_atr * ATR_MULTIPLIER_SL)
+                
+                # Check for TP/SL exit
+                if latest_price >= target_price:
+                    print(f"TAKE PROFIT (LONG): Price {latest_price:.8f} >= TP {target_price:.8f}")
+                    run_place_order(current_position, 'sell')
+                    bot_state['current_position'] = 0.0
+                elif latest_price <= stop_price:
+                    print(f"STOP LOSS (LONG): Price {latest_price:.8f} <= SL {stop_price:.8f}")
+                    run_place_order(current_position, 'sell')
+                    bot_state['current_position'] = 0.0
+            
+            elif position_side == 'Short':
+                target_price = entry_price - (latest_atr * ATR_MULTIPLIER_TP)
+                stop_price = entry_price + (latest_atr * ATR_MULTIPLIER_SL)
+                
+                # Check for TP/SL exit
+                if latest_price <= target_price:
+                    print(f"TAKE PROFIT (SHORT): Price {latest_price:.8f} <= TP {target_price:.8f}")
+                    run_place_order(current_position, 'buy')
+                    bot_state['current_position'] = 0.0
+                elif latest_price >= stop_price:
+                    print(f"STOP LOSS (SHORT): Price {latest_price:.8f} >= SL {stop_price:.8f}")
+                    run_place_order(current_position, 'buy')
+                    bot_state['current_position'] = 0.0
+
+            # Check for Time-Based Stop Loss (T-SL)
+            if bot_state['position_entry_time'] and datetime.now() > (bot_state['position_entry_time'] + timedelta(minutes=MAX_HOLDING_PERIOD_MINUTES)):
+                print(f"TIME-BASED STOP LOSS: Position held for over {MAX_HOLDING_PERIOD_MINUTES} minutes. Closing...")
+                if position_side == 'Long':
+                    run_place_order(current_position, 'sell')
+                elif position_side == 'Short':
+                    run_place_order(current_position, 'buy')
+                bot_state['current_position'] = 0.0
+            
+            # If position was closed by T/SL/TP logic above, reset entry time
+            if bot_state['current_position'] == 0.0:
+                bot_state['position_entry_time'] = None
+                bot_state['position_entry_price'] = 0.0
+
+        # 6. Signal Execution (Entry)
+        if current_position == 0.0 and is_model_trained and latest_atr > 0:
+            quantity_to_trade = adaptive_position_sizing(wallet_balance, current_price, latest_atr, prob_buy, prob_sell)
+
+            if quantity_to_trade >= MIN_QTY:
+                
+                success = False
+                if signal == 'BUY':
+                    print(f"ENTRY LONG: Qty={quantity_to_trade:.8f}, Price={current_price:.8f}")
+                    msg, success = run_place_order(quantity_to_trade, 'buy')
+                    if success:
+                        bot_state['current_position'] = quantity_to_trade
+                        bot_state['position_entry_price'] = latest_price
+                elif signal == 'SELL':
+                    # Short position is a negative quantity internally
+                    print(f"ENTRY SHORT: Qty={quantity_to_trade:.8f}, Price={current_price:.8f}")
+                    msg, success = run_place_order(quantity_to_trade, 'sell')
+                    if success:
+                        bot_state['current_position'] = -quantity_to_trade
+                        bot_state['position_entry_price'] = latest_price
+
+                if success:
+                    print(f"Order Success: {msg}")
+                    # Set entry time for T-SL tracking
+                    bot_state['position_entry_time'] = datetime.now()
+                else:
+                    print(f"Order Error: {msg}")
+
+            else:
+                print(f"HOLD: Calculated quantity {quantity_to_trade:.8f} is too small or signal confidence too low.")
+        else:
+            print(f"Current Position: {current_position:.8f} | Unrealized PnL: ${unrealized_pnl:.4f}")
+            if current_position == 0.0 and not is_model_trained:
+                 print("HOLD: Waiting for enough data to train ML model.")
+
+        # 7. Update Dashboard
         update_dashboard(
-            wallet_balance, 
-            current_position, 
-            prob_buy, 
-            prob_sell, 
-            ml_accuracy, 
-            adaptive_threshold, 
-            adaptive_risk_percent,
-            position_entry_time,
-            bid_price,
-            ask_price,
+            wallet_balance,
+            bot_state['current_position'],
+            prob_buy,
+            prob_sell,
+            ml_accuracy,
             unrealized_pnl,
-            last_cycle_time
+            bot_state['position_entry_time'],
+            target_price,
+            stop_price
         )
 
         # 8. Wait for next cycle
-        sleep_duration = max(0, INTERVAL_SECONDS - elapsed)
+        end_time = time.time()
+        elapsed = end_time - start_time
+        sleep_duration = max(0.0, INTERVAL_SECONDS - elapsed)
         print(f"Cycle finished in {elapsed:.2f}s. Sleeping for {sleep_duration:.2f}s.")
         time.sleep(sleep_duration)
+
+def close_all_positions_on_start():
+    """Runs the close positions script once at startup."""
+    run_close_positions_sh()
+    # Reset state after closing
+    bot_state['current_position'] = 0.0
+    bot_state['position_entry_price'] = 0.0
+    bot_state['position_entry_time'] = None
 
 if __name__ == '__main__':
     # Initial setup before the main loop starts
     close_all_positions_on_start()
-    
+
     # Run the main bot logic
     try:
         main()
@@ -843,4 +650,4 @@ if __name__ == '__main__':
         print("\nBot stopped by user (KeyboardInterrupt).")
     except Exception as e:
         print(f"\nCRITICAL BOT FAILURE: {e}")
-        time.sleep(5) # Wait before exiting to allow console visibility
+        time.sleep(5)
