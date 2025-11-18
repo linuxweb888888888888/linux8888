@@ -397,14 +397,14 @@ class TradingBot:
             history_html = "<div class='log-entry neutral-pos'>Awaiting first action...</div>"
 
 
+        # --- START HTML GENERATION with AJAX Wrappers ---
         html = f"""
         <!DOCTYPE html>
         <html lang="en">
         <head>
             <meta charset="UTF-8">
-            <meta http-equiv="refresh" content="0.5"> <!-- Faster refresh for UHF feel -->
             <meta name="viewport" content="width=device-width, initial-scale=1.0">
-            <title>UHF SCALPER COMMAND CENTER V2.0</title>
+            <title>UHF SCALPER COMMAND CENTER V2.0 (AJAX)</title>
             <style>
                 @import url('https://fonts.googleapis.com/css2?family=Orbitron:wght@400;700;900&family=Roboto+Mono:wght@300;400;700&display=swap');
                 
@@ -582,62 +582,65 @@ class TradingBot:
             <div class="header">UHF SCALPER V2.0 / {SYMBOL_CCXT} MONITOR</div>
             
             <div class="container">
-                <div class="status-bar {pos_class}">
-                    <span>POSITION STATUS: {pos_dir}</span>
-                    <span>QTY: {pos_qty_display} {BASE_COIN}</span>
-                    <span>ENTRY: {position['entry_price']:.6f}</span>
+                <div id="position-status-wrapper">
+                    <div class="status-bar {pos_class}">
+                        <span>POSITION STATUS: {pos_dir}</span>
+                        <span>QTY: {pos_qty_display} {BASE_COIN}</span>
+                        <span>ENTRY: {position['entry_price']:.6f}</span>
+                    </div>
                 </div>
 
                 <div class="grid-main">
-                    <!-- LEFT COLUMN: PNL and Key Metrics -->
                     <div>
-                        <!-- PNL BLOCK (Dominant) -->
                         <div class="card pnl-block" style="border-left: 4px solid {'var(--success-green)' if unrealized_pnl > 0 else 'var(--danger-red)' if unrealized_pnl < 0 else 'var(--neutral-gray)'};">
                             <h2>UNREALIZED PNL</h2>
-                            <div class="value pnl {pnl_class}">{unrealized_pnl:.6f} USDT</div>
-                            <div class="sub">Required Profit to Close: <span class="success-text">{required_pnl_usd:.6f} USDT</span></div>
+                            <div id="pnl-block-content">
+                                <div class="value pnl {pnl_class}">{unrealized_pnl:.6f} USDT</div>
+                                <div class="sub">Required Profit to Close: <span class="success-text">{required_pnl_usd:.6f} USDT</span></div>
+                            </div>
                         </div>
                         
-                        <!-- AI CONFIDENCE GAUGE -->
                         <div class="card" style="margin-top: 15px;">
                             <h2>AI CONFIDENCE GAUGE</h2>
-                            <div class="confidence-gauge">
-                                <div class="threshold-marker" style="left: {threshold_pos}%;"></div>
-                                <div class="confidence-fill" style="width: {confidence_width}%;"></div>
-                            </div>
-                            <div class="gauge-labels">
-                                <span>0%</span>
-                                <span>Threshold: {threshold:.1f}%</span>
-                                <span>Confidence: {confidence:.1f}%</span>
-                                <span>100%</span>
+                            <div id="confidence-gauge-content">
+                                <div class="confidence-gauge">
+                                    <div class="threshold-marker" style="left: {threshold_pos}%;"></div>
+                                    <div class="confidence-fill" style="width: {confidence_width}%;"></div>
+                                </div>
+                                <div class="gauge-labels">
+                                    <span>0%</span>
+                                    <span>Threshold: {threshold:.1f}%</span>
+                                    <span>Confidence: {confidence:.1f}%</span>
+                                    <span>100%</span>
+                                </div>
                             </div>
                         </div>
                     </div>
                     
-                    <!-- RIGHT COLUMN: ACTION HISTORY & CURRENT PRICE -->
                     <div>
-                        <!-- MARKET PRICE -->
                         <div class="card">
                             <h2>CURRENT PRICE</h2>
-                            <div class="value neutral-text">{price_info['last']:.6f}</div>
-                            <div class="sub">AI Signal: <span style="color: {signal_color}">{ai_signal} ({prediction:.8f})</span></div>
-                            
-                            <div style="margin-top: 10px;">
-                                <div class="metric-title">TARGET EXIT PRICE</div>
-                                <div class="metric-value success-text">{target_price:.6f}</div>
+                            <div id="price-block-content">
+                                <div class="value neutral-text">{price_info['last']:.6f}</div>
+                                <div class="sub">AI Signal: <span style="color: {signal_color}">{ai_signal} ({prediction:.8f})</span></div>
+                                
+                                <div style="margin-top: 10px;">
+                                    <div class="metric-title">TARGET EXIT PRICE</div>
+                                    <div class="metric-value success-text">{target_price:.6f}</div>
+                                </div>
                             </div>
                         </div>
                         
-                        <!-- ACTION HISTORY LOG -->
                         <div class="card" style="margin-top: 15px;">
                             <h2>RECENT ACTION LOG</h2>
-                            {history_html}
+                            <div id="action-history-log">
+                                {history_html}
+                            </div>
                         </div>
                     </div>
                 </div>
 
-                <!-- BOTTOM ROW: CORE METRICS -->
-                <div class="grid-bottom">
+                <div class="grid-bottom" id="core-metrics-row">
                     
                     <div class="card">
                         <h2>ACCOUNT BALANCE</h2>
@@ -666,12 +669,59 @@ class TradingBot:
             </div>
             
             <script>
-                // Prevents flicker on refresh if the dashboard were to rely on JS animations
-                // Not strictly necessary here but good practice for high-freq updates
+                const REFRESH_INTERVAL_MS = 500; // 0.5 seconds
+
+                function fetchDataAndRender() {{
+                    // NOTE: This client-side script fetches the entire updated HTML file 
+                    // that the bot constantly writes to the disk. It then parses the 
+                    // new content and swaps only the dynamic sections to prevent flicker.
+                    fetch(window.location.href) 
+                        .then(response => response.text())
+                        .then(html => {{
+                            const parser = new DOMParser();
+                            const doc = parser.parseFromString(html, 'text/html');
+
+                            // Find and update all dynamic blocks by ID
+                            const dynamic_ids = [
+                                'position-status-wrapper', 
+                                'pnl-block-content', 
+                                'confidence-gauge-content', 
+                                'price-block-content', 
+                                'action-history-log', 
+                                'core-metrics-row'
+                            ];
+
+                            dynamic_ids.forEach(id => {{
+                                const newContent = doc.getElementById(id);
+                                const currentElement = document.getElementById(id);
+                                if (newContent && currentElement) {{
+                                    // Replace the inner HTML of the current element with the new content
+                                    currentElement.innerHTML = newContent.innerHTML;
+                                    
+                                    // SPECIAL CASE: Update the border-left style for the PNL card 
+                                    // (This style is defined on the parent element of pnl-block-content)
+                                    if (id === 'pnl-block-content') {{
+                                        const newParentStyle = newContent.parentNode.getAttribute('style');
+                                        currentElement.parentNode.setAttribute('style', newParentStyle);
+                                    }}
+                                }}
+                            }});
+                        }})
+                        .catch(error => console.error('Error fetching dashboard data:', error));
+                }}
+
+                // Start the polling process once the page is fully loaded
+                document.addEventListener('DOMContentLoaded', () => {{
+                    // Execute the update immediately, then set the interval
+                    fetchDataAndRender(); 
+                    setInterval(fetchDataAndRender, REFRESH_INTERVAL_MS);
+                }});
             </script>
         </body>
         </html>
         """
+        # --- END HTML GENERATION ---
+        
         try:
             with open(DASHBOARD_PATH, 'w') as f:
                 f.write(html)
