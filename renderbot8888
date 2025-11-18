@@ -94,6 +94,7 @@ def get_current_state():
     
     if success and coin_info_output:
         # Define regex to extract key information
+        # Note: Added parsing for Bid and Ask which were often missing in previous outputs
         size_match = re.search(r'Quantity:\s*([\d.]+)', coin_info_output)
         entry_match = re.search(r'Entry Price:\s*([\d.]+)', coin_info_output)
         bid_match = re.search(r'Bid:\s*([\d.]+)', coin_info_output)
@@ -109,20 +110,15 @@ def get_current_state():
             if size_match and entry_match:
                 current_position['size'] = float(size_match.group(1))
                 current_position['entry_price'] = float(entry_match.group(1))
-                # Determine side based on context or assume it's set elsewhere (default to BUY for PnL calculation until we can infer side)
-                # NOTE: Since /coinrealinfo.sh doesn't explicitly state 'side', we'll rely on a manual check for now.
-                # In a real system, the trading platform provides 'side'. Here, we assume a side if PnL is non-zero or based on the latest trade.
-                # For simplicity, if size > 0, we assume the side is determined by the last executed trade. 
-                # For this iteration, we'll track 'side' in the main loop after a trade is executed.
-                pass # Side is tracked globally after a successful trade in 'main()'
+                # The 'side' is tracked globally in 'main' after a successful trade execution.
+                pass 
 
     # 3. Fetch historical data (assuming hitbtc get_history command still works for candles)
-    # Since the user only mentioned replacing trading/wallet scripts, we keep the history call pattern for CCXT/HitBTC for the technical analysis data
     history_output, hist_success = run_bash_command(f"hitbtc get_history {SYMBOL} 1m {LOOKBACK_PERIOD + 100}", print_output=True)
     historical_data = []
     if hist_success and isinstance(history_output, str):
         try:
-             # Attempt to parse the string output as JSON, assuming it was successful
+             # Attempt to parse the string output as JSON
              history_json = json.loads(history_output)
              historical_data = history_json.get('result', []) if isinstance(history_json, dict) else []
         except json.JSONDecodeError:
@@ -133,7 +129,10 @@ def get_current_state():
         if ask_price > 0:
             latest_price = ask_price # Use the real-time ask as a fallback
         else:
-            raise ValueError("Failed to fetch historical data and real-time prices are 0. Cannot continue.")
+            # If no price is available, we can't continue the TA logic
+            print("ERROR: Failed to fetch historical data and real-time prices are 0. Cannot generate DF.")
+            df = pd.DataFrame()
+            return wallet_balance, current_position, df, bid_price, ask_price
         
         # Create a single row DF based on the latest available price for prediction input
         df = pd.DataFrame([{
@@ -183,7 +182,6 @@ def execute_trade(side, quantity, current_position):
     
     if current_position['size'] > 0 and current_position.get('side') != 'NONE' and is_opposing_trade:
         # Close existing position first
-        # Since /closepositions.sh is provided, we use that for a clean slate
         print(f"Attempting to close existing {current_position.get('side')} position via {CLOSE_POSITIONS_SCRIPT}...")
         close_output, success = run_bash_command(CLOSE_POSITIONS_SCRIPT, print_output=True)
         if not success or 'SUCCESS' not in close_output.upper():
@@ -192,7 +190,6 @@ def execute_trade(side, quantity, current_position):
         time.sleep(1.0) # Give exchange time to process closure
         
     # Place new order
-    # Format quantity to 8 decimal places for the shell script
     quantity_str = f"{quantity:.8f}"
     order_command = f"{PLACE_ORDER_SCRIPT} {BASE_COIN} {quantity_str} {side}"
     print(f"Executing trade: {order_command}")
@@ -217,7 +214,7 @@ def close_all_positions_on_start():
     else:
         print("Position closure script failed or returned error. Bot may start with an open position.")
 
-# --- INDICATOR CALCULATION (UNCHANGED) ---
+# --- INDICATOR CALCULATION ---
 
 def calculate_wilders_smoothing(series, period):
     return series.ewm(alpha=1/period, adjust=False).mean()
@@ -261,8 +258,7 @@ def calculate_advanced_indicators(historical_df):
     df['-DM'] = np.where((df['Low'].shift(1) > df['Low']) & (df['Low'].shift(1) - df['Low'] > df['High'] - df['High'].shift(1)), df['Low'].shift(1) - df['Low'], 0)
     
     df['+DI'] = calculate_wilders_smoothing(df['+DM'], window) / df['ATR'] * 100
-    df['-DI'] = calculate_wilders_smoothing(df['-DM'], window) / df['ATR'] * 100 # Should be '-DM'
-    df['-DI'] = calculate_wilders_smoothing(df['-DM'], window) / df['ATR'] * 100
+    df['-DI'] = calculate_wilders_smoothing(df['-DM'], window) / df['ATR'] * 100 
     
     df['DX'] = abs(df['+DI'] - df['-DI']) / (df['+DI'] + df['-DI']) * 100
     df['ADX'] = calculate_wilders_smoothing(df['DX'], window)
@@ -296,7 +292,7 @@ def calculate_advanced_indicators(historical_df):
     
     return df
 
-# --- MACHINE LEARNING & ADAPTIVE LOGIC (UNCHANGED) ---
+# --- MACHINE LEARNING & ADAPTIVE LOGIC ---
 
 def create_target_variable(df):
     df['Target'] = np.where(df['Close'].shift(-1) > df['Close'], 1, 0)
@@ -305,18 +301,20 @@ def create_target_variable(df):
 def get_feature_cols():
     return ['ATR', 'RSI', 'CCI', 'ADX', 'ROC', 'NVI', 'Volatility']
 
-def setup_and_train_ml_model(historical_df, model, scaler, initial_fit_done):
-    """Prepares data, trains the model, and updates the scaler if necessary."""
-    global ml_model, initial_fit_done, scaler
+def setup_and_train_ml_model(historical_df):
+    """
+    Prepares data, trains the model, and updates the scaler if necessary.
+    Uses global variables for ml_model, scaler, and initial_fit_done.
+    """
+    # FIX: Remove model, scaler, initial_fit_done from parameters to resolve SyntaxError.
+    global ml_model, initial_fit_done, scaler 
 
     feature_cols = get_feature_cols()
     
     if len(historical_df) < MIN_TRAINING_SAMPLES:
-        # Fallback for initial run if only one candle could be fetched
         if len(historical_df) > 0 and not initial_fit_done:
-             # Train with the limited data if possible, or skip training
              print("Warning: Insufficient historical data for full training. Skipping ML training.")
-             return model, scaler, initial_fit_done, 0.5
+             return 0.5
         
         if len(historical_df) == 0:
             raise ValueError("Not enough data to train ML model.")
@@ -335,11 +333,17 @@ def setup_and_train_ml_model(historical_df, model, scaler, initial_fit_done):
     ml_model.fit(X_train_scaled, y_train)
     accuracy = ml_model.score(X_train_scaled, y_train)
     
-    return ml_model, scaler, initial_fit_done, accuracy
+    return accuracy
 
-def get_ml_prediction(historical_df, model, scaler):
-    """Generates the probability prediction for the next bar."""
-    if model is None or scaler is None or len(historical_df) == 0:
+def get_ml_prediction(historical_df):
+    """
+    Generates the probability prediction for the next bar.
+    Uses global variables for ml_model and scaler.
+    """
+    # FIX: Remove model and scaler from parameters for consistency.
+    global ml_model, scaler 
+    
+    if ml_model is None or scaler is None or len(historical_df) == 0:
         return 0.5, 0.5
 
     feature_cols = get_feature_cols()
@@ -353,7 +357,7 @@ def get_ml_prediction(historical_df, model, scaler):
         
     X_predict_scaled = scaler.transform(X_predict)
 
-    proba = model.predict_proba(X_predict_scaled)[0]
+    proba = ml_model.predict_proba(X_predict_scaled)[0]
     prob_buy = proba[1]
     prob_sell = proba[0]
     
@@ -634,11 +638,9 @@ def main():
     global ml_model, scaler, initial_fit_done
 
     # State variables for dashboard and trade tracking
-    realized_wins = 0 # Not currently used in the core logic but kept for future dashboard use
-    realized_losses = 0 # Not currently used in the core logic but kept for future dashboard use
     position_entry_time = None 
     
-    # Initialize dashboard variables
+    # Initialize dashboard variables (used for dashboard update on first cycle)
     wallet_balance = 0.0
     current_position = {'size': 0.0, 'side': 'NONE', 'entry_price': 0.0}
     bid_price = 0.0
@@ -656,17 +658,21 @@ def main():
         wallet_balance, current_position, historical_df, bid_price, ask_price = get_current_state()
         
         # Initial position 'side' must be inferred or manually set if position exists on start
-        # Since we don't have a reliable way to get 'side' from /coinrealinfo.sh, we assume the user must manually set it
-        # if a position is detected on start, or assume the first trade determines it.
         if current_position['size'] > 0:
-            print("WARNING: Existing position detected. Please manually set current_position['side'] if known.")
-            current_position['side'] = 'BUY' # Placeholder: Assume BUY if size > 0 on startup
+            print("WARNING: Existing position detected. Setting side to BUY placeholder.")
+            current_position['side'] = 'BUY' 
+            position_entry_time = datetime.now() # Assume current time as entry time
+            
+        if historical_df.empty:
+            print("FATAL: Cannot initialize due to empty historical data DataFrame.")
+            sys.exit(1)
 
         historical_df = create_target_variable(historical_df)
         historical_df = calculate_advanced_indicators(historical_df)
         
         # Train model for the first time
-        ml_model, scaler, initial_fit_done, _ = setup_and_train_ml_model(historical_df, ml_model, scaler, initial_fit_done)
+        # FIX: Pass only historical_df, as globals are accessed directly inside the function
+        _ = setup_and_train_ml_model(historical_df)
         print("Initial ML model trained successfully.")
     except Exception as e:
         print(f"FATAL: Initial setup failed. Ensure all custom scripts are executable and return expected data. Error: {e}")
@@ -681,32 +687,41 @@ def main():
             # 1. Get current market and account state
             wallet_balance, current_position_new, historical_df, bid_price, ask_price = get_current_state()
             
-            # Preserve 'side' if it was set after a successful trade in a previous cycle
+            # Preserve 'side' and 'entry_time' if position is still open, otherwise reset
             if current_position_new['size'] > 0:
-                # If a new position is reported, keep the side from the *last successful trade* until explicitly closed
-                # If size is 0, reset side
-                if current_position['size'] == 0:
-                     # This should only happen if the bot places the trade, setting the side
-                     pass # Side will be set in step 6
-                else:
-                    # Position is still open, keep the recorded side
-                    current_position = current_position_new
-                    current_position['side'] = current_position.get('side', 'NONE')
+                # If size > 0, update size/entry_price but keep the currently tracked side
+                current_position.update({
+                    'size': current_position_new['size'], 
+                    'entry_price': current_position_new['entry_price']
+                })
+                
+                # If side is still 'NONE' but size is positive, assume BUY as a fail-safe
+                if current_position['side'] == 'NONE':
+                    current_position['side'] = 'BUY' 
+                    if position_entry_time is None:
+                        position_entry_time = datetime.now()
+
             else:
                  # Position closed or never opened
-                 current_position = current_position_new
-                 current_position['side'] = 'NONE'
+                 current_position = {'size': 0.0, 'side': 'NONE', 'entry_price': 0.0}
+                 position_entry_time = None
 
 
             # 2. Update Data and Indicators
+            if historical_df.empty:
+                 print("ERROR: Historical data is empty, skipping cycle.")
+                 raise Exception("Empty historical data.")
+                 
             historical_df = create_target_variable(historical_df)
             historical_df = calculate_advanced_indicators(historical_df)
             
             # 3. Retrain ML Model (for adaptive learning)
-            ml_model, scaler, initial_fit_done, ml_accuracy = setup_and_train_ml_model(historical_df, ml_model, scaler, initial_fit_done)
+            # FIX: Pass only historical_df
+            ml_accuracy = setup_and_train_ml_model(historical_df)
 
             # 4. Get Prediction
-            prob_buy, prob_sell = get_ml_prediction(historical_df, ml_model, scaler)
+            # FIX: Pass only historical_df
+            prob_buy, prob_sell = get_ml_prediction(historical_df)
             
             # 5. Adaptive Strategy
             adaptive_threshold = calculate_adaptive_threshold(ml_accuracy, BASE_PROBABILITY_THRESHOLD)
@@ -766,9 +781,15 @@ def main():
                              
                              # Wait a moment and re-fetch real info to update current_position details
                              time.sleep(1.0) 
+                             # Re-fetch the *size* and *entry_price* from the script output after the trade
                              _, current_position_info, _, _, _ = get_current_state()
-                             current_position = current_position_info
-                             current_position['side'] = executed_side.upper()
+                             
+                             current_position.update({
+                                 'size': current_position_info.get('size', 0.0),
+                                 'entry_price': current_position_info.get('entry_price', 0.0),
+                                 'side': executed_side.upper() # Update the side to the executed side
+                             })
+                             
                              print(f"Trade successful. New position: {current_position}")
                              position_entry_time = datetime.now() 
                              
