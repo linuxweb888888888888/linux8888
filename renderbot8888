@@ -258,7 +258,7 @@ def calculate_advanced_indicators(historical_df):
     df['-DM'] = np.where((df['Low'].shift(1) > df['Low']) & (df['Low'].shift(1) - df['Low'] > df['High'] - df['High'].shift(1)), df['Low'].shift(1) - df['Low'], 0)
     
     df['+DI'] = calculate_wilders_smoothing(df['+DM'], window) / df['ATR'] * 100
-    df['-DI'] = calculate_wilders_smoothing(df['-DM'], window) / df['ATR'] * 100 
+    df['-DI'] = calculate_wilders_smoothing(df['+DI'], window) / df['ATR'] * 100 
     
     df['DX'] = abs(df['+DI'] - df['-DI']) / (df['+DI'] + df['-DI']) * 100
     df['ADX'] = calculate_wilders_smoothing(df['DX'], window)
@@ -651,6 +651,7 @@ def main():
     adaptive_threshold = BASE_PROBABILITY_THRESHOLD
     adaptive_risk_percent = calculate_adaptive_risk(ml_accuracy)
     unrealized_pnl = 0.0
+    last_cycle_time = 0.0
     
     # --- Initial Setup ---
     try:
@@ -672,7 +673,7 @@ def main():
         
         # Train model for the first time
         # FIX: Pass only historical_df, as globals are accessed directly inside the function
-        _ = setup_and_train_ml_model(historical_df)
+        ml_accuracy = setup_and_train_ml_model(historical_df)
         print("Initial ML model trained successfully.")
     except Exception as e:
         print(f"FATAL: Initial setup failed. Ensure all custom scripts are executable and return expected data. Error: {e}")
@@ -809,6 +810,7 @@ def main():
         # 7. Update Dashboard (always run, even on error)
         end_time = time.time()
         elapsed = end_time - start_time
+        last_cycle_time = elapsed # Use 'elapsed' as the 'last_cycle_time'
         
         update_dashboard(
             wallet_balance, 
@@ -822,7 +824,7 @@ def main():
             bid_price,
             ask_price,
             unrealized_pnl,
-            elapsed
+            last_cycle_time
         )
 
         # 8. Wait for next cycle
@@ -831,13 +833,14 @@ def main():
         time.sleep(sleep_duration)
 
 if __name__ == '__main__':
-    # Initial closing of positions as requested
+    # Initial setup before the main loop starts
     close_all_positions_on_start()
     
+    # Run the main bot logic
     try:
         main()
     except KeyboardInterrupt:
         print("\nBot stopped by user (KeyboardInterrupt).")
     except Exception as e:
         print(f"\nCRITICAL BOT FAILURE: {e}")
-        time.sleep(5)
+        time.sleep(5) # Wait before exiting to allow console visibility
