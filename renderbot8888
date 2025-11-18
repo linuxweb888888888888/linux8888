@@ -18,12 +18,18 @@ SYMBOL_CCXT = 'ATOM/USDT'      # For CCXT Fetching
 SYMBOL_BASH = 'ATOMUSDT_PERP'  # For Bash Scripts
 BASE_COIN = 'ATOM'             # For placeorder arguments
 MIN_QTY = 0.001                # Minimum step size (Confirmed 0.001)
+# NEW: Calculate required decimal precision from MIN_QTY for robust stepping
+DECIMAL_PRECISION = len(str(MIN_QTY).split('.')[-1]) 
 DASHBOARD_PATH = '/var/www/html/dashboard.html'
 MAX_HISTORY = 200              # Data points for ML training
 TRAINING_INTERVAL = 1          # Train every step for max adaptation
 FEE_RATE = 0.0006              # Est. Taker fee (0.06%)
-PROFIT_TARGET_MULTIPLIER = 2.0 # Target: Cover fees + 100% of fees as profit
-GRID_STEP_PCT = 0.003          # Averaging down closer (0.3%)
+# MAX SPEED: Target 0.01% gross profit + fees for immediate closure
+TARGET_PROFIT_PCT = 0.0001     
+# MAX SPEED: Averaging down extremely close (0.1%)
+GRID_STEP_PCT = 0.001          
+# MAX SPEED: Larger initial entry size to maximize tiny profits
+INITIAL_ENTRY_SIZE_MULTIPLIER = 2.0 
 
 # ------------------------------------------------------------------------------
 # LOGGING SETUP
@@ -38,7 +44,8 @@ class SystemInterface:
     @staticmethod
     def run_command(command_list):
         try:
-            result = subprocess.run(command_list, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=5)
+            # Added shorter timeout for faster feedback loop
+            result = subprocess.run(command_list, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=3)
             return result.stdout.strip()
         except Exception as e:
             logger.error(f"Command failed: {command_list} | Error: {e}")
@@ -111,7 +118,7 @@ class SystemInterface:
         return output
 
 # ------------------------------------------------------------------------------
-# WALLET LEARNER (AGGRESSIVE MODE)
+# WALLET LEARNER (ULTRA-AGGRESSIVE MODE)
 # ------------------------------------------------------------------------------
 class WalletLearner:
     def __init__(self):
@@ -119,8 +126,8 @@ class WalletLearner:
         self.current_balance = 0.0
         self.previous_balance = 0.0
         self.trade_history = deque(maxlen=50)
-        # Increased starting threshold for higher quality entries
-        self.dynamic_threshold = 60.0 
+        # MAX SPEED: Low starting threshold (30.0%) for maximum trade frequency
+        self.dynamic_threshold = 30.0 
         self.risk_multiplier = 0.99   # Start MAX usage (99% - leaving 1% for fees)
 
     def update_balance(self, new_balance):
@@ -141,33 +148,33 @@ class WalletLearner:
 
     def adapt_strategy(self, delta):
         """
-        Aggressive adaptation: Never reduce risk, only adjust threshold.
+        Ultra-aggressive adaptation for maximum frequency trading.
         """
         if delta > 0:
-            # Winning: Go faster (lower threshold for faster entries)
-            self.dynamic_threshold = max(55.0, self.dynamic_threshold - 0.5)
+            # Winning: Go faster (lower threshold for faster entries, down to 25.0)
+            self.dynamic_threshold = max(25.0, self.dynamic_threshold - 0.5)
             self.risk_multiplier = 0.99 # Keep pinned at max
-            logger.info(f"PROFIT (+{delta:.6f}) -> MAX VELOCITY") # Increased precision
+            logger.info(f"PROFIT (+{delta:.6f}) -> MAX VELOCITY (Threshold: {self.dynamic_threshold:.2f}%)")
             
         else:
-            # Losing: Tighten threshold slightly (higher threshold for safer entries)
-            self.dynamic_threshold = min(70.0, self.dynamic_threshold + 1.0)
+            # Losing: Tighten threshold slightly (max 40.0 to maintain high activity but manage risk)
+            self.dynamic_threshold = min(40.0, self.dynamic_threshold + 1.0)
             self.risk_multiplier = 0.99 # STAY AGGRESSIVE
-            logger.info(f"LOSS ({delta:.6f}) -> RECOVERY MODE (Full Stack)") # Increased precision
+            logger.info(f"LOSS ({delta:.6f}) -> RECOVERY MODE (Threshold: {self.dynamic_threshold:.2f}%)")
 
     def get_growth_pct(self):
         if self.initial_balance == 0: return 0.0
         return ((self.current_balance - self.initial_balance) / self.initial_balance) * 100
 
 # ------------------------------------------------------------------------------
-# AI & MARKET DATA ENGINE
+# AI & MARKET DATA ENGINE (FASTEST POSSIBLE INDICATORS)
 # ------------------------------------------------------------------------------
 class AIEngine:
     def __init__(self):
         self.exchange = ccxt.hitbtc({'enableRateLimit': True})
         self.history = pd.DataFrame()
-        # Faster Model: Fewer estimators, deeper trees for complex/fast patterns
-        self.model = RandomForestRegressor(n_estimators=20, max_depth=10, random_state=42)
+        # MAX SPEED: Less complex model for ultra-fast training
+        self.model = RandomForestRegressor(n_estimators=20, max_depth=8, random_state=42)
         self.scaler = StandardScaler()
         self.is_trained = False
         self.simulation_wins = 0
@@ -202,30 +209,28 @@ class AIEngine:
         df = df.copy()
         df['returns'] = df['last'].pct_change()
         
-        # Ultra Fast RSI (Period 5)
+        # MAX SPEED: Ultra Fast RSI (Period 3) - Reacts instantly
         delta = df['last'].diff()
-        gain = (delta.where(delta > 0, 0)).rolling(window=5).mean()
-        loss = (-delta.where(delta < 0, 0)).rolling(window=5).mean()
+        gain = (delta.where(delta > 0, 0)).rolling(window=3).mean()
+        loss = (-delta.where(delta < 0, 0)).rolling(window=3).mean()
         rs = gain / loss
         df['rsi'] = 100 - (100 / (1 + rs))
         
-        # Volatility
-        df['volatility'] = df['returns'].rolling(window=5).std()
+        # MAX SPEED: Volatility (Period 3) - Measures short-term instability
+        df['volatility'] = df['returns'].rolling(window=3).std()
         
-        # Momentum
+        # Momentum (Period 2)
         df['momentum'] = df['last'] - df['last'].shift(2)
 
         # Spread
         df['spread'] = df['ask'] - df['bid']
         
-        # NEW: Fast Moving Average (MA 3) - Added for clearer short-term trend confirmation
+        # Fast Moving Average (MA 3)
         df['ma_3'] = df['last'].rolling(window=3).mean()
         
         # Target: Immediate next tick
         df['target'] = df['last'].shift(-1) - df['last']
         
-        # IMPORTANT: Do NOT dropna here. We dropna in train_and_predict 
-        # to separate the training set from the prediction set.
         return df
 
     def train_and_predict(self):
@@ -325,7 +330,7 @@ class TradingBot:
             <meta charset="UTF-8">
             <meta http-equiv="refresh" content="1">
             <meta name="viewport" content="width=device-width, initial-scale=1.0">
-            <title>HitBTC ULTRA AGGRESSIVE</title>
+            <title>ULTRA-HIGH FREQUENCY SCALPER (Max Speed)</title>
             <style>
                 @import url('https://fonts.googleapis.com/css2?family=Roboto:wght@100;300;400;700;900&display=swap');
                 
@@ -353,7 +358,7 @@ class TradingBot:
                     margin-bottom: 30px;
                     font-size: 2.5rem;
                     font-weight: 900;
-                    color: var(--accent-blue);
+                    color: var(--success-green); /* Green for 'Profit/Speed' */
                 }}
 
                 .container {{ 
@@ -414,12 +419,12 @@ class TradingBot:
                     padding: 15px 25px; 
                     margin-bottom: 30px; 
                     border-radius: 8px; 
-                    border: 1px solid var(--accent-blue);
+                    border: 1px solid var(--success-green); /* Green border for max speed */
                     font-weight: 700;
-                    box-shadow: 0 2px 8px rgba(0, 163, 255, 0.3);
+                    box-shadow: 0 2px 8px rgba(46, 204, 113, 0.3);
                 }}
                 
-                .status-bar strong {{ color: var(--accent-blue); margin-right: 10px; }}
+                .status-bar strong {{ color: var(--success-green); margin-right: 10px; }}
 
                 /* Responsive Adjustments */
                 @media (max-width: 600px) {{
@@ -430,7 +435,7 @@ class TradingBot:
             </style>
         </head>
         <body>
-            <div class="header">BOT DASHBOARD</div>
+            <div class="header">ULTRA-HIGH FREQUENCY SCALPER</div>
             
             <div class="status-bar">
                 <strong>ACTION:</strong> {action_msg} | 
@@ -440,7 +445,7 @@ class TradingBot:
             <div class="container">
                 
                 <!-- WALLET CARD -->
-                <div class="card info">
+                <div class="card success">
                     <h2>USDT BALANCE</h2>
                     <div class="value">${wallet:.6f}</div>
                     <div class="sub">Growth: <span class="{growth_class}">{growth_pct:.6f}%</span> YTD</div>
@@ -473,7 +478,7 @@ class TradingBot:
             logger.error(f"Failed to write dashboard: {e}")
 
     def run(self):
-        logger.info("Starting ULTRA AGGRESSIVE Bot...")
+        logger.info("Starting ULTRA-HIGH FREQUENCY SCALPER Bot...")
         self.sys.close_all_positions()
         
         initial_wallet = self.sys.get_wallet_balance()
@@ -490,11 +495,18 @@ class TradingBot:
                 price_data = self.ai.fetch_price()
                 
                 if not price_data:
-                    time.sleep(0.1)
+                    # MAX SPEED: Continue faster if price data fetch fails
+                    time.sleep(0.01) 
                     continue
 
                 self.ai.update_data(price_data)
-                prediction, confidence = self.ai.train_and_predict()
+                
+                # Check if we should retrain based on a very fast, continuous interval (1 == every loop)
+                if self.iteration % TRAINING_INTERVAL == 0:
+                    prediction, confidence = self.ai.train_and_predict()
+                else:
+                    prediction = self.ai.last_prediction
+                    confidence = self.ai.confidence
                 
                 # ---------------------------------------------------------
                 # TRADING LOGIC
@@ -516,15 +528,22 @@ class TradingBot:
 
                     total_fee = (entry * abs(qty) * FEE_RATE) + (price_data['last'] * abs(qty) * FEE_RATE)
                     net_pnl = current_pnl - total_fee
-                    action_log = f"PnL: {net_pnl:.6f}" # Increased precision
+                    action_log = f"PnL: {net_pnl:.6f}"
 
-                    # 1. FAST PROFIT TAKER (Full Close) - Adjusted to cover fees + 100% profit (Multiplier 2.0)
-                    if net_pnl > 0 and net_pnl > (total_fee * PROFIT_TARGET_MULTIPLIER):
-                        logger.info(f"$$$ SCALP PROFIT: {net_pnl:.6f}")
+                    # Calculate required gross profit for a scalp exit (0.01% target + transaction fees)
+                    entry_value = entry * abs(qty)
+                    required_gross_profit = entry_value * TARGET_PROFIT_PCT
+                    
+                    # Required PnL (Gross PnL - Target PnL)
+                    required_pnl_usd = required_gross_profit + total_fee
+
+                    # 1. MAX SPEED SCALP PROFIT TAKER (Full Close)
+                    if current_pnl > required_pnl_usd:
+                        logger.info(f"$$$ MAX SPEED SCALP PROFIT (Target {TARGET_PROFIT_PCT*100:.4f}% + Fees): {net_pnl:.6f}")
                         side = 'sell' if is_long else 'buy'
                         self.sys.place_order(BASE_COIN, abs(qty), side)
-                        action_log = "SCALP CLOSE (Full)"
-
+                        action_log = "MAX SCALP CLOSE (Full)"
+                        
                     # 2. PARTIAL PROFIT SCALING (Decrease Trade) - If profitable, but AI predicts reversal
                     elif net_pnl > 0 and (
                         (is_long and prediction < 0) or (not is_long and prediction > 0)
@@ -532,10 +551,10 @@ class TradingBot:
                         # AI predicts a move against us -> scale out 25% profit
                         reduce_qty = abs(qty) * 0.25
                         
-                        # Robust step-based calculation
+                        # Robust step-based calculation using numpy for precision
                         raw_qty = reduce_qty
-                        reduce_qty = (raw_qty // MIN_QTY) * MIN_QTY
-                        reduce_qty = max(MIN_QTY, round(reduce_qty, 3))
+                        reduce_qty = np.floor(raw_qty / MIN_QTY) * MIN_QTY
+                        reduce_qty = max(MIN_QTY, round(reduce_qty, DECIMAL_PRECISION))
                         
                         if abs(qty) > reduce_qty: # Ensure we don't try to reduce more than held
                             side = 'sell' if is_long else 'buy'
@@ -544,8 +563,8 @@ class TradingBot:
                             logger.info(action_log)
 
                     # 3. AGGRESSIVE PYRAMIDING (Increase Trade) - Add if green AND AI confirms more profit ahead
-                    # Increased confidence requirement to 65.0% for stacking trades
-                    elif net_pnl > 0 and confidence > 65.0:
+                    # MAX SPEED: Lowered confidence requirement to 55.0% for stacking trades
+                    elif net_pnl > 0 and confidence > 55.0:
                         # Check if AI confirms the direction
                         if (is_long and prediction > 0) or (not is_long and prediction < 0):
                             usable_wallet = wallet * self.wallet_learner.risk_multiplier
@@ -558,9 +577,9 @@ class TradingBot:
                             
                             if free_margin > (execution_price * MIN_QTY):
                                 raw_qty = free_margin / execution_price
-                                # Robust step-based calculation
-                                add_qty = (raw_qty // MIN_QTY) * MIN_QTY
-                                add_qty = max(MIN_QTY, round(add_qty, 3)) 
+                                # Robust step-based calculation using numpy for precision
+                                add_qty = np.floor(raw_qty / MIN_QTY) * MIN_QTY
+                                add_qty = max(MIN_QTY, round(add_qty, DECIMAL_PRECISION)) 
                                 side = 'buy' if is_long else 'sell'
                                 self.sys.place_order(BASE_COIN, add_qty, side)
                                 action_log = f"COMPOUNDING (Qty: {add_qty})"
@@ -581,9 +600,9 @@ class TradingBot:
                             if free_margin > (execution_price * MIN_QTY): 
                                 # Use 75% of remaining free margin to avg down for faster recovery
                                 raw_qty = (free_margin * 0.75) / execution_price
-                                # Robust step-based calculation
-                                recovery_qty = (raw_qty // MIN_QTY) * MIN_QTY
-                                recovery_qty = max(MIN_QTY, round(recovery_qty, 3)) 
+                                # Robust step-based calculation using numpy for precision
+                                recovery_qty = np.floor(raw_qty / MIN_QTY) * MIN_QTY
+                                recovery_qty = max(MIN_QTY, round(recovery_qty, DECIMAL_PRECISION)) 
                                 side = 'buy' if is_long else 'sell'
                                 self.sys.place_order(BASE_COIN, recovery_qty, side)
                                 action_log = f"AVG DOWN (Qty: {recovery_qty})"
@@ -591,7 +610,7 @@ class TradingBot:
 
                 else:
                     # -----------------------------------------------------
-                    # NEW ENTRY (FULL WALLET)
+                    # NEW ENTRY (MAX-FREQUENCY)
                     # -----------------------------------------------------
                     if self.ai.is_trained and confidence > self.wallet_learner.dynamic_threshold: 
                         
@@ -608,21 +627,23 @@ class TradingBot:
                             # No strong prediction
                             continue 
                             
-                        max_usd_to_use = wallet * self.wallet_learner.risk_multiplier
+                        # Uses INITIAL_ENTRY_SIZE_MULTIPLIER = 2.0 for larger, max-speed entry
+                        max_usd_to_use = (wallet * self.wallet_learner.risk_multiplier) * INITIAL_ENTRY_SIZE_MULTIPLIER
                         
                         if max_usd_to_use > (execution_price * MIN_QTY):
                             # Calculate max quantity based on the execution price (Ask or Bid)
                             raw_qty = max_usd_to_use / execution_price
-                            # Robust step-based calculation
-                            trade_qty = (raw_qty // MIN_QTY) * MIN_QTY
-                            trade_qty = max(MIN_QTY, round(trade_qty, 3)) 
+                            # Robust step-based calculation using numpy for precision
+                            trade_qty = np.floor(raw_qty / MIN_QTY) * MIN_QTY
+                            trade_qty = max(MIN_QTY, round(trade_qty, DECIMAL_PRECISION)) 
                             
                             self.sys.place_order(BASE_COIN, trade_qty, side)
-                            action_log = f"MAX ENTRY {side.upper()} (Qty: {trade_qty})"
+                            action_log = f"NEW MAX ENTRY {side.upper()} (Qty: {trade_qty})"
                             
                 self.generate_dashboard(wallet, pos_data, price_data, prediction, confidence, action_log)
                 self.iteration += 1
-                time.sleep(0.1) # 100ms loop
+                # MAX SPEED: Reduce sleep time to 50ms for hyper-responsiveness
+                time.sleep(0.05) 
 
             except KeyboardInterrupt:
                 self.running = False
