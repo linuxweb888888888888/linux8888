@@ -17,7 +17,7 @@ from collections import deque
 SYMBOL_CCXT = 'ATOM/USDT'      # For CCXT Fetching
 SYMBOL_BASH = 'ATOMUSDT_PERP'  # For Bash Scripts
 BASE_COIN = 'ATOM'             # For placeorder arguments
-MIN_QTY = 0.001                # Minimum step size
+MIN_QTY = 0.001                # Minimum step size (Confirmed 0.001)
 DASHBOARD_PATH = '/var/www/html/dashboard.html'
 MAX_HISTORY = 200              # Data points for ML training
 TRAINING_INTERVAL = 1          # Train every step for max adaptation
@@ -405,13 +405,14 @@ class TradingBot:
                         if free_margin > (price_data['last'] * MIN_QTY):
                             # AI confirmation check
                             if (is_long and prediction > 0) or (not is_long and prediction < 0):
-                                logger.info("PYRAMIDING (COMPOUNDING)")
-                                add_qty = free_margin / price_data['last']
-                                # *** HIGH PRECISION UPDATE HERE ***
-                                add_qty = max(MIN_QTY, round(add_qty, 5))
+                                raw_qty = free_margin / price_data['last']
+                                # *** ROBUST STEP-BASED CALCULATION: Floor raw qty to nearest MIN_QTY multiple (0.001) ***
+                                add_qty = (raw_qty // MIN_QTY) * MIN_QTY
+                                add_qty = max(MIN_QTY, round(add_qty, 3)) 
                                 side = 'buy' if is_long else 'sell'
                                 self.sys.place_order(BASE_COIN, add_qty, side)
-                                action_log = "COMPOUNDING"
+                                action_log = f"COMPOUNDING (Qty: {add_qty})"
+                                logger.info(action_log)
                     
                     # 3. GRID RECOVERY (If losing) - Use remaining wallet to avg down
                     elif price_diff_pct < -GRID_STEP_PCT:
@@ -421,14 +422,15 @@ class TradingBot:
 
                         if free_margin > (price_data['last'] * MIN_QTY): 
                             if (is_long and prediction > 0) or (not is_long and prediction < 0):
-                                logger.info("GRID RECOVERY (AVG DOWN)")
-                                # Use 50% of remaining free margin to avg down (leave some for further drops)
-                                recovery_qty = (free_margin * 0.5) / price_data['last']
-                                # *** HIGH PRECISION UPDATE HERE ***
-                                recovery_qty = max(MIN_QTY, round(recovery_qty, 5))
+                                # Use 50% of remaining free margin to avg down
+                                raw_qty = (free_margin * 0.5) / price_data['last']
+                                # *** ROBUST STEP-BASED CALCULATION: Floor raw qty to nearest MIN_QTY multiple (0.001) ***
+                                recovery_qty = (raw_qty // MIN_QTY) * MIN_QTY
+                                recovery_qty = max(MIN_QTY, round(recovery_qty, 3)) 
                                 side = 'buy' if is_long else 'sell'
                                 self.sys.place_order(BASE_COIN, recovery_qty, side)
-                                action_log = "AVG DOWN"
+                                action_log = f"AVG DOWN (Qty: {recovery_qty})"
+                                logger.info(action_log)
 
                 else:
                     # -----------------------------------------------------
@@ -439,16 +441,17 @@ class TradingBot:
                         max_usd_to_use = wallet * self.wallet_learner.risk_multiplier
                         
                         if max_usd_to_use > (price_data['last'] * MIN_QTY):
-                            calc_qty = max_usd_to_use / price_data['last']
-                            # *** HIGH PRECISION UPDATE HERE ***
-                            trade_qty = max(MIN_QTY, round(calc_qty, 5))
+                            raw_qty = max_usd_to_use / price_data['last']
+                            # *** ROBUST STEP-BASED CALCULATION: Floor raw qty to nearest MIN_QTY multiple (0.001) ***
+                            trade_qty = (raw_qty // MIN_QTY) * MIN_QTY
+                            trade_qty = max(MIN_QTY, round(trade_qty, 3)) 
                             
                             if prediction > 0:
                                 self.sys.place_order(BASE_COIN, trade_qty, 'buy')
-                                action_log = "MAX ENTRY LONG"
+                                action_log = f"MAX ENTRY LONG (Qty: {trade_qty})"
                             elif prediction < 0:
                                 self.sys.place_order(BASE_COIN, trade_qty, 'sell')
-                                action_log = "MAX ENTRY SHORT"
+                                action_log = f"MAX ENTRY SHORT (Qty: {trade_qty})"
 
                 self.generate_dashboard(wallet, pos_data, price_data, prediction, confidence, action_log)
                 self.iteration += 1
