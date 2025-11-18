@@ -149,14 +149,18 @@ def get_ultra_fast_signal():
 def calc_order_qty(wallet, price, predicted_profit=0):
     adjustment = wallet_learning.get("adjustment_factor", 1.0)
     use_usdt = wallet * WALLET_RISK_BASE * adjustment
+    # Use recent volatility or other metrics here for adaptive sizing
+    volatility = get_recent_volatility(df)  # df should be global or passed
+    volatility_factor = max(0.1, 1 - volatility)
     multiplier = min(TRAILING_MULTIPLIER, 1 + predicted_profit*5)
-    qty = use_usdt / price * multiplier
+    qty = use_usdt / price * multiplier * volatility_factor
     return max(MIN_QTY, np.floor(qty*1000000)/1000000)
 
-def add_position(side, qty):
+def add_position(side, qty, entry_price=None):
     coin_info = get_coin_real_info()
-    entry_price = coin_info['entry']
-    qty = coin_info['qty']
+    # Use adaptive position size
+    if entry_price is None:
+        entry_price = get_tick_data()[2]  # mid
     if len(open_positions) < MAX_POSITIONS:
         open_positions.append({
             "side": side,
@@ -164,7 +168,9 @@ def add_position(side, qty):
             "entry": entry_price,
             "time": time.time(),
             "realized_pnl": 0,
-            "trailing_stop": None
+            "trailing_stop": None,
+            "highest_price": entry_price if side=='buy' else None,
+            "lowest_price": entry_price if side=='sell' else None
         })
 
 def sync_virtual_positions_to_real():
@@ -175,10 +181,9 @@ def sync_virtual_positions_to_real():
         pos['qty'] = coin_info['qty']
 
 # ============================
-# PNL FUNCTIONS
+# PNL & Trailing Stop Functions
 # ============================
 def update_real_pnl():
-    coin_info = get_coin_real_info()
     bid, ask, mid = get_tick_data()
     for pos in open_positions:
         if pos['side']=='buy':
@@ -196,6 +201,20 @@ def close_positions_if_profitable():
         profit_history.append(graded_pnl)
         open_positions.clear()
 
+def update_trailing_stop(position, current_price):
+    # For buy positions
+    if position['side'] == 'buy':
+        if 'highest_price' not in position or current_price > position['highest_price']:
+            position['highest_price'] = current_price
+        # Set trailing stop a percentage below highest
+        position['trailing_stop'] = position['highest_price'] * (1 - 0.005)  # 0.5%
+    # For sell positions
+    elif position['side'] == 'sell':
+        if 'lowest_price' not in position or current_price < position['lowest_price']:
+            position['lowest_price'] = current_price
+        # Set trailing stop above lowest
+        position['trailing_stop'] = position['lowest_price'] * (1 + 0.005)  # 0.5%
+
 # ============================
 # BACKGROUND SIMULATION
 # ============================
@@ -211,29 +230,63 @@ def simulate_realistic_background(mid_price, n_trades=2):
 # ============================
 # DASHBOARD
 # ============================
+def get_dynamic_take_profit(entry_price, current_profit, volatility, side):
+    # Adjust take-profit based on market conditions
+    base_tp = entry_price * (1 + TAKE_PROFIT_SENSITIVITY) if side=='buy' else entry_price * (1 - TAKE_PROFIT_SENSITIVITY)
+    if volatility < 0.005:
+        factor = 0.5  # tighten in low volatility
+    elif current_profit > 0.01:
+        factor = 1.5  # expand in trending markets
+    else:
+        factor = 1
+    if side=='buy':
+        return entry_price * (1 + TAKE_PROFIT_SENSITIVITY * factor)
+    else:
+        return entry_price * (1 - TAKE_PROFIT_SENSITIVITY * factor)
+
 def render_dashboard(signal, pred, conf, bid, ask, mid, wallet, wallet_delta, wallet_delta_percent):
     graded_pnl = sum(pos.get('realized_pnl',0) for pos in open_positions)
     accumulated_profit = sum(profit_history)
     coin_info = get_coin_real_info()
     entry_price = coin_info['entry']
     qty = coin_info['qty']
-    direction = "BUY" if qty > 0 else "SELL" if qty < 0 else "HOLD"
-
+    direction = "HOLD"
+    if qty > 0:
+        direction = "BUY"
+        side='buy'
+    elif qty < 0:
+        direction = "SELL"
+        side='sell'
+    
+    # Determine next entry and TP
     if direction=="BUY":
         next_entry = entry_price*(1-DCA_STEP)
-        take_profit = entry_price*(1+TAKE_PROFIT_SENSITIVITY)
+        volatility = get_recent_volatility(pd.DataFrame())  # Provide actual df if needed
+        take_profit = get_dynamic_take_profit(entry_price, graded_pnl, volatility, side)
         take_profit_pnl = (mid - entry_price)*qty
     elif direction=="SELL":
         next_entry = entry_price*(1+DCA_STEP)
-        take_profit = entry_price*(1-TAKE_PROFIT_SENSITIVITY)
+        volatility = get_recent_volatility(pd.DataFrame())  # Provide actual df if needed
+        take_profit = get_dynamic_take_profit(entry_price, graded_pnl, volatility, side)
         take_profit_pnl = (entry_price - mid)*qty
     else:
         next_entry = take_profit = take_profit_pnl = 0
 
+    # Update or set trailing stops
+    for pos in open_positions:
+        current_price = get_tick_data()[0] if pos['side']=='buy' else get_tick_data()[1]
+        update_trailing_stop(pos, current_price)
+        # Close position if stop is hit
+        if pos['trailing_stop'] and ((pos['side']=='buy' and current_price <= pos['trailing_stop']) or
+                                       (pos['side']=='sell' and current_price >= pos['trailing_stop'])):
+            # Close position logic here (simulate or real)
+            open_positions.remove(pos)
+
+    # Build HTML
     positions_html = "".join([
         f"<div class='position-card'><div class='pos-header'>Pos {i+1} {p['side'].upper()}</div>"
         f"<div>Qty: {p['qty']:.6f}</div>"
-        f"<div>Entry: {entry_price:.6f}</div>"
+        f"<div>Entry: {p['entry']:.6f}</div>"
         f"<div>PnL: <span class='{ 'green' if p['realized_pnl']>0 else 'red' }'>{p['realized_pnl']:.8f}</span></div>"
         f"<div>TP PnL: <span class='green'>{take_profit_pnl:.8f}</span></div>"
         f"<div>Trailing Stop: {p['trailing_stop'] if p['trailing_stop'] else 'N/A'}</div></div>"
@@ -243,8 +296,8 @@ def render_dashboard(signal, pred, conf, bid, ask, mid, wallet, wallet_delta, wa
     html_content = f"""<!doctype html>
 <html lang="en">
 <head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0"/>
 <title>ATOM Bot Dashboard</title>
 <style>
 body {{ font-family: Roboto, sans-serif; margin:0; padding:0; background:#17191D; color:#FCFEFF; }}
@@ -309,7 +362,7 @@ h1 {{ text-align:center; margin-top:10px; }}
 # ============================
 def main():
     global tick_history, starting_wallet
-    console.print("[green]Starting ATOM/USDT ultra-fast bot...[/green]")
+    console.print("[green]Starting ATOM/USDT ultra-fast bot with adaptive management...[/green]")
     with Live(refresh_per_second=4) as live:
         while True:
             try:
@@ -334,18 +387,26 @@ def main():
 
                 simulate_realistic_background(mid, n_trades=2)
                 sync_virtual_positions_to_real()
+                update_real_pnl()
                 close_positions_if_profitable()
 
+                # Determine if need to open new position
                 if (not open_positions or all(p['side']==signal_fast for p in open_positions)) and signal_fast in ["buy","sell"]:
                     qty = calc_order_qty(wallet, mid or 1, predicted_profit=pred)
-                    add_position(signal_fast, qty)
+                    add_position(signal_fast, qty, entry_price=mid)
 
+                # For existing positions, update trailing stops
+                for pos in open_positions:
+                    current_price = get_tick_data()[0] if pos['side']=='buy' else get_tick_data()[1]
+                    update_trailing_stop(pos, current_price)
+
+                # Render dashboard
                 panel = render_dashboard(signal_fast, pred, conf, bid, ask, mid, wallet, wallet_delta, wallet_delta_percent)
                 live.update(panel)
                 time.sleep(UPDATE_INTERVAL)
 
             except Exception as e:
-                console.print(f"[red]Error main loop: {e}[/red]")
+                console.print(f"[red]Error in main loop: {e}[/red]")
                 time.sleep(1)
 
 if __name__ == "__main__":
