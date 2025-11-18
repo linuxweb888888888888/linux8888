@@ -207,13 +207,15 @@ class AIEngine:
 
     def calculate_features(self, df):
         df = df.copy()
-        df['returns'] = df['last'].pct_change()
         
-        # FIX: Increased look-back window from 3 to 5 to generate more stable, non-zero signals.
-        # This is necessary because 50ms gaps often result in zero-change data, causing the model to predict 0.
+        # ------------------------------------------------------------------
+        # UHF SCALPING FOCUS: Use Mid-Price for core indicators and Target
+        # ------------------------------------------------------------------
+        df['mid_price'] = (df['bid'] + df['ask']) / 2
+        df['returns'] = df['mid_price'].pct_change()
         
-        # Ultra Fast RSI (Period 5) 
-        delta = df['last'].diff()
+        # Ultra Fast RSI (Period 5) based on MID-PRICE
+        delta = df['mid_price'].diff()
         gain = (delta.where(delta > 0, 0)).rolling(window=5).mean()
         loss = (-delta.where(delta < 0, 0)).rolling(window=5).mean()
         rs = gain / loss
@@ -222,17 +224,20 @@ class AIEngine:
         # Volatility (Period 5) - Measures short-term instability
         df['volatility'] = df['returns'].rolling(window=5).std()
         
-        # Momentum (Period 3)
-        df['momentum'] = df['last'] - df['last'].shift(3)
+        # Momentum (Period 3) based on MID-PRICE
+        df['momentum'] = df['mid_price'] - df['mid_price'].shift(3)
 
-        # Spread
+        # Spread (distance between bid/ask)
         df['spread'] = df['ask'] - df['bid']
         
-        # Fast Moving Average (MA 5)
-        df['ma_5'] = df['last'].rolling(window=5).mean()
+        # NEW CRITICAL FEATURE: Spread Change (Widening or Narrowing)
+        df['spread_change'] = df['spread'].diff()
         
-        # Target: Immediate next tick
-        df['target'] = df['last'].shift(-1) - df['last']
+        # Fast Moving Average (MA 5) based on MID-PRICE
+        df['ma_5'] = df['mid_price'].rolling(window=5).mean()
+        
+        # NEW TARGET: Predict the change in the next MID-PRICE tick
+        df['target'] = df['mid_price'].shift(-1) - df['mid_price']
         
         return df
 
@@ -253,8 +258,8 @@ class AIEngine:
         if df_train.empty or X_current.empty: 
             return 0, 0
 
-        # Feature definition (Updated feature name from 'ma_3' to 'ma_5')
-        feature_cols = ['rsi', 'volatility', 'spread', 'momentum', 'ma_5'] 
+        # FEATURE UPDATE: Now includes 'spread_change'
+        feature_cols = ['rsi', 'volatility', 'spread', 'momentum', 'ma_5', 'spread_change'] 
         
         # Check if the needed features exist in the current feature set
         X_current = X_current[feature_cols]
