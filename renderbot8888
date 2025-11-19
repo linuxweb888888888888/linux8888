@@ -34,13 +34,14 @@ FEE_RATE = 0.0006
 TARGET_PROFIT_PCT = 0.0001     
 GRID_STEP_PCT = 0.001          
 
-# *** AGGRESSIVE CAPITAL UTILIZATION ***
-INITIAL_ENTRY_SIZE_MULTIPLIER = 3.0 # INCREASED from 2.0 for faster compounding/recovery
+# *** AGGRESSIVE CAPITAL UTILIZATION (INCREASED) ***
+INITIAL_ENTRY_SIZE_MULTIPLIER = 3.5 # INCREASED from 3.0 for even faster compounding/recovery
 UHF_SLEEP_SECONDS = 0.05       
+MIN_COMPOUND_PROFIT_USD = 0.001 # Must have at least this much PnL before compounding
 
-# *** MAX ACTIVITY & SIZING ***
-# Uses 10% of your Total Usable USDT for every new entry (INCREASED from 5%)
-AGGRESSIVE_ENTRY_WALLET_PCT = 0.10 
+# *** MAX WALLET USAGE (INCREASED) ***
+# Uses 15% of your Total Usable USDT for every new entry (INCREASED from 10%)
+AGGRESSIVE_ENTRY_WALLET_PCT = 0.15 
 
 # DISPLAY SETTINGS
 SPREAD_TIGHT_THRESHOLD = 0.0005 
@@ -63,7 +64,7 @@ class SystemInterface:
         self.last_pos_check = 0
         self.cached_wallet = 0.0
         self.cached_pos = {'symbol': SYMBOL_BASH, 'qty': 0.0, 'entry_price': 0.0, 'has_position': False}
-        # CACHE DURATION REDUCED FROM 2.0s TO 0.5s for faster updates
+        # CACHE DURATION REDUCED TO 0.5s for faster position/wallet data
         self.cache_duration = 0.5 
 
     @staticmethod
@@ -177,6 +178,7 @@ class WalletLearner:
         return True
 
     def adapt_strategy(self, delta):
+        # Adapts confidence threshold based on recent performance
         if delta > 0:
             self.dynamic_threshold = max(15.0, self.dynamic_threshold - 0.5)
         else:
@@ -235,6 +237,7 @@ class AIEngine:
         df['mid_price'] = (df['bid'] + df['ask']) / 2
         df['returns'] = df['mid_price'].pct_change()
         
+        # Indicators
         delta = df['mid_price'].diff()
         gain = (delta.where(delta > 0, 0)).rolling(window=5).mean()
         loss = (-delta.where(delta < 0, 0)).rolling(window=5).mean()
@@ -247,6 +250,7 @@ class AIEngine:
         df['spread_change'] = df['spread'].diff()
         df['ma_5'] = df['mid_price'].rolling(window=5).mean()
         
+        # Target: Predict price 1 step ahead
         df['target'] = df['mid_price'].shift(-1) - df['mid_price']
         
         return df
@@ -269,6 +273,7 @@ class AIEngine:
         y = df_train['target']
         X_curr = X_current[available_cols]
 
+        # Sim Stats (for learning)
         if self.is_trained:
             actual_move = df_all.iloc[-2]['target'] if not pd.isna(df_all.iloc[-2]['target']) else 0
             if (self.last_prediction > 0 and actual_move > 0) or (self.last_prediction < 0 and actual_move < 0):
@@ -314,6 +319,7 @@ class TradingBot:
             qty = position['qty']
             entry = position['entry_price']
             is_long = qty > 0
+            # Use the price the bot will CLOSE at for pnl calculation
             curr_price = price_info['bid'] if is_long else price_info['ask']
             
             if is_long: 
@@ -327,8 +333,10 @@ class TradingBot:
             
             if abs(qty) > 0:
                 if is_long:
+                    # Closing Price (Bid) = Entry Price + (Required PnL / Qty)
                     target_price = entry + (required_pnl_usd / abs(qty))
                 else:
+                    # Closing Price (Ask) = Entry Price - (Required PnL / Qty)
                     target_price = entry - (required_pnl_usd / abs(qty))
         
         # Styles
@@ -368,7 +376,7 @@ class TradingBot:
         <head>
             <meta charset="UTF-8">
             <meta name="viewport" content="width=device-width, initial-scale=1.0">
-            <title>UHF SCALPER V2.0</title>
+            <title>UHF SCALPER V2.1 (MAX WALLET)</title>
             <style>
                 @import url('https://fonts.googleapis.com/css2?family=Orbitron:wght@400;700;900&family=Roboto+Mono:wght@300;400;700&display=swap');
                 :root {{ --bg-dark: #070D12; --card-bg: #101F2B; --success-green: #00FF99; --danger-red: #FF3366; --accent-blue: #00BFFF; --neutral-gray: #4A6D7C; --text-light: #E0FFEF; --long-color: #00BFFF; --short-color: #FF3366; }}
@@ -392,12 +400,12 @@ class TradingBot:
                 .threshold-marker {{ position: absolute; height: 100%; width: 2px; background-color: var(--danger-red); top: 0; }}
                 .log-entry {{ font-size: 0.8rem; padding: 5px 0; border-bottom: 1px dotted rgba(74, 109, 124, 0.3); display: flex; }}
                 .log-time {{ color: var(--neutral-gray); min-width: 60px; margin-right: 10px; }}
-                .log-entry.entry .log-message {{ color: var(--accent-blue); }} .log-entry.profit .log-message {{ color: var(--success-green); }} .log-entry.recovery .log-message {{ color: var(--danger-red); }}
+                .log-entry.entry .log-message {{ color: var(--accent-blue); }} .log-entry.profit .log-message {{ color: var(--success-green); }} .log-entry.recovery .log-message {{ color: var(--danger-red); }} .log-entry.close .log-message {{ color: var(--success-green); font-weight: bold; }}
             </style>
         </head>
         <body>
             <div id="dashboard-content">
-                <div class="header">UHF SCALPER V2.0 / {SYMBOL_CCXT}</div>
+                <div class="header">UHF SCALPER V2.1 / {SYMBOL_CCXT}</div>
                 <div class="container">
                     <div class="status-bar {pos_class}">
                         <span>STATUS: {pos_dir}</span>
@@ -442,21 +450,19 @@ class TradingBot:
                 </div>
             </div>
             <script>
-                // AJAX RELOAD for smooth, non-blinking dashboard refresh
+                // AJAX RELOAD for smooth, non-blinking dashboard refresh (0.5s)
                 setInterval(function() {{
                     var timestamp = new Date().getTime();
-                    // Fetch the content of the dashboard file itself
                     fetch(window.location.href.split('?')[0] + '?t=' + timestamp)
                         .then(response => response.text())
                         .then(html => {{
                             var parser = new DOMParser();
                             var doc = parser.parseFromString(html, "text/html");
-                            // Isolate the dynamic content only
                             var newContent = doc.getElementById("dashboard-content").innerHTML;
                             document.getElementById("dashboard-content").innerHTML = newContent;
                         }})
                         .catch(err => console.log("Refresh error: " + err));
-                }}, 500); // Reload every 500ms
+                }}, 500); 
             </script>
         </body>
         </html>
@@ -512,16 +518,17 @@ class TradingBot:
                     entry = pos_data['entry_price']
                     is_long = qty > 0
                     
-                    curr_price = price_data['bid'] if is_long else price_data['ask']
+                    # The price used to check if an immediate market CLOSE is profitable
+                    close_price = price_data['bid'] if is_long else price_data['ask']
                     
                     if is_long:
-                        current_pnl = (curr_price - entry) * abs(qty)
-                        price_diff_pct = (curr_price - entry) / entry
+                        current_pnl = (close_price - entry) * abs(qty)
+                        price_diff_pct = (close_price - entry) / entry
                     else:
-                        current_pnl = (entry - curr_price) * abs(qty)
-                        price_diff_pct = (entry - curr_price) / entry
+                        current_pnl = (entry - close_price) * abs(qty)
+                        price_diff_pct = (entry - close_price) / entry
 
-                    total_fee = (entry * abs(qty) * FEE_RATE) + (curr_price * abs(qty) * FEE_RATE)
+                    total_fee = (entry * abs(qty) * FEE_RATE) + (close_price * abs(qty) * FEE_RATE)
                     net_pnl = current_pnl - total_fee
                     
                     entry_value = entry * abs(qty)
@@ -532,47 +539,50 @@ class TradingBot:
                     action_type = "PROFIT" if net_pnl >= 0 else "RECOVERY"
 
                     # 1. MAX SPEED SCALP PROFIT TAKER (Full Close)
-                    if current_pnl > required_pnl_usd:
+                    # Check if the calculated profit meets the minimum requirement
+                    if net_pnl >= MIN_COMPOUND_PROFIT_USD and current_pnl >= required_pnl_usd:
                         side = 'sell' if is_long else 'buy'
                         if self.sys.place_order(BASE_COIN, abs(qty), side):
                             action_log = f"PROFIT CLOSE: +{net_pnl:.4f}"
                             action_type = "CLOSE"
 
-                    # 2. AGGRESSIVE PYRAMIDING
-                    elif net_pnl > 0 and confidence > 60.0:
+                    # 2. HYPER AGGRESSIVE PYRAMIDING (Compound on tiny profit)
+                    # Compound aggressively if PnL is barely positive and AI is confident
+                    elif net_pnl >= MIN_COMPOUND_PROFIT_USD and confidence > 60.0:
                          if (is_long and prediction > 0) or (not is_long and prediction < 0):
                              execution_price = price_data['ask'] if is_long else price_data['bid']
                              usable_wallet = wallet * self.wallet_learner.risk_multiplier
-                             free_margin = usable_wallet - (abs(qty) * execution_price)
+                             free_margin = usable_wallet - (entry_value) # Use entry value for margin calculation
                              
                              if free_margin > (execution_price * MIN_QTY * 2):
-                                 # Uses the INCREASED INITIAL_ENTRY_SIZE_MULTIPLIER = 3.0
+                                 # Uses the INCREASED INITIAL_ENTRY_SIZE_MULTIPLIER = 3.5
                                  raw_qty = (free_margin * INITIAL_ENTRY_SIZE_MULTIPLIER) / execution_price
                                  add_qty = max(MIN_QTY, round(np.floor(raw_qty/MIN_QTY)*MIN_QTY, DECIMAL_PRECISION))
                                  side = 'buy' if is_long else 'sell'
                                  if self.sys.place_order(BASE_COIN, add_qty, side):
-                                     action_log = f"COMPOUND: +{add_qty}"
+                                     action_log = f"COMPOUND: +{add_qty} Qty"
                                      action_type = "COMPOUND"
 
-                    # 3. GRID RECOVERY
+                    # 3. HYPER AGGRESSIVE RECOVERY / GRID
+                    # Trigger recovery as soon as the price moves against the position past the grid step
                     elif price_diff_pct < -GRID_STEP_PCT:
                         if (is_long and prediction > -0.2) or (not is_long and prediction < 0.2):
                             execution_price = price_data['ask'] if is_long else price_data['bid']
                             usable_wallet = wallet * self.wallet_learner.risk_multiplier
-                            free_margin = usable_wallet - (abs(qty) * execution_price)
+                            free_margin = usable_wallet - (entry_value)
                             
                             if free_margin > (execution_price * MIN_QTY * 2):
-                                # Uses the INCREASED INITIAL_ENTRY_SIZE_MULTIPLIER = 3.0 (with 0.8 scaling)
+                                # Uses the INCREASED INITIAL_ENTRY_SIZE_MULTIPLIER = 3.5 (with 0.8 scaling)
                                 raw_qty = (free_margin * 0.8 * INITIAL_ENTRY_SIZE_MULTIPLIER) / execution_price
                                 rec_qty = max(MIN_QTY, round(np.floor(raw_qty/MIN_QTY)*MIN_QTY, DECIMAL_PRECISION))
                                 side = 'buy' if is_long else 'sell'
                                 if self.sys.place_order(BASE_COIN, rec_qty, side):
-                                    action_log = f"RECOVERY: +{rec_qty}"
+                                    action_log = f"RECOVERY: +{rec_qty} Qty"
                                     action_type = "RECOVERY"
 
                 else:
                     # -----------------------------------------------------
-                    # AGGRESSIVE NEW ENTRY (10% of Usable Wallet)
+                    # AGGRESSIVE NEW ENTRY (15% of Usable Wallet)
                     # -----------------------------------------------------
                     if self.ai.is_trained and confidence > dynamic_threshold and len(self.ai.history) > 50: 
                         
@@ -588,7 +598,7 @@ class TradingBot:
                         if side:
                             usable_wallet = wallet * self.wallet_learner.risk_multiplier
                             
-                            # LOGIC: (Wallet * 0.10) / Price -> Maximized entry size
+                            # LOGIC: (Wallet * 0.15) / Price -> Max initial entry size
                             raw_qty = (usable_wallet * AGGRESSIVE_ENTRY_WALLET_PCT) / execution_price
                             trade_qty = np.floor(raw_qty / MIN_QTY) * MIN_QTY
                             trade_qty = max(MIN_QTY, round(trade_qty, DECIMAL_PRECISION))
@@ -611,7 +621,6 @@ class TradingBot:
                 self.iteration += 1
                 
                 elapsed = time.time() - start_time
-                # Subtract processing time from the target sleep duration
                 sleep_time = max(0.01, UHF_SLEEP_SECONDS - elapsed)
                 time.sleep(sleep_time)
 
