@@ -41,6 +41,8 @@ UHF_SLEEP_SECONDS = 0.05
 # Dashboard Configuration
 SPREAD_TIGHT_THRESHOLD = 0.0005 # Max spread considered 'tight' for display
 
+print("linux8888")
+
 # ------------------------------------------------------------------------------
 # LOGGING SETUP
 # ------------------------------------------------------------------------------
