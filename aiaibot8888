@@ -845,3 +845,5 @@ class TradingBot:
 if __name__ == "__main__":
     bot = TradingBot()
     bot.run()
+
+https://aistudio.google.com/apps/drive/1MRi2HFwNWilGFAOMnEzjZkXhIQ8SaDf1?showAssistant=true&resourceKey=&showPreview=true
