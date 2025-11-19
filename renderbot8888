@@ -33,13 +33,14 @@ FEE_RATE = 0.0006
 # STRATEGY SETTINGS
 TARGET_PROFIT_PCT = 0.0001     
 GRID_STEP_PCT = 0.001          
-INITIAL_ENTRY_SIZE_MULTIPLIER = 2.0 
+
+# *** AGGRESSIVE CAPITAL UTILIZATION ***
+INITIAL_ENTRY_SIZE_MULTIPLIER = 3.0 # INCREASED from 2.0 for faster compounding/recovery
 UHF_SLEEP_SECONDS = 0.05       
 
-# *** ACTIVE TRADING SETTING ***
-# Uses 5% of your Total USDT for every single entry. 
-# Formula: (Total USDT / Price) * 0.05 = Trade Quantity
-AGGRESSIVE_ENTRY_WALLET_PCT = 0.05 
+# *** MAX ACTIVITY & SIZING ***
+# Uses 10% of your Total Usable USDT for every new entry (INCREASED from 5%)
+AGGRESSIVE_ENTRY_WALLET_PCT = 0.10 
 
 # DISPLAY SETTINGS
 SPREAD_TIGHT_THRESHOLD = 0.0005 
@@ -54,7 +55,7 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 logger = logging.getLogger()
 
 # ------------------------------------------------------------------------------
-# SYSTEM INTERFACE (Bash Scripts) with CACHING
+# SYSTEM INTERFACE (Bash Scripts) with FASTER CACHING
 # ------------------------------------------------------------------------------
 class SystemInterface:
     def __init__(self):
@@ -62,7 +63,8 @@ class SystemInterface:
         self.last_pos_check = 0
         self.cached_wallet = 0.0
         self.cached_pos = {'symbol': SYMBOL_BASH, 'qty': 0.0, 'entry_price': 0.0, 'has_position': False}
-        self.cache_duration = 2.0 
+        # CACHE DURATION REDUCED FROM 2.0s TO 0.5s for faster updates
+        self.cache_duration = 0.5 
 
     @staticmethod
     def run_command(command_list):
@@ -74,7 +76,7 @@ class SystemInterface:
             return None
 
     def get_wallet_balance(self, force=False):
-        """Cached wallet check to reduce I/O latency"""
+        """Faster Cached wallet check (0.5s refresh)"""
         now = time.time()
         if not force and (now - self.last_wallet_check < self.cache_duration):
             return self.cached_wallet
@@ -90,7 +92,7 @@ class SystemInterface:
         return self.cached_wallet
 
     def get_real_position(self, symbol_bash, force=False):
-        """Cached position check"""
+        """Faster Cached position check (0.5s refresh)"""
         now = time.time()
         if not force and (now - self.last_pos_check < self.cache_duration):
             return self.cached_pos
@@ -125,7 +127,7 @@ class SystemInterface:
         cmd = ['bash', '/placeorder.sh', coin_base, str(qty), side]
         output = self.run_command(cmd)
         
-        # Invalidate cache immediately after trade
+        # Invalidate cache instantly after trade
         self.last_pos_check = 0 
         self.last_wallet_check = 0
         
@@ -158,13 +160,12 @@ class WalletLearner:
             self.initial_balance = new_balance
             self.start_balance_session = new_balance
             self.current_balance = new_balance
-            return True # Safe
+            return True
 
-        # Circuit Breaker Check
         drawdown = (self.start_balance_session - new_balance) / self.start_balance_session * 100
         if drawdown > MAX_DAILY_LOSS_PCT:
             logger.critical(f"MAX DAILY LOSS HIT (-{drawdown:.2f}%). STOPPING BOT.")
-            return False # Unsafe
+            return False
 
         delta = new_balance - self.current_balance
         self.current_balance = new_balance
@@ -190,7 +191,6 @@ class WalletLearner:
 # ------------------------------------------------------------------------------
 class AIEngine:
     def __init__(self):
-        # Enable strict rate limiting handling
         self.exchange = ccxt.hitbtc({
             'enableRateLimit': True,
             'options': {'defaultType': 'future'} 
@@ -235,7 +235,6 @@ class AIEngine:
         df['mid_price'] = (df['bid'] + df['ask']) / 2
         df['returns'] = df['mid_price'].pct_change()
         
-        # Indicators
         delta = df['mid_price'].diff()
         gain = (delta.where(delta > 0, 0)).rolling(window=5).mean()
         loss = (-delta.where(delta < 0, 0)).rolling(window=5).mean()
@@ -248,7 +247,6 @@ class AIEngine:
         df['spread_change'] = df['spread'].diff()
         df['ma_5'] = df['mid_price'].rolling(window=5).mean()
         
-        # Target: Predict price 1 step ahead
         df['target'] = df['mid_price'].shift(-1) - df['mid_price']
         
         return df
@@ -271,7 +269,6 @@ class AIEngine:
         y = df_train['target']
         X_curr = X_current[available_cols]
 
-        # Sim Stats
         if self.is_trained:
             actual_move = df_all.iloc[-2]['target'] if not pd.isna(df_all.iloc[-2]['target']) else 0
             if (self.last_prediction > 0 and actual_move > 0) or (self.last_prediction < 0 and actual_move < 0):
@@ -364,7 +361,7 @@ class TradingBot:
         for item in action_history:
             history_html += f"<div class='log-entry {item['class']}'><span class='log-time'>{item['time']}</span><span class='log-message'>{item['message']}</span></div>"
 
-        # HTML with AJAX RELOAD (No Meta Refresh)
+        # HTML with AJAX RELOAD
         html = f"""
         <!DOCTYPE html>
         <html lang="en">
@@ -445,18 +442,21 @@ class TradingBot:
                 </div>
             </div>
             <script>
+                // AJAX RELOAD for smooth, non-blinking dashboard refresh
                 setInterval(function() {{
                     var timestamp = new Date().getTime();
-                    fetch(window.location.href + '?t=' + timestamp)
+                    // Fetch the content of the dashboard file itself
+                    fetch(window.location.href.split('?')[0] + '?t=' + timestamp)
                         .then(response => response.text())
                         .then(html => {{
                             var parser = new DOMParser();
                             var doc = parser.parseFromString(html, "text/html");
+                            // Isolate the dynamic content only
                             var newContent = doc.getElementById("dashboard-content").innerHTML;
                             document.getElementById("dashboard-content").innerHTML = newContent;
                         }})
                         .catch(err => console.log("Refresh error: " + err));
-                }}, 500);
+                }}, 500); // Reload every 500ms
             </script>
         </body>
         </html>
@@ -468,7 +468,7 @@ class TradingBot:
             logger.error(f"Failed to write dashboard: {e}")
 
     def run(self):
-        logger.info("Starting DYNAMIC SIZING UHF SCALPER...")
+        logger.info("Starting AGGRESSIVE UHF SCALPER...")
         self.sys.close_all_positions()
         
         initial_wallet = self.sys.get_wallet_balance(force=True)
@@ -504,6 +504,9 @@ class TradingBot:
                 dynamic_threshold = self.wallet_learner.dynamic_threshold
                 required_pnl_usd = 0.0
                 
+                # ---------------------------------------------------------
+                # TRADING LOGIC
+                # ---------------------------------------------------------
                 if pos_data['has_position']:
                     qty = pos_data['qty']
                     entry = pos_data['entry_price']
@@ -528,12 +531,14 @@ class TradingBot:
                     action_log = f"PnL: {net_pnl:.6f} (Req: {required_pnl_usd:.4f})"
                     action_type = "PROFIT" if net_pnl >= 0 else "RECOVERY"
 
+                    # 1. MAX SPEED SCALP PROFIT TAKER (Full Close)
                     if current_pnl > required_pnl_usd:
                         side = 'sell' if is_long else 'buy'
                         if self.sys.place_order(BASE_COIN, abs(qty), side):
                             action_log = f"PROFIT CLOSE: +{net_pnl:.4f}"
                             action_type = "CLOSE"
 
+                    # 2. AGGRESSIVE PYRAMIDING
                     elif net_pnl > 0 and confidence > 60.0:
                          if (is_long and prediction > 0) or (not is_long and prediction < 0):
                              execution_price = price_data['ask'] if is_long else price_data['bid']
@@ -541,6 +546,7 @@ class TradingBot:
                              free_margin = usable_wallet - (abs(qty) * execution_price)
                              
                              if free_margin > (execution_price * MIN_QTY * 2):
+                                 # Uses the INCREASED INITIAL_ENTRY_SIZE_MULTIPLIER = 3.0
                                  raw_qty = (free_margin * INITIAL_ENTRY_SIZE_MULTIPLIER) / execution_price
                                  add_qty = max(MIN_QTY, round(np.floor(raw_qty/MIN_QTY)*MIN_QTY, DECIMAL_PRECISION))
                                  side = 'buy' if is_long else 'sell'
@@ -548,6 +554,7 @@ class TradingBot:
                                      action_log = f"COMPOUND: +{add_qty}"
                                      action_type = "COMPOUND"
 
+                    # 3. GRID RECOVERY
                     elif price_diff_pct < -GRID_STEP_PCT:
                         if (is_long and prediction > -0.2) or (not is_long and prediction < 0.2):
                             execution_price = price_data['ask'] if is_long else price_data['bid']
@@ -555,6 +562,7 @@ class TradingBot:
                             free_margin = usable_wallet - (abs(qty) * execution_price)
                             
                             if free_margin > (execution_price * MIN_QTY * 2):
+                                # Uses the INCREASED INITIAL_ENTRY_SIZE_MULTIPLIER = 3.0 (with 0.8 scaling)
                                 raw_qty = (free_margin * 0.8 * INITIAL_ENTRY_SIZE_MULTIPLIER) / execution_price
                                 rec_qty = max(MIN_QTY, round(np.floor(raw_qty/MIN_QTY)*MIN_QTY, DECIMAL_PRECISION))
                                 side = 'buy' if is_long else 'sell'
@@ -564,7 +572,7 @@ class TradingBot:
 
                 else:
                     # -----------------------------------------------------
-                    # ACTIVE ENTRY LOGIC (Maximize based on Total USDT)
+                    # AGGRESSIVE NEW ENTRY (10% of Usable Wallet)
                     # -----------------------------------------------------
                     if self.ai.is_trained and confidence > dynamic_threshold and len(self.ai.history) > 50: 
                         
@@ -580,8 +588,7 @@ class TradingBot:
                         if side:
                             usable_wallet = wallet * self.wallet_learner.risk_multiplier
                             
-                            # LOGIC: (Wallet * 0.05) / Price
-                            # This calculates the max quantity for 5% of your wallet size
+                            # LOGIC: (Wallet * 0.10) / Price -> Maximized entry size
                             raw_qty = (usable_wallet * AGGRESSIVE_ENTRY_WALLET_PCT) / execution_price
                             trade_qty = np.floor(raw_qty / MIN_QTY) * MIN_QTY
                             trade_qty = max(MIN_QTY, round(trade_qty, DECIMAL_PRECISION))
@@ -604,6 +611,7 @@ class TradingBot:
                 self.iteration += 1
                 
                 elapsed = time.time() - start_time
+                # Subtract processing time from the target sleep duration
                 sleep_time = max(0.01, UHF_SLEEP_SECONDS - elapsed)
                 time.sleep(sleep_time)
 
