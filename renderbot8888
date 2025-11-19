@@ -38,7 +38,7 @@ UHF_SLEEP_SECONDS = 0.05
 
 # *** ACTIVE TRADING SETTING ***
 # Uses 5% of your Total USDT for every single entry. 
-# This calculates: (Total USDT / Price) * 0.05 = Trade Quantity
+# Formula: (Total USDT / Price) * 0.05 = Trade Quantity
 AGGRESSIVE_ENTRY_WALLET_PCT = 0.05 
 
 # DISPLAY SETTINGS
@@ -364,12 +364,12 @@ class TradingBot:
         for item in action_history:
             history_html += f"<div class='log-entry {item['class']}'><span class='log-time'>{item['time']}</span><span class='log-message'>{item['message']}</span></div>"
 
+        # HTML with AJAX RELOAD (No Meta Refresh)
         html = f"""
         <!DOCTYPE html>
         <html lang="en">
         <head>
             <meta charset="UTF-8">
-            <meta http-equiv="refresh" content="0.5">
             <meta name="viewport" content="width=device-width, initial-scale=1.0">
             <title>UHF SCALPER V2.0</title>
             <style>
@@ -399,49 +399,65 @@ class TradingBot:
             </style>
         </head>
         <body>
-            <div class="header">UHF SCALPER V2.0 / {SYMBOL_CCXT}</div>
-            <div class="container">
-                <div class="status-bar {pos_class}">
-                    <span>STATUS: {pos_dir}</span>
-                    <span>QTY: {pos_qty_display} {BASE_COIN}</span>
-                    <span>ENTRY: {position['entry_price']:.6f}</span>
-                </div>
-                <div class="grid-main">
-                    <div>
-                        <div class="card pnl-block" style="border-left: 4px solid {'var(--success-green)' if unrealized_pnl > 0 else 'var(--danger-red)' if unrealized_pnl < 0 else 'var(--neutral-gray)'};">
-                            <h2>UNREALIZED PNL</h2>
-                            <div class="value pnl {pnl_class}">{unrealized_pnl:.6f} USDT</div>
-                            <div class="sub">Required: <span class="success-text">{required_pnl_usd:.6f} USDT</span></div>
-                        </div>
-                        <div class="card" style="margin-top: 15px;">
-                            <h2>AI CONFIDENCE</h2>
-                            <div class="confidence-gauge">
-                                <div class="threshold-marker" style="left: {threshold_pos}%;"></div>
-                                <div class="confidence-fill" style="width: {confidence_width}%;"></div>
+            <div id="dashboard-content">
+                <div class="header">UHF SCALPER V2.0 / {SYMBOL_CCXT}</div>
+                <div class="container">
+                    <div class="status-bar {pos_class}">
+                        <span>STATUS: {pos_dir}</span>
+                        <span>QTY: {pos_qty_display} {BASE_COIN}</span>
+                        <span>ENTRY: {position['entry_price']:.6f}</span>
+                    </div>
+                    <div class="grid-main">
+                        <div>
+                            <div class="card pnl-block" style="border-left: 4px solid {'var(--success-green)' if unrealized_pnl > 0 else 'var(--danger-red)' if unrealized_pnl < 0 else 'var(--neutral-gray)'};">
+                                <h2>UNREALIZED PNL</h2>
+                                <div class="value pnl {pnl_class}">{unrealized_pnl:.6f} USDT</div>
+                                <div class="sub">Required: <span class="success-text">{required_pnl_usd:.6f} USDT</span></div>
                             </div>
-                            <div class="sub" style="display:flex; justify-content:space-between;"><span>Thr: {dynamic_threshold:.1f}%</span><span>Conf: {confidence:.1f}%</span></div>
+                            <div class="card" style="margin-top: 15px;">
+                                <h2>AI CONFIDENCE</h2>
+                                <div class="confidence-gauge">
+                                    <div class="threshold-marker" style="left: {threshold_pos}%;"></div>
+                                    <div class="confidence-fill" style="width: {confidence_width}%;"></div>
+                                </div>
+                                <div class="sub" style="display:flex; justify-content:space-between;"><span>Thr: {dynamic_threshold:.1f}%</span><span>Conf: {confidence:.1f}%</span></div>
+                            </div>
+                        </div>
+                        <div>
+                            <div class="card">
+                                <h2>PRICE</h2>
+                                <div class="value neutral-text">{price_info['last']:.6f}</div>
+                                <div class="sub">Signal: <span style="color: {signal_color}">{ai_signal} ({prediction:.8f})</span></div>
+                                <div class="sub">Target: <span class="success-text">{target_price:.6f}</span></div>
+                            </div>
+                            <div class="card" style="margin-top: 15px;">
+                                <h2>LOG</h2>
+                                {history_html}
+                            </div>
                         </div>
                     </div>
-                    <div>
-                        <div class="card">
-                            <h2>PRICE</h2>
-                            <div class="value neutral-text">{price_info['last']:.6f}</div>
-                            <div class="sub">Signal: <span style="color: {signal_color}">{ai_signal} ({prediction:.8f})</span></div>
-                            <div class="sub">Target: <span class="success-text">{target_price:.6f}</span></div>
-                        </div>
-                        <div class="card" style="margin-top: 15px;">
-                            <h2>LOG</h2>
-                            {history_html}
-                        </div>
+                    <div class="grid-bottom">
+                        <div class="card"><h2>BALANCE</h2><div class="value success-text">${wallet:.4f}</div><div class="sub">Growth: <span class="{growth_class}">{growth_pct:.4f}%</span></div></div>
+                        <div class="card"><h2>SPREAD</h2><div class="value {spread_class}">{spread:.6f}</div><div class="sub">{spread_status}</div></div>
+                        <div class="card"><h2>ACCURACY</h2><div class="value neutral-text">{sim_acc:.1f}%</div><div class="sub">Simulated</div></div>
+                        <div class="card"><h2>NOISE</h2><div class="value neutral-text">{(avg_volatility*100):.4f}%</div></div>
                     </div>
-                </div>
-                <div class="grid-bottom">
-                    <div class="card"><h2>BALANCE</h2><div class="value success-text">${wallet:.4f}</div><div class="sub">Growth: <span class="{growth_class}">{growth_pct:.4f}%</span></div></div>
-                    <div class="card"><h2>SPREAD</h2><div class="value {spread_class}">{spread:.6f}</div><div class="sub">{spread_status}</div></div>
-                    <div class="card"><h2>ACCURACY</h2><div class="value neutral-text">{sim_acc:.1f}%</div><div class="sub">Simulated</div></div>
-                    <div class="card"><h2>NOISE</h2><div class="value neutral-text">{(avg_volatility*100):.4f}%</div></div>
                 </div>
             </div>
+            <script>
+                setInterval(function() {{
+                    var timestamp = new Date().getTime();
+                    fetch(window.location.href + '?t=' + timestamp)
+                        .then(response => response.text())
+                        .then(html => {{
+                            var parser = new DOMParser();
+                            var doc = parser.parseFromString(html, "text/html");
+                            var newContent = doc.getElementById("dashboard-content").innerHTML;
+                            document.getElementById("dashboard-content").innerHTML = newContent;
+                        }})
+                        .catch(err => console.log("Refresh error: " + err));
+                }}, 500);
+            </script>
         </body>
         </html>
         """
@@ -564,9 +580,8 @@ class TradingBot:
                         if side:
                             usable_wallet = wallet * self.wallet_learner.risk_multiplier
                             
-                            # LOGIC: (Wallet / Price) * 0.05
-                            # Divides total possible lots by Price, then takes a chunk.
-                            # This ensures the trade size scales perfectly with the account size.
+                            # LOGIC: (Wallet * 0.05) / Price
+                            # This calculates the max quantity for 5% of your wallet size
                             raw_qty = (usable_wallet * AGGRESSIVE_ENTRY_WALLET_PCT) / execution_price
                             trade_qty = np.floor(raw_qty / MIN_QTY) * MIN_QTY
                             trade_qty = max(MIN_QTY, round(trade_qty, DECIMAL_PRECISION))
