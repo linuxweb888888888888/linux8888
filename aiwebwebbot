@@ -151,3 +151,72 @@ place real orders with "https://api.hitbtc.com/api/3/futures/order" parameters "
 close all positions on start with "https://api.hitbtc.com/api/3/futures/position"
 
 get real info entryprice and so on from "https://api.hitbtc.com/api/3/futures/account" check under positions value
+
+Profitable Futures Trading Bot — Detailed Bullet Points
+1. Advanced Futures Market Intelligence
+
+Real-time monitoring of perpetual futures order books, funding rates, open interest, and long/short ratio shifts.
+
+Leverage-aware signal engine that adjusts entry strength based on volatility and market momentum.
+
+Liquidation cluster detection to identify zones where sharp moves are likely.
+
+Funding-fee optimization, entering positions when fee direction favors profit.
+
+Trend tracking across multiple timeframes, using EMA clouds, VWAP deviation, RSI momentum, and volatility compression patterns.
+
+2. High-Precision Execution & Leverage Management
+
+Instant automated order execution using market, limit, or post-only orders depending on liquidity.
+
+Dynamic leverage scaling that lowers leverage in high-volatility zones and increases it during stable trends.
+
+Smart entry confirmation using volume spikes, order-book imbalance, and candle-close validation.
+
+Multi-tier take-profit system to secure profit in phases without fully closing the position.
+
+Auto-reduce or auto-hedge when the market flips direction or a reversal becomes statistically likely.
+
+3. Risk Protection & Liquidation Prevention
+
+Adaptive stop-loss engine that widens in trending markets and tightens in choppy conditions.
+
+Liquidation price buffer monitoring to prevent trades from approaching unsafe levels.
+
+Automatic partial close to reduce position size when risk becomes too high.
+
+Daily loss limits, max drawdown protection, and exposure caps to maintain account safety.
+
+Slippage and spread detection to avoid entering positions in unstable order books.
+
+4. Strategy Adaptation & Market Response
+
+Ranging/trending mode switching based on real-time volatility and breakout detection.
+
+Scalping mode for fast, low-risk entries during sideways markets.
+
+Momentum mode when strong directional force appears.
+
+Reversal mode using exhaustion patterns, divergences, and volume drops.
+
+Sensitivity tuning for ultra-responsive entries in fast-moving futures markets.
+
+5. Performance Tracking & Automation
+
+Live PnL tracking for both realized and unrealized profit on open futures positions.
+
+Automatic trade logging including entry price, exit price, funding fees, and liquidation buffer.
+
+HTML dashboard & metrics panel for real-time system monitoring.
+
+Error detection and auto-recovery during API issues or exchange delays.
+
+24/7 uptime with self-restart logic to ensure non-stop operation.
+
+6. Security & API Safety
+
+API key encryption with no withdrawal permissions enabled.
+
+Secure server deployment with recommended IP whitelisting.
+
+Rate-limit handling to avoid bans and ensure stable communication with exchanges
