@@ -1,0 +1,273 @@
+1. Ultra-High-Win-Rate Scalping Features
+Market Conditions
+
+Uses bid/ask microstructure from HitBTC /public/ticker.
+
+Executes a trade when:
+
+Spread is favorable
+
+Local micro-trend aligns (1-minute data)
+
+ML model predicts profitability > threshold
+
+Scalping Entry Logic
+
+Uses fast signal generation < 1 minute
+
+Buy signal:
+
+Price touches lower micro-band
+
+ML model predicts short-term upward movement
+
+Sell signal:
+
+Price touches upper micro-band
+
+ML model predicts short-term downward movement
+
+Scalping Exit Logic
+
+Exit triggered only if:
+
+PNL > trading fee
+
+OR ML model predicts profit reversion
+
+Losses prevented via:
+
+Dynamic stop-loss based on volatility
+
+Adaptive trailing stop
+
+Execution Rules
+
+Use market orders for fastest fill
+
+Position size auto-calculated based on:
+
+Minimum ATOM quantity (0.001)
+
+Wallet USDT available
+
+Cross-margin reserved amount
+
+Predicted profit vs. risk ratio
+
+2. Martingale-Like Mean Reversion Features
+Mean Reversion Entry Logic
+
+Continuously evaluates:
+
+Distance from moving mid-price
+
+Z-score deviation
+
+Microstructure imbalance
+
+If price moves against position:
+
+Add another position only if:
+
+ML model predicts recovery
+
+Wallet free margin is safe
+
+Quantity increase still >= 0.001 ATOM
+
+PNL improvement is probable
+
+Martingale Safety Rules
+
+Never double blindly
+
+ML-controlled increase factor
+
+Maximum allowed pyramiding depth
+
+Stop adding if:
+
+Cross-margin reserved too high
+
+ML confidence < threshold
+
+Volatility spike detected
+
+Exit Logic
+
+Close entire stack when:
+
+Weighted Avg Entry Price (WAE) < current mid-price for long
+
+Weighted Avg Entry Price > current mid-price for short
+
+AND PNL > fee
+
+3. Grid Trading Features
+Grid Structure
+
+Dynamic grid spaced using:
+
+Volatility %
+
+ATR-like formula without TA-Lib
+
+Real bid/ask spread
+
+Grid Orders
+
+Grid above and below current price
+
+When price dips → long grid orders fill
+
+When price rises → short grid orders fill
+
+Grid spacing adjusts automatically
+
+Grid size adjusts based on wallet USDT growth
+
+Grid + ML Hybrid Rules
+
+Grid entry executed only if ML predicts profitability
+
+Grid size reduced during high volatility
+
+Grid direction is one-sided:
+
+Only long grid when uptrend
+
+Only short grid when downtrend
+
+Determined by ML trend engine
+
+4. ML / AI Learning System (sklearn)
+Model Type
+
+Use RandomForestRegressor (not SGDRegressor, since that caused errors)
+
+Predicts:
+
+1-minute price change
+
+Profit probability
+
+Expected PNL vs. fee
+
+Confidence score
+
+Inputs
+
+Bid/ask
+
+Mid price
+
+Spread
+
+1-minute returns
+
+Volatility
+
+Order book imbalance
+
+Current open position PNL
+
+Historical trade outcomes
+
+Background simulated trade results
+
+Outputs
+
+Direction probability (long/short)
+
+Profit probability
+
+Optimal quantity
+
+Expected PNL range
+
+Signal confidence
+
+Learning Loop
+
+On every tick:
+
+Update DataFrame safely (no .append)
+
+Retrain incrementally only when enough new data
+
+Log warnings and eliminate feature-name mismatches
+
+5. HitBTC Cross-Margin Rules (Required for Bot)
+Account Data
+
+API: /futures/account
+
+Extract:
+
+positions[]
+
+avgEntryPrice
+
+quantity
+
+direction
+
+realized_pnl
+
+unrealized_pnl
+
+cross_margin_reserved
+
+Balance Data
+
+API: /futures/balance
+
+Fields:
+
+total USDT
+
+available USDT
+
+cross_margin_reserved
+
+Order Rules
+
+All orders must include:
+
+margin_mode=cross
+
+type=market
+
+symbol=ATOMUSDT_PERP (correct symbol)
+
+Position Handling
+
+Only one direction open at a time
+
+Add positions in same direction
+
+Never open < 0.001 ATOM
+
+Recalculate:
+
+Weighted avg entry price
+
+Total position size
+
+Total PNL
+
+6. PNL Calculation Rules
+Entry Price
+
+If long → entry = ask
+
+If short → entry = bid
+
+Exit Price
+
+If long → exit uses bid
+
+If short → exit uses ask
+
+Real-time PNL
