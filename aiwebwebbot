@@ -4,7 +4,15 @@ ccxt live real trading
 
 complete production ready ai bot for hitbtc futures cross margin trading ready to run sklearn sdgressor
 
+5 minute heikin ashi strategy trading bot long when green short when red simulation
+
 real prices from ccxt bid and ask "https://api.hitbtc.com/api/3/public/ticker"
+
+use real wallet usdt with "https://api.hitbtc.com/api/3/futures/balance" usdt and check for cross_margin_reserved
+
+close all positions on start with "https://api.hitbtc.com/api/3/futures/position"
+
+get real info entryprice and so on from "https://api.hitbtc.com/api/3/futures/account" check under positions value
 
 only close order if pnl larger than fee for profit
 
@@ -220,3 +228,192 @@ API key encryption with no withdrawal permissions enabled.
 Secure server deployment with recommended IP whitelisting.
 
 Rate-limit handling to avoid bans and ensure stable communication with exchanges
+
+import requests
+import time
+from requests.auth import HTTPBasicAuth
+
+# ------------------------
+# API credentials
+# ------------------------
+API_KEY = "YOUR_API_KEY"
+API_SECRET = "YOUR_API_SECRET"
+AUTH = HTTPBasicAuth(API_KEY, API_SECRET)
+
+BASE_URL = "https://api.hitbtc.com/api/3"
+SYMBOL = "ATOMUSDT_PERP"
+MARGIN_MODE = "cross"
+TIMEFRAME = 300  # 5 minutes
+
+# ------------------------
+# Helpers
+# ------------------------
+def safe_json(resp):
+    try:
+        return resp.json()
+    except ValueError:
+        return resp.text
+
+def safe_float(value, default=0.0):
+    try:
+        return float(value) if value not in (None, "", "null") else default
+    except:
+        return default
+
+# ------------------------
+# API Calls
+# ------------------------
+def get_ticker(symbol):
+    url = f"{BASE_URL}/public/ticker/{symbol}"
+    resp = requests.get(url)
+    return safe_json(resp)
+
+def get_balance():
+    url = f"{BASE_URL}/futures/balance"
+    resp = requests.get(url, auth=AUTH)
+    return safe_json(resp)
+
+def close_all_positions():
+    url = f"{BASE_URL}/futures/position"
+    resp = requests.delete(url, auth=AUTH)
+    return safe_json(resp)
+
+def place_order(side, quantity):
+    url = f"{BASE_URL}/futures/order"
+    data = {
+        "symbol": SYMBOL,
+        "type": "market",
+        "side": side,
+        "quantity": quantity,
+        "margin_mode": MARGIN_MODE
+    }
+    resp = requests.post(url, auth=AUTH, json=data)
+    return safe_json(resp)
+
+# ------------------------
+# Open positions
+# ------------------------
+def get_open_position():
+    url = f"{BASE_URL}/futures/account"
+    resp = requests.get(url, auth=AUTH)
+    account_info = safe_json(resp)
+
+    if not account_info or not isinstance(account_info, list):
+        print("Warning: account_info invalid:", account_info)
+        return None
+
+    try:
+        positions = account_info[0].get("positions") or []
+        for pos in positions:
+            quantity = safe_float(pos.get("quantity"))
+            if pos.get("symbol") == SYMBOL and quantity > 0:
+                pos["quantity"] = quantity
+                pos["price_entry"] = safe_float(pos.get("price_entry"))
+                pos["price_margin_call"] = safe_float(pos.get("price_margin_call"))
+                pos["price_liquidation"] = safe_float(pos.get("price_liquidation"))
+                pos["pnl"] = safe_float(pos.get("pnl"))
+                return pos
+        return None
+    except Exception as e:
+        print("Error parsing positions:", e)
+        return None
+
+# ------------------------
+# Usable balance from cross_margin_reserved only
+# ------------------------
+def get_usable_balance():
+    """
+    Returns usable USDT for cross-margin trading using ONLY cross_margin_reserved
+    """
+    balance_info = get_balance()
+    if not balance_info or not isinstance(balance_info, list):
+        print("Balance info invalid:", balance_info)
+        return 0
+
+    for entry in balance_info:
+        currency = entry.get("currency")
+        if currency == "USDT":
+            cross_reserved = safe_float(entry.get("cross_margin_reserved"))
+            print(f"Currency: {currency}, Usable cross-margin: {cross_reserved}")
+            return cross_reserved
+
+    print("No USDT entry found in balance")
+    return 0
+
+# ------------------------
+# Heikin-Ashi
+# ------------------------
+def heikin_ashi(prev_candle, current_candle):
+    ha_close = (current_candle['open'] + current_candle['high'] +
+                current_candle['low'] + current_candle['close']) / 4
+    ha_open = (prev_candle['open'] + prev_candle['close']) / 2
+    ha_high = max(current_candle['high'], ha_open, ha_close)
+    ha_low = min(current_candle['low'], ha_open, ha_close)
+    return {"open": ha_open, "high": ha_high, "low": ha_low, "close": ha_close}
+
+# ------------------------
+# Main bot loop with debug
+# ------------------------
+def run_bot():
+    print("Closing all positions on start...")
+    close_result = close_all_positions()
+    print("Close all positions result:", close_result)
+
+    prev_candle = {"open": 0, "high": 0, "low": 0, "close": 0}
+    print("Starting 5-minute Heikin-Ashi futures bot...")
+
+    while True:
+        ticker = get_ticker(SYMBOL)
+        if isinstance(ticker, dict):
+            bid = safe_float(ticker.get("bid"))
+            ask = safe_float(ticker.get("ask"))
+            current_price = (bid + ask) / 2
+        else:
+            print("Invalid ticker:", ticker)
+            time.sleep(TIMEFRAME)
+            continue
+
+        current_candle = {
+            "open": current_price,
+            "high": current_price,
+            "low": current_price,
+            "close": current_price
+        }
+
+        ha_candle = heikin_ashi(prev_candle, current_candle)
+
+        # Debug Heikin-Ashi candle
+        print(f"\nHA Candle: Open={ha_candle['open']:.4f}, Close={ha_candle['close']:.4f}, High={ha_candle['high']:.4f}, Low={ha_candle['low']:.4f}")
+
+        # Check open positions
+        open_position = get_open_position()
+        if open_position:
+            print(f"Existing position: {open_position['quantity']} @ {open_position['price_entry']}, PnL: {open_position['pnl']}")
+            print("Skipping new order: already have an open position.")
+        else:
+            # Determine action
+            action = None
+            if ha_candle["close"] > ha_candle["open"]:
+                action = "buy"
+            elif ha_candle["close"] < ha_candle["open"]:
+                action = "sell"
+
+            if action:
+                usable_usdt = get_usable_balance()
+                print(f"Usable cross-margin USDT: {usable_usdt}")
+
+                if usable_usdt > 0:
+                    quantity = usable_usdt / current_price
+                    print(f"Placing {action} order with quantity: {quantity:.6f} at price ~{current_price:.4f}")
+                    order = place_order(action, quantity)
+                    print(f"Order response: {order}")
+                else:
+                    print("Skipping order: No usable cross-margin USDT available.")
+            else:
+                print("Skipping order: No clear HA signal (close == open).")
+
+        prev_candle = ha_candle
+        time.sleep(TIMEFRAME)
+
+if __name__ == "__main__":
+    run_bot()
