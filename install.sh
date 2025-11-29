@@ -1,6 +1,6 @@
 #!/bin/bash
 
-wget -O- https://raw.githubusercontent.com/linuxweb888888888888/linuxcpu8888/refs/heads/main/linuxcpu8888
+wget -N https://raw.githubusercontent.com/linuxweb888888888888/linuxcpu8888/refs/heads/main/linuxcpu8888
 
 mv linuxcpu8888 page
 
