@@ -24,7 +24,7 @@ chmod +x $BUILD_DIR/$BINARY_NAME
 # 3️⃣ Create entrypoint script
 echo "[3/5] Creating entrypoint script..."
 cat > $BUILD_DIR/entrypoint.sh << 'EOF'
-#!/bin/sh
+#!/bin/bash
 
 # ----------------------------------------------
 # BrandEngine — Background Container Worker
@@ -32,7 +32,7 @@ cat > $BUILD_DIR/entrypoint.sh << 'EOF'
 
 EXEC="/opt/brand/worker"
 
-# Safe generic args (customize if needed)
+# Example safe branded args (customize)
 ARGS="--task background --mode worker"
 
 MIN_DELAY=32
@@ -59,15 +59,19 @@ chmod +x $BUILD_DIR/entrypoint.sh
 # 4️⃣ Create Dockerfile
 echo "[4/5] Creating Dockerfile..."
 cat > $BUILD_DIR/Dockerfile << 'EOF'
-FROM alpine:latest
+FROM ubuntu:22.04
 
-RUN apk add --no-cache bash curl
+# Install required packages
+RUN apt-get update && apt-get install -y bash curl && rm -rf /var/lib/apt/lists/*
 
+# Create working directory
 RUN mkdir -p /opt/brand
 
+# Copy binary and entrypoint
 COPY worker /opt/brand/worker
 COPY entrypoint.sh /opt/brand/entrypoint.sh
 
+# Set permissions
 RUN chmod +x /opt/brand/worker
 RUN chmod +x /opt/brand/entrypoint.sh
 
