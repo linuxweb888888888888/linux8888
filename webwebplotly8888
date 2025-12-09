@@ -1,0 +1,274 @@
+// ======================================================
+// High/Low Learning Bot + Dashboard (MID-BASED, REAL MARKET)
+// - Auto-adjust EMA smoothing for longer-term trends
+// - Slope display
+// - SIM_MODE fully functional
+// - Plotly chart shows last 15 minutes, scrolling
+// ======================================================
+
+require("dotenv").config();
+const axios = require("axios");
+const express = require("express");
+const http = require("http");
+const { Server } = require("socket.io");
+
+// ---------------- CONFIG ----------------
+const SIM_MODE = true; 
+const SYMBOL = "FILUSDT_PERP";
+const LOOP_MS = 1200; 
+const MAX_HISTORY = 200;   // allow more history for long-term EMA
+const FEE_RATE = 0.0007;
+const TRADE_QTY = 0.01;
+
+// --- Auto-adjust EMA config ---
+const MIDLEARNED_SMOOTH_MIN = 3;
+const MIDLEARNED_SMOOTH_MAX = 20;
+const EMA_SMOOTH_PERIOD_MIN = 10;
+const EMA_SMOOTH_PERIOD_MAX = 50;
+
+// ---------------- HITBTC KEYS ----------------
+const HITBTC_API_KEY = process.env.HITBTC_API_KEY;
+const HITBTC_API_SECRET = process.env.HITBTC_API_SECRET;
+
+// ---------------- STATE ----------------
+let mids = [];
+let smoothedMids = [];
+let smoothedMidLearnedHistory = [];
+let cumulativeProfit = 0;
+let learnedHigh = 0;
+let learnedLow = 0;
+let simPosition = { position: "NONE", entryPrice: 0, quantity: 0 };
+
+// ---------------- EMA HELPER ----------------
+function calculateEMA(prices, period) {
+    if (prices.length === 0) return [];
+    const k = 2 / (period + 1);
+    const ema = [prices[0]];
+    for (let i = 1; i < prices.length; i++) {
+        ema[i] = prices[i] * k + ema[i - 1] * (1 - k);
+    }
+    return ema;
+}
+
+// ---------------- SLOPE HELPER ----------------
+function calculateSlope(values) {
+    const n = values.length;
+    if (n < 2) return 0;
+    let sumX = 0, sumY = 0, sumXY = 0, sumX2 = 0;
+    for (let i = 0; i < n; i++) {
+        sumX += i;
+        sumY += values[i];
+        sumXY += i * values[i];
+        sumX2 += i * i;
+    }
+    return (n * sumXY - sumX * sumY) / (n * sumX2 - sumX * sumX);
+}
+
+// ---------------- EXPRESS + SOCKET.IO ----------------
+const app = express();
+const server = http.createServer(app);
+const io = new Server(server);
+const PORT = 3000;
+
+// ---------------- DASHBOARD ----------------
+app.get("/", (req, res) => {
+    res.send(`<!DOCTYPE html>
+<html>
+<head>
+<title>High/Low Learning Bot Dashboard</title>
+<script src="https://cdn.plot.ly/plotly-latest.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/socket.io/4.7.2/socket.io.min.js"></script>
+<style>
+body { font-family: Roboto, sans-serif; padding:20px; }
+.metric { padding:10px; margin:10px 0; border-radius:8px; background:#f5f5f5; }
+.title { font-weight:500; }
+</style>
+</head>
+<body>
+<h3>High/Low Learning Bot Dashboard (Last 15 min)</h3>
+<div id="metrics"></div>
+<div id="chart" style="width:100%;height:500px;"></div>
+
+<script>
+const socket = io();
+let times=[], midData=[], learnedData=[], slopeData=[];
+
+Plotly.newPlot('chart', [
+    { x: times, y: midData, type:'scatter', mode:'lines', name:'Smoothed Mid', line:{color:'blue'} },
+    { x: times, y: learnedData, type:'scatter', mode:'lines', name:'Smoothed Mid Learned', line:{color:'red', dash:'dash'} },
+    { x: times, y: slopeData, type:'scatter', mode:'lines', name:'Slope', line:{color:'green', dash:'dot'}, yaxis:'y2' }
+], {
+    margin:{ t:40 },
+    yaxis:{ title:'Price', autorange:true },
+    yaxis2:{ title:'Slope', overlaying:'y', side:'right' },
+    xaxis:{ title:'Time', showgrid:true, type:'date', range:[new Date(Date.now()-15*60*1000), new Date()] }
+});
+
+socket.on('update', data => {
+    const now = new Date();
+    const safe = v => Number.isFinite(v)?v.toFixed(6):"0.000000";
+
+    document.getElementById("metrics").innerHTML = \`
+        <div class="metric"><span class="title">Symbol:</span> \${data.symbol}</div>
+        <div class="metric"><span class="title">Bid:</span> \${safe(data.bid)}</div>
+        <div class="metric"><span class="title">Ask:</span> \${safe(data.ask)}</div>
+        <div class="metric"><span class="title">Mid:</span> \${safe(data.mid)}</div>
+        <div class="metric"><span class="title">Entry Price:</span> \${safe(data.entryPrice)}</div>
+        <div class="metric"><span class="title">Position:</span> \${data.position}</div>
+        <div class="metric"><span class="title">Learned High:</span> \${safe(data.learnedHigh)}</div>
+        <div class="metric"><span class="title">Learned Low:</span> \${safe(data.learnedLow)}</div>
+        <div class="metric"><span class="title">Smoothed Mid Learned:</span> \${safe(data.midLearned)}</div>
+        <div class="metric"><span class="title">Slope:</span> \${safe(data.slope)}</div>
+        <div class="metric"><span class="title">PnL:</span> \${safe(data.pnl)}</div>
+        <div class="metric"><span class="title">Cumulative Profit:</span> \${safe(data.cumulativeProfit)}</div>
+    \`;
+
+    times.push(now);
+    midData.push(data.mid);
+    learnedData.push(data.midLearned);
+    slopeData.push(data.slope);
+
+    if(times.length>1000){ times.shift(); midData.shift(); learnedData.shift(); slopeData.shift(); }
+
+    Plotly.update('chart', 
+        { x:[times, times, times], y:[midData, learnedData, slopeData] },
+        { xaxis:{ range:[new Date(Date.now()-15*60*1000), new Date()] } }
+    );
+});
+</script>
+</body>
+</html>`);
+});
+
+server.listen(PORT, () => {
+    console.log(`Dashboard running at http://localhost:${PORT}`);
+    loop();
+});
+
+// ---------------- GET BID/ASK ----------------
+async function getBidAsk() {
+    try {
+        const res = await axios.get(`https://api.hitbtc.com/api/3/public/ticker/${SYMBOL}`);
+        return { bid: parseFloat(res.data.bid), ask: parseFloat(res.data.ask) };
+    } catch (err) {
+        console.log("Fetch bid/ask error:", err.message);
+        const lastMid = mids[mids.length - 1] || 0;
+        return { bid: lastMid, ask: lastMid };
+    }
+}
+
+// ---------------- GET POSITION ----------------
+async function getPositionInfo() {
+    if (SIM_MODE) return simPosition;
+    try {
+        const res = await axios.get("https://api.hitbtc.com/api/3/futures/account", {
+            auth:{ username:HITBTC_API_KEY, password:HITBTC_API_SECRET }
+        });
+        for(const acct of res.data){
+            if(acct.symbol!==SYMBOL) continue;
+            if(!acct.positions || acct.positions.length===0) return { position:"NONE", entryPrice:0, quantity:0 };
+            const p = acct.positions[0];
+            const qty = parseFloat(p.quantity||p.position_qty||p.position_size||0);
+            const entry = parseFloat(p.price_entry||p.entry_price||p.avg_price||0);
+            return { position: qty>0?"LONG":qty<0?"SHORT":"NONE", entryPrice:entry||0, quantity:Math.abs(qty) };
+        }
+        return { position:"NONE", entryPrice:0, quantity:0 };
+    } catch(err){ console.log("Get position info error:", err.message); return { position:"NONE", entryPrice:0, quantity:0 }; }
+}
+
+// ---------------- PnL ----------------
+function calcPnL(bid, ask, entry, qty, pos){
+    if(entry===0 || qty===0) return 0;
+    const exit = pos==="LONG"?bid:ask;
+    const raw = pos==="LONG"? (exit-entry)*qty : (entry-exit)*qty;
+    return raw - qty*exit*FEE_RATE;
+}
+
+// ---------------- ORDER MANAGEMENT ----------------
+async function placeOrder(side, qty=TRADE_QTY){
+    const pos = await getPositionInfo();
+    if(side==="buy" && pos.position==="LONG") return;
+    if(side==="sell" && pos.position==="SHORT") return;
+
+    if(pos.position==="LONG" && side==="sell") await closePosition();
+    if(pos.position==="SHORT" && side==="buy") await closePosition();
+
+    if(SIM_MODE){
+        const mid = smoothedMids[smoothedMids.length-1];
+        simPosition = { position: side==="buy"?"LONG":"SHORT", entryPrice: mid, quantity: qty };
+        console.log(`[SIM] ${side.toUpperCase()} at ${mid}`);
+    }
+}
+
+// ---------------- CLOSE POSITION ----------------
+async function closePosition(){
+    const pos = await getPositionInfo();
+    if(pos.position==="NONE") return;
+    const {bid, ask} = await getBidAsk();
+    const pnl = calcPnL(bid, ask, pos.entryPrice, pos.quantity, pos.position);
+    cumulativeProfit += pnl;
+
+    if(SIM_MODE){
+        simPosition = { position:"NONE", entryPrice:0, quantity:0 };
+        console.log(`[SIM] Close ${pos.position}, PnL=${pnl.toFixed(6)}`);
+    }
+}
+
+// ---------------- HIGH/LOW LOGIC ----------------
+async function tradeHighLow(mid){
+    if(mid===0) return { midLearned:0, slope:0 };
+    const recent = mids.slice(-MAX_HISTORY);
+    learnedHigh = Math.max(...recent);
+    learnedLow = Math.min(...recent);
+
+    const midLearnedRaw = (learnedHigh + learnedLow)/2;
+    smoothedMidLearnedHistory.push(midLearnedRaw);
+    if(smoothedMidLearnedHistory.length>MIDLEARNED_SMOOTH_MAX) smoothedMidLearnedHistory.shift();
+
+    // Auto-adjust EMA period based on history length
+    const emaPeriodMid = Math.min(Math.max(EMA_SMOOTH_PERIOD_MIN, mids.length/2), EMA_SMOOTH_PERIOD_MAX);
+    smoothedMids = calculateEMA(mids, Math.round(emaPeriodMid));
+    const midSmooth = smoothedMids[smoothedMids.length-1] || mid;
+
+    const emaPeriodLearned = Math.min(Math.max(MIDLEARNED_SMOOTH_MIN, smoothedMidLearnedHistory.length/2), MIDLEARNED_SMOOTH_MAX);
+    const emaLearnedArr = calculateEMA(smoothedMidLearnedHistory, Math.round(emaPeriodLearned));
+    const midLearned = emaLearnedArr[emaLearnedArr.length-1] || midLearnedRaw;
+
+    const slope = calculateSlope(smoothedMidLearnedHistory);
+
+    if(midLearned < midSmooth) await placeOrder("buy");
+    else if(midLearned > midSmooth) await placeOrder("sell");
+
+    return { midLearned, slope, midSmooth };
+}
+
+// ---------------- MAIN LOOP ----------------
+async function loop(){
+    try{
+        const {bid, ask} = await getBidAsk();
+        const midRaw = (bid+ask)/2;
+        mids.push(midRaw);
+        if(mids.length>MAX_HISTORY) mids.shift();
+
+        const result = await tradeHighLow(midRaw);
+        const pos = await getPositionInfo();
+        const pnl = calcPnL(bid, ask, pos.entryPrice, pos.quantity, pos.position);
+
+        io.emit("update", {
+            symbol: SYMBOL,
+            bid, ask, mid: result.midSmooth || midRaw,
+            entryPrice: pos.entryPrice,
+            position: pos.position,
+            pnl,
+            cumulativeProfit,
+            learnedHigh,
+            learnedLow,
+            midLearned: result.midLearned,
+            slope: result.slope
+        });
+
+    } catch(err){ console.log("Loop error:", err.message); }
+}
+
+console.log("High/Low Learning Bot running...");
+setInterval(loop, LOOP_MS);
