@@ -1,0 +1,298 @@
+/******************************************************************************************
+ *  ADVANCED SMOOTHED MEAN REVERSION BOT — LIVE PRICES + TAKE PROFIT/STOP LOSS + SWAPPED SIGNALS
+ *  -------------------------------------------------------
+ *  ✔ REAL BID/ASK PRICES (HitBTC)
+ *  ✔ Mid-price smoothing
+ *  ✔ 15m WINDOW (approx 643 ticks)
+ *  ✔ Smoothed Mid (5 ticks)
+ *  ✔ Z-Score Strategy
+ *  ✔ Swapped Signals:
+ *      - GREEN DOT → LONG
+ *      - RED DOT → SHORT
+ *  ✔ Take-Profit / Stop-Loss
+ *  ✔ Sim Trading Engine
+ *  ✔ Dashboard with:
+ *     - Chart.js Chart
+ *     - Trade Markers
+ *     - PnL Tracking
+ *     - Live Trade Log
+ *     - Z-Score + Volatility panels
+ *****************************************************************************************/
+
+const express = require("express");
+const http = require("http");
+const { Server } = require("socket.io");
+const axios = require("axios");
+
+// --------------------------------------------------
+// CONFIG
+// --------------------------------------------------
+const CONFIG = {
+    tickRate: 1400,           // 1.4s tick
+    windowMinutes: 15,        // rolling window
+    smoothing: 5,             // moving average
+    zScoreThreshold: 2.0,     // trigger threshold
+    SIM_MODE: true,           // simulate trades
+    SYMBOL: "FILUSDT",        // HitBTC symbol
+    TAKE_PROFIT_PCT: 0.00125, // 0.125%
+    STOP_LOSS_PCT: 0.0020     // 0.2%
+};
+
+// Derived buffer size
+const BUFFER_SIZE = Math.ceil((CONFIG.windowMinutes * 60 * 1000) / CONFIG.tickRate);
+
+// --------------------------------------------------
+// STATE
+// --------------------------------------------------
+let priceHistory = [];
+
+// Sim trading state
+let position = null;
+let entryPrice = null;
+let realizedPnL = 0;
+let tradeHistory = [];
+
+// --------------------------------------------------
+// MATH HELPERS
+// --------------------------------------------------
+function mean(arr) {
+    if (arr.length === 0) return 0;
+    return arr.reduce((a, b) => a + b, 0) / arr.length;
+}
+
+function stddev(arr, m) {
+    if (arr.length < 2) return 0;
+    const sq = arr.map(v => (v - m) ** 2);
+    return Math.sqrt(mean(sq));
+}
+
+function smooth(arr, count) {
+    if (arr.length < count) return arr[arr.length - 1];
+    return mean(arr.slice(-count));
+}
+
+// --------------------------------------------------
+// REAL PRICE FETCHER (HitBTC)
+// --------------------------------------------------
+async function fetchPrice(symbol = CONFIG.SYMBOL) {
+    try {
+        const res = await axios.get(`https://api.hitbtc.com/api/3/public/ticker/${symbol}`);
+        const bid = parseFloat(res.data.bid);
+        const ask = parseFloat(res.data.ask);
+        const mid = (bid + ask) / 2;
+        return mid;
+    } catch (err) {
+        console.error("Price fetch error:", err.message);
+        return null;
+    }
+}
+
+// --------------------------------------------------
+// STRATEGY CORE (SWAPPED SIGNALS)
+// --------------------------------------------------
+function runStrategy(io, price) {
+    if (priceHistory.length < 50) {
+        return io.emit("warmup", { progress: priceHistory.length, target: BUFFER_SIZE });
+    }
+
+    const smoothed = smooth(priceHistory, CONFIG.smoothing);
+    const m = mean(priceHistory);
+    const sd = stddev(priceHistory, m);
+
+    const z = sd === 0 ? 0 : (smoothed - m) / sd;
+    const time = new Date().toLocaleTimeString("en-US", { hour12: false });
+
+    // Emit dashboard stats
+    io.emit("stats", {
+        time,
+        price: smoothed,
+        zScore: z,
+        volatility: sd,
+        position,
+        entryPrice,
+        realizedPnL
+    });
+
+    // Swapped Signals:
+    // High Z → GREEN DOT → LONG
+    // Low Z  → RED DOT → SHORT
+    if (z >= CONFIG.zScoreThreshold) {
+        io.emit("signal", { type: "GREEN", price: smoothed, time }); // RED → GREEN
+        if (CONFIG.SIM_MODE) executeLong(io, smoothed, time);         // SHORT → LONG
+    } else if (z <= -CONFIG.zScoreThreshold) {
+        io.emit("signal", { type: "RED", price: smoothed, time });   // GREEN → RED
+        if (CONFIG.SIM_MODE) executeShort(io, smoothed, time);       // LONG → SHORT
+    }
+}
+
+// --------------------------------------------------
+// SIM TRADING ENGINE
+// --------------------------------------------------
+function executeLong(io, price, time) {
+    if (position === "SHORT") {
+        closePosition(io, price, time, "SHORT", "REVERSE LONG");
+    }
+    if (!position) {
+        position = "LONG";
+        entryPrice = price;
+        tradeHistory.push({ type: "OPEN LONG", entry: price, time });
+        io.emit("trade", tradeHistory[tradeHistory.length - 1]);
+    }
+}
+
+function executeShort(io, price, time) {
+    if (position === "LONG") {
+        closePosition(io, price, time, "LONG", "REVERSE SHORT");
+    }
+    if (!position) {
+        position = "SHORT";
+        entryPrice = price;
+        tradeHistory.push({ type: "OPEN SHORT", entry: price, time });
+        io.emit("trade", tradeHistory[tradeHistory.length - 1]);
+    }
+}
+
+// --------------------------------------------------
+// TAKE-PROFIT / STOP-LOSS CHECK
+// --------------------------------------------------
+function checkTakeProfitStopLoss(io, price, time) {
+    if (!position || !entryPrice) return;
+
+    if (position === "LONG") {
+        const tpPrice = entryPrice * (1 + CONFIG.TAKE_PROFIT_PCT);
+        const slPrice = entryPrice * (1 - CONFIG.STOP_LOSS_PCT);
+
+        if (price >= tpPrice) closePosition(io, price, time, "LONG", "TAKE PROFIT");
+        else if (price <= slPrice) closePosition(io, price, time, "LONG", "STOP LOSS");
+    }
+
+    if (position === "SHORT") {
+        const tpPrice = entryPrice * (1 - CONFIG.TAKE_PROFIT_PCT);
+        const slPrice = entryPrice * (1 + CONFIG.STOP_LOSS_PCT);
+
+        if (price <= tpPrice) closePosition(io, price, time, "SHORT", "TAKE PROFIT");
+        else if (price >= slPrice) closePosition(io, price, time, "SHORT", "STOP LOSS");
+    }
+}
+
+function closePosition(io, price, time, pos, reason) {
+    let pnl = pos === "LONG" ? price - entryPrice : entryPrice - price;
+    realizedPnL += pnl;
+
+    tradeHistory.push({ type: `CLOSE ${pos} (${reason})`, entry: entryPrice, exit: price, pnl, time });
+    io.emit("trade", tradeHistory[tradeHistory.length - 1]);
+
+    position = null;
+    entryPrice = null;
+}
+
+// --------------------------------------------------
+// SERVER + DASHBOARD
+// --------------------------------------------------
+const app = express();
+const server = http.createServer(app);
+const io = new Server(server);
+
+app.get("/", (req, res) => res.send(DASHBOARD_HTML));
+
+// --------------------------------------------------
+// TICK ENGINE (REAL PRICES + TP/SL + SWAPPED SIGNALS)
+// --------------------------------------------------
+setInterval(async () => {
+    const price = await fetchPrice(CONFIG.SYMBOL);
+    if (!price) return;
+
+    priceHistory.push(price);
+    if (priceHistory.length > BUFFER_SIZE) priceHistory.shift();
+
+    io.emit("tick", { price });
+
+    runStrategy(io, price);
+    if (CONFIG.SIM_MODE) checkTakeProfitStopLoss(io, price, new Date().toLocaleTimeString("en-US", { hour12: false }));
+}, CONFIG.tickRate);
+
+// --------------------------------------------------
+server.listen(3000, () => console.log("Bot running on http://localhost:3000"));
+// --------------------------------------------------
+
+
+// ======================================================================================
+// DASHBOARD HTML (UNCHANGED)
+// ======================================================================================
+const DASHBOARD_HTML = `
+<!DOCTYPE html>
+<html>
+<head>
+<title>Smoothed Mean Reversion Bot</title>
+<style>
+body { margin:0; background:#121212; color:#eee; font-family:Arial; }
+#topbar { padding:15px; background:#1e1e1e; display:flex; gap:40px; }
+.card { background:#1b1b1b; padding:15px; border-radius:10px; flex:1; }
+.label { font-size:14px; opacity:0.7; }
+.value { font-size:22px; margin-top:5px; }
+#layout { display:flex; height:calc(100vh - 80px); }
+#left { flex:3; padding:20px; }
+#right { flex:1.5; padding:20px; overflow-y:auto; }
+#tradeLog { font-family:monospace; white-space:pre-wrap; line-height:1.4; }
+</style>
+<script src="https://cdn.jsdelivr.net/npm/socket.io-client@4/dist/socket.io.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+</head>
+<body>
+<div id="topbar">
+    <div class="card"><div class="label">Price</div><div class="value" id="priceBox">--</div></div>
+    <div class="card"><div class="label">Z-Score</div><div class="value" id="zBox">--</div></div>
+    <div class="card"><div class="label">Volatility (SD)</div><div class="value" id="volBox">--</div></div>
+    <div class="card"><div class="label">Position</div><div class="value" id="posBox">--</div></div>
+    <div class="card"><div class="label">Realized PnL</div><div class="value" id="pnlBox">0.00000</div></div>
+</div>
+<div id="layout">
+    <div id="left"><canvas id="chart"></canvas></div>
+    <div id="right">
+        <h2>Live Trade Log</h2>
+        <div id="tradeLog"></div>
+    </div>
+</div>
+<script>
+const socket = io();
+const ctx = document.getElementById("chart").getContext("2d");
+const chart = new Chart(ctx, {
+    type:"line",
+    data:{
+        labels:[],
+        datasets:[
+            { label:"Price", data:[], borderWidth:2, borderColor:"white", pointRadius:0 },
+            { label:"Trade Markers", data:[], borderColor:"rgba(0,0,0,0)", pointBackgroundColor:[], pointRadius:6, showLine:false }
+        ]
+    },
+    options:{ animation:false, scales:{ x:{ display:false }, y:{ ticks:{ color:"white" } } } }
+});
+socket.on("tick", msg => {
+    chart.data.labels.push("");
+    chart.data.datasets[0].data.push(msg.price);
+    chart.update("none");
+});
+socket.on("stats", msg => {
+    document.getElementById("priceBox").innerText = msg.price.toFixed(5);
+    document.getElementById("zBox").innerText = msg.zScore.toFixed(2);
+    document.getElementById("volBox").innerText = msg.volatility.toFixed(5);
+    document.getElementById("posBox").innerText = msg.position ? msg.position : "NONE";
+    document.getElementById("pnlBox").innerText = msg.realizedPnL.toFixed(5);
+});
+socket.on("trade", t => {
+    const log = document.getElementById("tradeLog");
+    log.innerText = JSON.stringify(t, null, 2) + "\\n" + log.innerText;
+    chart.data.datasets[1].data.push(t.entry || t.exit);
+    chart.data.datasets[1].pointBackgroundColor.push(t.type.includes("LONG") ? "lime" : "red");
+    chart.update();
+});
+socket.on("signal", s => {
+    const color = s.type === "GREEN" ? "lime" : "red";
+    chart.data.datasets[1].data.push(s.price);
+    chart.data.datasets[1].pointBackgroundColor.push(color);
+    chart.update();
+});
+</script>
+</body>
+</html>
+`;
