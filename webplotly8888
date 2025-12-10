@@ -1,9 +1,7 @@
 // ======================================================
-// High/Low Learning Bot + CISD Signal + Dashboard
-// - Uses HITBTC live bid/ask
-// - Generates micro-candles from tick stream for CISD
-// - CISD produces LONG / SHORT / NONE
-// - Bot trades based on CISD signal
+// High/Low Learning Bot + CISD + Synthetic Candles + Dashboard
+// Uses Bid/Ask ONLY - No candle API needed
+// With CISD LONG/SHORT signals + Chart Markers
 // ======================================================
 
 require("dotenv").config();
@@ -17,14 +15,22 @@ const SIM_MODE = true;
 const SYMBOL = "FILUSDT_PERP";
 const LOOP_MS = 1200;
 const MAX_HISTORY = 200;
+const FEE_RATE = 0.0007;
+const TRADE_QTY = 0.01;
 
-// CISD params
+// Synthetic candle config
+const CANDLE_SECONDS = 5;
+
+// CISD config
 const CISD_TOLERANCE = 0.7;
-const SWING_LEN = 2;
-const EXPIRY_BARS = 10;
+const SWING_LEN = 3;
+const EXPIRY_BARS = 20;
 
-// Candle length (ms)
-const CANDLE_MS = 5000;
+// Auto-adjust EMA config
+const MIDLEARNED_SMOOTH_MIN = 3;
+const MIDLEARNED_SMOOTH_MAX = 20;
+const EMA_SMOOTH_PERIOD_MIN = 10;
+const EMA_SMOOTH_PERIOD_MAX = 50;
 
 // ---------------- HITBTC KEYS ----------------
 const HITBTC_API_KEY = process.env.HITBTC_API_KEY;
@@ -32,31 +38,38 @@ const HITBTC_API_SECRET = process.env.HITBTC_API_SECRET;
 
 // ---------------- STATE ----------------
 let mids = [];
-let candleBuffer = [];      // tick mids for current candle
-let candles = [];           // OHLC candles for CISD
+let smoothedMids = [];
+let syntheticCandles = [];
+let currentCandle = null;
 let lastCandleTime = Date.now();
 
-let smoothedMids = [];
 let smoothedMidLearnedHistory = [];
-
+let cumulativeProfit = 0;
 let learnedHigh = 0;
 let learnedLow = 0;
-let cumulativeProfit = 0;
+let lastCISD = "NONE";
 
+let cisdMarkers = []; // chart markers {time, price, type}
+
+// SIM position
 let simPosition = { position: "NONE", entryPrice: 0, quantity: 0 };
 
-// ---------------- EMA ----------------
-function calculateEMA(prices, period) {
-    if (prices.length === 0) return [];
+
+// ======================================================
+// EMA
+// ======================================================
+function calculateEMA(arr, period) {
+    if (arr.length === 0) return [];
     const k = 2 / (period + 1);
-    const ema = [prices[0]];
-    for (let i = 1; i < prices.length; i++) {
-        ema[i] = prices[i] * k + ema[i - 1] * (1 - k);
-    }
+    const ema = [arr[0]];
+    for (let i = 1; i < arr.length; i++)
+        ema[i] = arr[i] * k + ema[i - 1] * (1 - k);
     return ema;
 }
 
-// ---------------- SLOPE ----------------
+// ======================================================
+// SLOPE
+// ======================================================
 function calculateSlope(values) {
     const n = values.length;
     if (n < 2) return 0;
@@ -67,32 +80,44 @@ function calculateSlope(values) {
         sumXY += i * values[i];
         sumX2 += i * i;
     }
-    return (n * sumXY - sumX * sumY) / (n * sumX2 - sumX * sumX);
+    return (n * sumXY - sumX * sumX) / (n * sumX2 - sumX * sumY);
 }
 
 // ======================================================
-// CISD STRATEGY (unchanged except uses synthetic candles)
+// Synthetic Candles (built from mid price)
+// ======================================================
+function updateSyntheticCandle(mid) {
+    const now = Date.now();
+
+    if (!currentCandle) {
+        currentCandle = { open: mid, high: mid, low: mid, close: mid, time: now };
+    }
+
+    currentCandle.high = Math.max(currentCandle.high, mid);
+    currentCandle.low = Math.min(currentCandle.low, mid);
+    currentCandle.close = mid;
+
+    if (now - lastCandleTime >= CANDLE_SECONDS * 1000) {
+        syntheticCandles.push({ ...currentCandle });
+        if (syntheticCandles.length > 300) syntheticCandles.shift();
+        currentCandle = { open: mid, high: mid, low: mid, close: mid, time: now };
+        lastCandleTime = now;
+    }
+}
+
+// ======================================================
+// CISD (Converted to work on synthetic candles)
 // ======================================================
 function computeCISD(candles) {
     const tolerance = CISD_TOLERANCE;
-    const swingLen = SWING_LEN;
-    const expiryBars = EXPIRY_BARS;
-
-    const swingHighs = [];
-    const swingLows = [];
-
-    let lastWickedHigh = null;
-    let lastWickedLow = null;
-
-    let bearPotential = [];
-    let bullPotential = [];
-
+    const swingHighs = [], swingLows = [];
+    let bearPotential = [], bullPotential = [];
     let cisd = 0;
 
     function pivotHigh(i) {
-        if (i < swingLen || i > candles.length - swingLen - 1) return false;
+        if (i < SWING_LEN || i > candles.length - SWING_LEN - 1) return false;
         let base = candles[i].high;
-        for (let j = 1; j <= swingLen; j++) {
+        for (let j = 1; j <= SWING_LEN; j++) {
             if (candles[i - j].high >= base || candles[i + j].high >= base)
                 return false;
         }
@@ -100,9 +125,9 @@ function computeCISD(candles) {
     }
 
     function pivotLow(i) {
-        if (i < swingLen || i > candles.length - swingLen - 1) return false;
+        if (i < SWING_LEN || i > candles.length - SWING_LEN - 1) return false;
         let base = candles[i].low;
-        for (let j = 1; j <= swingLen; j++) {
+        for (let j = 1; j <= SWING_LEN; j++) {
             if (candles[i - j].low <= base || candles[i + j].low <= base)
                 return false;
         }
@@ -115,29 +140,11 @@ function computeCISD(candles) {
         if (pivotHigh(i)) swingHighs.unshift({ i, level: high });
         if (pivotLow(i)) swingLows.unshift({ i, level: low });
 
-        for (let s = swingHighs.length - 1; s >= 0; s--) {
-            let sh = swingHighs[s];
-            if (i - sh.i >= expiryBars) {
-                swingHighs.splice(s, 1);
-                continue;
-            }
-            if (high >= sh.level) {
-                lastWickedHigh = sh.level;
-                swingHighs.splice(s, 1);
-            }
-        }
+        for (let s = swingHighs.length - 1; s >= 0; s--)
+            if (i - swingHighs[s].i >= EXPIRY_BARS) swingHighs.splice(s, 1);
 
-        for (let s = swingLows.length - 1; s >= 0; s--) {
-            let sl = swingLows[s];
-            if (i - sl.i >= expiryBars) {
-                swingLows.splice(s, 1);
-                continue;
-            }
-            if (low <= sl.level) {
-                lastWickedLow = sl.level;
-                swingLows.splice(s, 1);
-            }
-        }
+        for (let s = swingLows.length - 1; s >= 0; s--)
+            if (i - swingLows[s].i >= EXPIRY_BARS) swingLows.splice(s, 1);
 
         if (i > 0) {
             let prev = candles[i - 1];
@@ -146,7 +153,6 @@ function computeCISD(candles) {
                 bearPotential.unshift(i);
                 bearPotential.unshift(open);
             }
-
             if (prev.close > prev.open && close < open) {
                 bullPotential.unshift(i);
                 bullPotential.unshift(open);
@@ -155,15 +161,15 @@ function computeCISD(candles) {
 
         if (bearPotential.length >= 2) {
             let trigger = bearPotential[0];
-            let startIndex = bearPotential[1];
+            let start = bearPotential[1];
 
             if (close < trigger) {
                 let highest = 0;
-                for (let k = startIndex; k <= i; k++) {
+                for (let k = start; k <= i; k++)
                     highest = Math.max(highest, candles[k].close);
-                }
+
                 let top = 0;
-                for (let k = startIndex + 1; k <= i; k++) {
+                for (let k = start + 1; k <= i; k++) {
                     if (candles[k].close < candles[k].open)
                         top = candles[k].open;
                     else break;
@@ -176,15 +182,15 @@ function computeCISD(candles) {
 
         if (bullPotential.length >= 2) {
             let trigger = bullPotential[0];
-            let startIndex = bullPotential[1];
+            let start = bullPotential[1];
 
             if (close > trigger) {
-                let lowest = candles[startIndex].close;
-                for (let k = startIndex; k <= i; k++) {
+                let lowest = candles[start].close;
+                for (let k = start; k <= i; k++)
                     lowest = Math.min(lowest, candles[k].close);
-                }
+
                 let bottom = 0;
-                for (let k = startIndex + 1; k <= i; k++) {
+                for (let k = start + 1; k <= i; k++) {
                     if (candles[k].close > candles[k].open)
                         bottom = candles[k].open;
                     else break;
@@ -194,101 +200,273 @@ function computeCISD(candles) {
                     cisd = 2;
             }
         }
-
-        if (i === candles.length - 1) {
-            if (cisd === 1) return "SHORT";
-            if (cisd === 2) return "LONG";
-            return "NONE";
-        }
     }
+
+    if (cisd === 1) return "SHORT";
+    if (cisd === 2) return "LONG";
+    return "NONE";
 }
 
 // ======================================================
-// HITBTC API
+// GET BID/ASK
 // ======================================================
 async function getBidAsk() {
     try {
-        const res = await axios.get(`https://api.hitbtc.com/api/3/public/ticker/${SYMBOL}`);
-        return { bid: parseFloat(res.data.bid), ask: parseFloat(res.data.ask) };
-    } catch (err) {
-        console.log("Fetch error:", err.message);
-        const last = mids[mids.length - 1] || 0;
+        const r = await axios.get(`https://api.hitbtc.com/api/3/public/ticker/${SYMBOL}`);
+        return { bid: +r.data.bid, ask: +r.data.ask };
+    } catch (e) {
+        let last = mids[mids.length - 1] || 0;
         return { bid: last, ask: last };
     }
 }
 
 // ======================================================
-// ORDER + PNL
+// POSITION
 // ======================================================
-function calcPnL(bid, ask, entry, qty, pos) {
-    if (entry === 0 || qty === 0) return 0;
-    const exit = pos === "LONG" ? bid : ask;
-    return pos === "LONG"
-        ? (exit - entry) * qty
-        : (entry - exit) * qty;
+async function getPositionInfo() {
+    if (SIM_MODE) return simPosition;
+    try {
+        const r = await axios.get("https://api.hitbtc.com/api/3/futures/account", {
+            auth: { username: HITBTC_API_KEY, password: HITBTC_API_SECRET }
+        });
+        for (const acct of r.data) {
+            if (acct.symbol !== SYMBOL) continue;
+            if (!acct.positions?.length) return { position: "NONE", entryPrice: 0, quantity: 0 };
+            const p = acct.positions[0];
+            const qty = Math.abs(+p.quantity || +p.position_size || 0);
+            const entry = +p.entry_price || 0;
+            return {
+                position: qty > 0
+                    ? (+p.quantity > 0 ? "LONG" : "SHORT")
+                    : "NONE",
+                entryPrice: entry,
+                quantity: qty
+            };
+        }
+        return { position: "NONE", entryPrice: 0, quantity: 0 };
+    } catch {
+        return { position: "NONE", entryPrice: 0, quantity: 0 };
+    }
 }
 
-async function placeOrder(side) {
+// ======================================================
+// PnL
+// ======================================================
+function calcPnL(bid, ask, entry, qty, pos) {
+    if (!qty || !entry) return 0;
+    const exit = pos === "LONG" ? bid : ask;
+    const raw = pos === "LONG" ? (exit - entry) * qty : (entry - exit) * qty;
+    return raw - exit * qty * FEE_RATE;
+}
+
+// ======================================================
+// ORDER MANAGEMENT
+// ======================================================
+async function placeOrder(side, qty = TRADE_QTY) {
+    const pos = await getPositionInfo();
+
+    if (side === "buy" && pos.position === "LONG") return;
+    if (side === "sell" && pos.position === "SHORT") return;
+
+    if (pos.position !== "NONE") await closePosition();
+
     if (SIM_MODE) {
-        const mid = mids[mids.length - 1];
-        simPosition.position = side === "buy" ? "LONG" : "SHORT";
-        simPosition.entryPrice = mid;
-        simPosition.quantity = 0.01;
-        console.log(`[SIM] OPEN ${simPosition.position} @ ${mid}`);
+        let price = mids[mids.length - 1];
+        simPosition = {
+            position: side === "buy" ? "LONG" : "SHORT",
+            entryPrice: price,
+            quantity: qty
+        };
+        console.log(`[SIM] ${side} at ${price}`);
     }
 }
 
 async function closePosition() {
+    const pos = await getPositionInfo();
+    if (pos.position === "NONE") return;
+    const { bid, ask } = await getBidAsk();
+    const pnl = calcPnL(bid, ask, pos.entryPrice, pos.quantity, pos.position);
+    cumulativeProfit += pnl;
+
     if (SIM_MODE) {
-        console.log(`[SIM] CLOSE ${simPosition.position}`);
-        simPosition.position = "NONE";
+        console.log(`[SIM] Close ${pos.position}, PnL=${pnl.toFixed(6)}`);
+        simPosition = { position: "NONE", entryPrice: 0, quantity: 0 };
     }
 }
+
+// ======================================================
+// High/Low Learning Trend System
+// ======================================================
+async function tradeHighLow(mid) {
+    if (mid === 0) return { midLearned: 0, slope: 0 };
+
+    const recent = mids.slice(-MAX_HISTORY);
+    learnedHigh = Math.max(...recent);
+    learnedLow = Math.min(...recent);
+
+    let midLearnedRaw = (learnedHigh + learnedLow) / 2;
+    smoothedMidLearnedHistory.push(midLearnedRaw);
+    if (smoothedMidLearnedHistory.length > MIDLEARNED_SMOOTH_MAX)
+        smoothedMidLearnedHistory.shift();
+
+    const emaPeriodMid =
+        Math.min(
+            Math.max(EMA_SMOOTH_PERIOD_MIN, mids.length / 2),
+            EMA_SMOOTH_PERIOD_MAX
+        );
+
+    smoothedMids = calculateEMA(mids, Math.round(emaPeriodMid));
+    let midSmooth = smoothedMids[smoothedMids.length - 1] || mid;
+
+    const emaPeriodLearned =
+        Math.min(
+            Math.max(MIDLEARNED_SMOOTH_MIN, smoothedMidLearnedHistory.length / 2),
+            MIDLEARNED_SMOOTH_MAX
+        );
+
+    const emaLearnedArr = calculateEMA(smoothedMidLearnedHistory, Math.round(emaPeriodLearned));
+    let midLearned = emaLearnedArr[emaLearnedArr.length - 1] || midLearnedRaw;
+
+    const slope = calculateSlope(smoothedMidLearnedHistory);
+
+    return { midLearned, slope, midSmooth };
+}
+
+// ======================================================
+// EXPRESS DASHBOARD
+// ======================================================
+const app = express();
+const server = http.createServer(app);
+const io = new Server(server);
+const PORT = 3000;
+
+app.get("/", (req, res) => {
+    res.send(`<!DOCTYPE html>
+<html>
+<head>
+<title>High/Low + CISD Dashboard</title>
+<script src="https://cdn.plot.ly/plotly-latest.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/socket.io/4.7.2/socket.io.min.js"></script>
+<style>
+body { font-family:Arial;padding:20px; }
+.metric { padding:10px;margin:8px;background:#f2f2f2;border-radius:8px; }
+.signal-long { color:green;font-weight:bold; }
+.signal-short { color:red;font-weight:bold; }
+</style>
+</head>
+<body>
+<h3>High/Low + CISD Real-Time Dashboard</h3>
+<div id="metrics"></div>
+<div id="chart" style="width:100%;height:550px;"></div>
+
+<script>
+let socket = io();
+
+let times=[], midData=[], learnedData=[], slopeData=[];
+let markerTimes=[], markerPrices=[], markerColors=[], markerSymbols=[];
+
+Plotly.newPlot('chart', [
+    { x:times, y:midData, type:'scatter', mode:'lines', name:'Smoothed Mid', line:{color:'blue'} },
+    { x:times, y:learnedData, type:'scatter', mode:'lines', name:'Mid Learned', line:{color:'red'} },
+    { x:times, y:slopeData, type:'scatter', mode:'lines', name:'Slope', yaxis:'y2', line:{dash:'dot'} },
+    { x:markerTimes, y:markerPrices, mode:'markers', name:'CISD', marker:{ size:12, symbol:markerSymbols, color:markerColors } }
+],
+{
+    yaxis:{title:'Price'},
+    yaxis2:{title:'Slope', overlaying:'y', side:'right'},
+    xaxis:{ type:'date' }
+});
+
+socket.on('update', d => {
+    let now=new Date();
+    const safe=v=>Number.isFinite(v)?v.toFixed(6):"0";
+
+    document.getElementById("metrics").innerHTML=\`
+        <div class="metric">Symbol: \${d.symbol}</div>
+        <div class="metric">Bid: \${safe(d.bid)}</div>
+        <div class="metric">Ask: \${safe(d.ask)}</div>
+        <div class="metric">CISD: <span class="\${d.cisd=='LONG'?'signal-long':d.cisd=='SHORT'?'signal-short':''}">\${d.cisd}</span></div>
+        <div class="metric">Slope: \${safe(d.slope)}</div>
+        <div class="metric">Position: \${d.position}</div>
+        <div class="metric">Entry Price: \${safe(d.entryPrice)}</div>
+        <div class="metric">PnL: \${safe(d.pnl)}</div>
+        <div class="metric">Cumulative Profit: \${safe(d.cumulativeProfit)}</div>
+    \`;
+
+    times.push(now);
+    midData.push(d.mid);
+    learnedData.push(d.midLearned);
+    slopeData.push(d.slope);
+
+    if (d.cisdMarker) {
+        markerTimes.push(now);
+        markerPrices.push(d.mid);
+        markerColors.push(d.cisdMarker=="LONG"?"green":"red");
+        markerSymbols.push(d.cisdMarker=="LONG"?"triangle-up":"triangle-down");
+    }
+
+    Plotly.update('chart', {
+        x:[times,times,times,markerTimes],
+        y:[midData,learnedData,slopeData,markerPrices],
+        marker:[{}, {}, {}, {color:markerColors, symbol:markerSymbols}]
+    });
+});
+</script>
+</body>
+</html>`);
+});
 
 // ======================================================
 // MAIN LOOP
 // ======================================================
 async function loop() {
-    const { bid, ask } = await getBidAsk();
-    const mid = (bid + ask) / 2;
+    try {
+        const { bid, ask } = await getBidAsk();
+        const mid = (bid + ask) / 2;
 
-    mids.push(mid);
-    if (mids.length > MAX_HISTORY) mids.shift();
+        updateSyntheticCandle(mid);
 
-    // Build synthetic candle
-    candleBuffer.push(mid);
-    if (Date.now() - lastCandleTime >= CANDLE_MS) {
-        const open = candleBuffer[0];
-        const close = candleBuffer[candleBuffer.length - 1];
-        const high = Math.max(...candleBuffer);
-        const low = Math.min(...candleBuffer);
+        let cisdSignal = "NONE";
+        let newMarker = null;
 
-        candles.push({ open, high, low, close });
-        if (candles.length > 200) candles.shift();
+        if (syntheticCandles.length > 30) {
+            cisdSignal = computeCISD(syntheticCandles);
+            if (cisdSignal !== "NONE" && cisdSignal !== lastCISD) {
+                newMarker = cisdSignal;
+                lastCISD = cisdSignal;
 
-        candleBuffer = [];
-        lastCandleTime = Date.now();
+                if (cisdSignal === "LONG") await placeOrder("buy");
+                if (cisdSignal === "SHORT") await placeOrder("sell");
+            }
+        }
+
+        mids.push(mid);
+        if (mids.length > MAX_HISTORY) mids.shift();
+
+        const trend = await tradeHighLow(mid);
+        const pos = await getPositionInfo();
+        const pnl = calcPnL(bid, ask, pos.entryPrice, pos.quantity, pos.position);
+
+        io.emit("update", {
+            symbol: SYMBOL,
+            bid, ask,
+            mid,
+            cisd: cisdSignal,
+            cisdMarker: newMarker,
+            slope: trend.slope,
+            midLearned: trend.midLearned,
+            entryPrice: pos.entryPrice,
+            position: pos.position,
+            pnl,
+            cumulativeProfit
+        });
+
+    } catch (err) {
+        console.log("Loop error:", err.message);
     }
-
-    // Compute CISD
-    let cisd = "NONE";
-    if (candles.length > 20) cisd = computeCISD(candles);
-
-    // Trading logic
-    if (cisd === "LONG" && simPosition.position !== "LONG") {
-        await closePosition();
-        await placeOrder("buy");
-    }
-
-    if (cisd === "SHORT" && simPosition.position !== "SHORT") {
-        await closePosition();
-        await placeOrder("sell");
-    }
-
-    console.log(`CISD: ${cisd} | POS: ${simPosition.position}`);
-
-    setTimeout(loop, LOOP_MS);
 }
 
-console.log("Bot running…");
-loop();
+// ======================================================
+console.log("Bot running with CISD + Synthetic Candles on port 3000...");
+setInterval(loop, LOOP_MS);
+const serverInst = server.listen(PORT);
