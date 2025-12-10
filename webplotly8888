@@ -1,0 +1,294 @@
+// ======================================================
+// High/Low Learning Bot + CISD Signal + Dashboard
+// - Uses HITBTC live bid/ask
+// - Generates micro-candles from tick stream for CISD
+// - CISD produces LONG / SHORT / NONE
+// - Bot trades based on CISD signal
+// ======================================================
+
+require("dotenv").config();
+const axios = require("axios");
+const express = require("express");
+const http = require("http");
+const { Server } = require("socket.io");
+
+// ---------------- CONFIG ----------------
+const SIM_MODE = true;
+const SYMBOL = "FILUSDT_PERP";
+const LOOP_MS = 1200;
+const MAX_HISTORY = 200;
+
+// CISD params
+const CISD_TOLERANCE = 0.7;
+const SWING_LEN = 2;
+const EXPIRY_BARS = 10;
+
+// Candle length (ms)
+const CANDLE_MS = 5000;
+
+// ---------------- HITBTC KEYS ----------------
+const HITBTC_API_KEY = process.env.HITBTC_API_KEY;
+const HITBTC_API_SECRET = process.env.HITBTC_API_SECRET;
+
+// ---------------- STATE ----------------
+let mids = [];
+let candleBuffer = [];      // tick mids for current candle
+let candles = [];           // OHLC candles for CISD
+let lastCandleTime = Date.now();
+
+let smoothedMids = [];
+let smoothedMidLearnedHistory = [];
+
+let learnedHigh = 0;
+let learnedLow = 0;
+let cumulativeProfit = 0;
+
+let simPosition = { position: "NONE", entryPrice: 0, quantity: 0 };
+
+// ---------------- EMA ----------------
+function calculateEMA(prices, period) {
+    if (prices.length === 0) return [];
+    const k = 2 / (period + 1);
+    const ema = [prices[0]];
+    for (let i = 1; i < prices.length; i++) {
+        ema[i] = prices[i] * k + ema[i - 1] * (1 - k);
+    }
+    return ema;
+}
+
+// ---------------- SLOPE ----------------
+function calculateSlope(values) {
+    const n = values.length;
+    if (n < 2) return 0;
+    let sumX = 0, sumY = 0, sumXY = 0, sumX2 = 0;
+    for (let i = 0; i < n; i++) {
+        sumX += i;
+        sumY += values[i];
+        sumXY += i * values[i];
+        sumX2 += i * i;
+    }
+    return (n * sumXY - sumX * sumY) / (n * sumX2 - sumX * sumX);
+}
+
+// ======================================================
+// CISD STRATEGY (unchanged except uses synthetic candles)
+// ======================================================
+function computeCISD(candles) {
+    const tolerance = CISD_TOLERANCE;
+    const swingLen = SWING_LEN;
+    const expiryBars = EXPIRY_BARS;
+
+    const swingHighs = [];
+    const swingLows = [];
+
+    let lastWickedHigh = null;
+    let lastWickedLow = null;
+
+    let bearPotential = [];
+    let bullPotential = [];
+
+    let cisd = 0;
+
+    function pivotHigh(i) {
+        if (i < swingLen || i > candles.length - swingLen - 1) return false;
+        let base = candles[i].high;
+        for (let j = 1; j <= swingLen; j++) {
+            if (candles[i - j].high >= base || candles[i + j].high >= base)
+                return false;
+        }
+        return true;
+    }
+
+    function pivotLow(i) {
+        if (i < swingLen || i > candles.length - swingLen - 1) return false;
+        let base = candles[i].low;
+        for (let j = 1; j <= swingLen; j++) {
+            if (candles[i - j].low <= base || candles[i + j].low <= base)
+                return false;
+        }
+        return true;
+    }
+
+    for (let i = 0; i < candles.length; i++) {
+        let { open, high, low, close } = candles[i];
+
+        if (pivotHigh(i)) swingHighs.unshift({ i, level: high });
+        if (pivotLow(i)) swingLows.unshift({ i, level: low });
+
+        for (let s = swingHighs.length - 1; s >= 0; s--) {
+            let sh = swingHighs[s];
+            if (i - sh.i >= expiryBars) {
+                swingHighs.splice(s, 1);
+                continue;
+            }
+            if (high >= sh.level) {
+                lastWickedHigh = sh.level;
+                swingHighs.splice(s, 1);
+            }
+        }
+
+        for (let s = swingLows.length - 1; s >= 0; s--) {
+            let sl = swingLows[s];
+            if (i - sl.i >= expiryBars) {
+                swingLows.splice(s, 1);
+                continue;
+            }
+            if (low <= sl.level) {
+                lastWickedLow = sl.level;
+                swingLows.splice(s, 1);
+            }
+        }
+
+        if (i > 0) {
+            let prev = candles[i - 1];
+
+            if (prev.close < prev.open && close > open) {
+                bearPotential.unshift(i);
+                bearPotential.unshift(open);
+            }
+
+            if (prev.close > prev.open && close < open) {
+                bullPotential.unshift(i);
+                bullPotential.unshift(open);
+            }
+        }
+
+        if (bearPotential.length >= 2) {
+            let trigger = bearPotential[0];
+            let startIndex = bearPotential[1];
+
+            if (close < trigger) {
+                let highest = 0;
+                for (let k = startIndex; k <= i; k++) {
+                    highest = Math.max(highest, candles[k].close);
+                }
+                let top = 0;
+                for (let k = startIndex + 1; k <= i; k++) {
+                    if (candles[k].close < candles[k].open)
+                        top = candles[k].open;
+                    else break;
+                }
+
+                if ((highest - trigger) / (top - trigger) > tolerance)
+                    cisd = 1;
+            }
+        }
+
+        if (bullPotential.length >= 2) {
+            let trigger = bullPotential[0];
+            let startIndex = bullPotential[1];
+
+            if (close > trigger) {
+                let lowest = candles[startIndex].close;
+                for (let k = startIndex; k <= i; k++) {
+                    lowest = Math.min(lowest, candles[k].close);
+                }
+                let bottom = 0;
+                for (let k = startIndex + 1; k <= i; k++) {
+                    if (candles[k].close > candles[k].open)
+                        bottom = candles[k].open;
+                    else break;
+                }
+
+                if ((trigger - lowest) / (trigger - bottom) > tolerance)
+                    cisd = 2;
+            }
+        }
+
+        if (i === candles.length - 1) {
+            if (cisd === 1) return "SHORT";
+            if (cisd === 2) return "LONG";
+            return "NONE";
+        }
+    }
+}
+
+// ======================================================
+// HITBTC API
+// ======================================================
+async function getBidAsk() {
+    try {
+        const res = await axios.get(`https://api.hitbtc.com/api/3/public/ticker/${SYMBOL}`);
+        return { bid: parseFloat(res.data.bid), ask: parseFloat(res.data.ask) };
+    } catch (err) {
+        console.log("Fetch error:", err.message);
+        const last = mids[mids.length - 1] || 0;
+        return { bid: last, ask: last };
+    }
+}
+
+// ======================================================
+// ORDER + PNL
+// ======================================================
+function calcPnL(bid, ask, entry, qty, pos) {
+    if (entry === 0 || qty === 0) return 0;
+    const exit = pos === "LONG" ? bid : ask;
+    return pos === "LONG"
+        ? (exit - entry) * qty
+        : (entry - exit) * qty;
+}
+
+async function placeOrder(side) {
+    if (SIM_MODE) {
+        const mid = mids[mids.length - 1];
+        simPosition.position = side === "buy" ? "LONG" : "SHORT";
+        simPosition.entryPrice = mid;
+        simPosition.quantity = 0.01;
+        console.log(`[SIM] OPEN ${simPosition.position} @ ${mid}`);
+    }
+}
+
+async function closePosition() {
+    if (SIM_MODE) {
+        console.log(`[SIM] CLOSE ${simPosition.position}`);
+        simPosition.position = "NONE";
+    }
+}
+
+// ======================================================
+// MAIN LOOP
+// ======================================================
+async function loop() {
+    const { bid, ask } = await getBidAsk();
+    const mid = (bid + ask) / 2;
+
+    mids.push(mid);
+    if (mids.length > MAX_HISTORY) mids.shift();
+
+    // Build synthetic candle
+    candleBuffer.push(mid);
+    if (Date.now() - lastCandleTime >= CANDLE_MS) {
+        const open = candleBuffer[0];
+        const close = candleBuffer[candleBuffer.length - 1];
+        const high = Math.max(...candleBuffer);
+        const low = Math.min(...candleBuffer);
+
+        candles.push({ open, high, low, close });
+        if (candles.length > 200) candles.shift();
+
+        candleBuffer = [];
+        lastCandleTime = Date.now();
+    }
+
+    // Compute CISD
+    let cisd = "NONE";
+    if (candles.length > 20) cisd = computeCISD(candles);
+
+    // Trading logic
+    if (cisd === "LONG" && simPosition.position !== "LONG") {
+        await closePosition();
+        await placeOrder("buy");
+    }
+
+    if (cisd === "SHORT" && simPosition.position !== "SHORT") {
+        await closePosition();
+        await placeOrder("sell");
+    }
+
+    console.log(`CISD: ${cisd} | POS: ${simPosition.position}`);
+
+    setTimeout(loop, LOOP_MS);
+}
+
+console.log("Bot running…");
+loop();
