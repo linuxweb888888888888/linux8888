@@ -1,0 +1,351 @@
+/******************************************************************************************
+ *  ADVANCED SMOOTHED MEAN REVERSION BOT — TRADE MARKERS + ONLINE USERS
+ *  MOBILE OPTIMIZED • CORRECT PNL • CLEAN MATERIAL UI • TRADE MARKERS ONLY
+ ******************************************************************************************/
+
+const express = require("express");
+const http = require("http");
+const { Server } = require("socket.io");
+const axios = require("axios");
+
+// --------------------------------------------------
+// CONFIG
+// --------------------------------------------------
+const CONFIG = {
+    tickRate: 1400,
+    windowMinutes: 15,
+    smoothing: 1,
+    zScoreThreshold: 0.05,
+    SIM_MODE: true,
+    SYMBOL: "FILUSDT",
+    TRADE_QTY: 250
+};
+
+const BUFFER_SIZE = Math.ceil((CONFIG.windowMinutes * 60 * 1000) / CONFIG.tickRate);
+
+// --------------------------------------------------
+// STATE
+// --------------------------------------------------
+let priceHistory = [];
+let position = null;
+let entryPrice = null;
+let realizedPnL = 0;
+let unrealizedPnL = 0;
+let tradeHistory = [];
+let lastBid = null;
+let lastAsk = null;
+
+// --------------------------------------------------
+// HELPERS
+// --------------------------------------------------
+function mean(arr){ return arr.length ? arr.reduce((a,b)=>a+b,0)/arr.length : 0; }
+function stddev(arr, m){ if(arr.length<2) return 0; const sq = arr.map(v => (v-m)**2); return Math.sqrt(mean(sq)); }
+function smooth(arr,n){ return arr.length<n ? arr[arr.length-1] : mean(arr.slice(-n)); }
+
+// --------------------------------------------------
+// FETCH BID/ASK
+// --------------------------------------------------
+async function fetchPrice(symbol = CONFIG.SYMBOL){
+    try{
+        const res = await axios.get(`https://api.hitbtc.com/api/3/public/ticker/${symbol}`, { timeout: 2500 });
+        const bid = parseFloat(res.data.bid);
+        const ask = parseFloat(res.data.ask);
+
+        if(!bid || !ask || bid <= 0 || ask <= 0) return null;
+
+        lastBid = bid;
+        lastAsk = ask;
+
+        return (bid + ask) / 2;
+    } catch(err){
+        console.log("⚠ Price fetch failed, retrying...");
+        return null;
+    }
+}
+
+// --------------------------------------------------
+// UNREALIZED PNL
+// --------------------------------------------------
+function updateUnrealized(){
+    if(!position || entryPrice === null) return unrealizedPnL = 0;
+
+    if(position === "LONG" && lastBid !== null)
+        unrealizedPnL = (lastBid - entryPrice) * CONFIG.TRADE_QTY;
+
+    else if(position === "SHORT" && lastAsk !== null)
+        unrealizedPnL = (entryPrice - lastAsk) * CONFIG.TRADE_QTY;
+
+    else
+        unrealizedPnL = 0;
+}
+
+// --------------------------------------------------
+// STRATEGY CORE
+// --------------------------------------------------
+function runStrategy(io, price){
+    if(priceHistory.length < 50)
+        return io.emit("warmup",{progress:priceHistory.length,target:BUFFER_SIZE});
+
+    const smoothed = smooth(priceHistory, CONFIG.smoothing);
+    const m = mean(priceHistory);
+    const sd = stddev(priceHistory, m);
+    const z = sd === 0 ? 0 : (smoothed - m) / sd;
+    const time = new Date().toLocaleTimeString("en-US",{hour12:false});
+
+    updateUnrealized();
+
+    io.emit("stats",{
+        time,
+        price: smoothed,
+        zScore: z,
+        volatility: sd,
+        position,
+        entryPrice,
+        realizedPnL,
+        unrealizedPnL
+    });
+
+    if(z >= CONFIG.zScoreThreshold){
+        if(CONFIG.SIM_MODE) executeLong(io, smoothed, time);
+    }
+    else if(z <= -CONFIG.zScoreThreshold){
+        if(CONFIG.SIM_MODE) executeShort(io, smoothed, time);
+    }
+}
+
+// --------------------------------------------------
+// SIM ENGINE
+// --------------------------------------------------
+function executeLong(io, price, time){
+    if(position === "SHORT") closePosition(io, price, time, "SHORT", "REVERSE LONG");
+    if(!position){
+        position = "LONG";
+        entryPrice = price;
+        tradeHistory.push({type:"OPEN LONG", entry:price, time, qty:CONFIG.TRADE_QTY});
+        io.emit("trade", tradeHistory.at(-1));
+    }
+}
+
+function executeShort(io, price, time){
+    if(position === "LONG") closePosition(io, price, time, "LONG", "REVERSE SHORT");
+    if(!position){
+        position = "SHORT";
+        entryPrice = price;
+        tradeHistory.push({type:"OPEN SHORT", entry:price, time, qty:CONFIG.TRADE_QTY});
+        io.emit("trade", tradeHistory.at(-1));
+    }
+}
+
+function closePosition(io, price, time, pos, reason){
+    const pnl = pos === "LONG"
+        ? (price - entryPrice) * CONFIG.TRADE_QTY
+        : (entryPrice - price) * CONFIG.TRADE_QTY;
+
+    realizedPnL += pnl;
+
+    tradeHistory.push({
+        type:`CLOSE ${pos} (${reason})`,
+        entry:entryPrice,
+        exit:price,
+        pnl,
+        qty:CONFIG.TRADE_QTY,
+        time
+    });
+
+    io.emit("trade", tradeHistory.at(-1));
+
+    position = null;
+    entryPrice = null;
+    unrealizedPnL = 0;
+}
+
+// --------------------------------------------------
+// SERVER + DASHBOARD
+// --------------------------------------------------
+const app = express();
+const server = http.createServer(app);
+const io = new Server(server);
+
+let onlineUsers = 0;
+
+io.on("connection", socket => {
+    onlineUsers++;
+    io.emit("onlineUsers", onlineUsers);
+
+    socket.on("disconnect", () => {
+        onlineUsers--;
+        io.emit("onlineUsers", onlineUsers);
+    });
+});
+
+app.get("/", (req,res)=>res.send(DASHBOARD_HTML));
+
+setInterval(async ()=>{
+    const price = await fetchPrice(CONFIG.SYMBOL);
+    if(!price) return;
+
+    priceHistory.push(price);
+    if(priceHistory.length > BUFFER_SIZE) priceHistory.shift();
+
+    io.emit("tick",{price});
+    runStrategy(io, price);
+
+}, CONFIG.tickRate);
+
+server.listen(3000,()=>console.log("Bot running → http://localhost:3000"));
+
+// ======================================================================================
+// DASHBOARD HTML — TRADE MARKERS + ONLINE USERS
+// ======================================================================================
+const DASHBOARD_HTML = `
+<!DOCTYPE html>
+<html>
+<head>
+<title>Smoothed Mean Reversion Bot</title>
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0">
+
+<style>
+body{margin:0;background:#121212;color:#fff;font-family:"Roboto",sans-serif;overflow:hidden;}
+#topbar{display:flex;flex-wrap:wrap;gap:10px;padding:10px;}
+.card{
+    background:#1f1f1f;padding:12px 14px;border-radius:12px;
+    box-shadow:0 2px 8px rgba(0,0,0,0.5);
+    min-width:90px;flex:1;text-align:center;
+}
+.label{font-size:12px;opacity:0.7;}
+.value{font-size:18px;margin-top:4px;}
+
+#layout{
+    display:flex;flex-direction:column;height:calc(100vh - 120px);
+}
+
+#left{flex:1;min-height:45vh;}
+#right{
+    flex:1;overflow-y:auto;padding:10px;
+    background:#151515;border-top:1px solid #333;
+}
+
+canvas{
+    width:100% !important;
+    height:100% !important;
+}
+
+@media(max-width:480px){
+    .value{font-size:16px;}
+    #layout{height:calc(100vh - 160px);}
+    #left{min-height:40vh;}
+}
+</style>
+
+<script src="https://cdn.jsdelivr.net/npm/socket.io-client@4/dist/socket.io.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+</head>
+
+<body>
+
+<div id="topbar">
+<div class="card"><div class="label">Price</div><div class="value" id="priceBox">--</div></div>
+<div class="card"><div class="label">Z-Score</div><div class="value" id="zBox">--</div></div>
+<div class="card"><div class="label">Vol (SD)</div><div class="value" id="volBox">--</div></div>
+<div class="card"><div class="label">Position</div><div class="value" id="posBox">--</div></div>
+<div class="card"><div class="label">Realized</div><div class="value" id="pnlBox">0.00</div></div>
+<div class="card"><div class="label">Unrealized</div><div class="value" id="unrealizedPnlBox">0.00</div></div>
+<div class="card"><div class="label">Online</div><div class="value" id="onlineBox">0</div></div>
+</div>
+
+<div id="layout">
+<div id="left"><canvas id="chart"></canvas></div>
+<div id="right">
+<h3>Trades</h3>
+<div id="tradeLog" style="font-family:monospace;white-space:pre-wrap;"></div>
+</div>
+</div>
+
+<script>
+const socket = io();
+const ctx = document.getElementById("chart").getContext("2d");
+
+const chart = new Chart(ctx,{
+    type:"line",
+    data:{
+        labels:[],
+        datasets:[
+            { 
+                label:"Price", 
+                data:[], 
+                borderWidth:2, 
+                borderColor:"white", 
+                pointRadius:0 
+            },
+            { 
+                label:"Trades",
+                data:[], 
+                borderColor:"transparent",
+                pointBackgroundColor:[], 
+                pointRadius:7, 
+                showLine:false 
+            }
+        ]
+    },
+    options:{
+        responsive:true,
+        maintainAspectRatio:false,
+        animation:false,
+        scales:{ 
+            x:{ display:false }, 
+            y:{ ticks:{ color:"white" } } 
+        }
+    }
+});
+
+// PRICE POINTS
+socket.on("tick", msg => {
+    chart.data.labels.push("");
+
+    chart.data.datasets[0].data.push(msg.price);
+
+    // ensure trade dataset always matches size
+    chart.data.datasets[1].data.push(null);
+    chart.data.datasets[1].pointBackgroundColor.push(null);
+
+    chart.update("none");
+});
+
+// STATS
+socket.on("stats", msg => {
+    priceBox.innerText = msg.price.toFixed(5);
+    zBox.innerText = msg.zScore.toFixed(2);
+    volBox.innerText = msg.volatility.toFixed(5);
+    posBox.innerText = msg.position || "NONE";
+    pnlBox.innerText = msg.realizedPnL.toFixed(5);
+    unrealizedPnlBox.innerText = msg.unrealizedPnL.toFixed(5);
+});
+
+// TRADE MARKERS — CORRECTLY ALIGNED
+socket.on("trade", t => {
+    const log = document.getElementById("tradeLog");
+    log.innerText = JSON.stringify(t, null, 2) + "\\n" + log.innerText;
+
+    const idx = chart.data.datasets[0].data.length - 1;
+    const lastPrice = chart.data.datasets[0].data[idx];
+
+    const color =
+        t.type.includes("OPEN LONG") ? "lime" :
+        t.type.includes("OPEN SHORT") ? "red" :
+        "yellow";
+
+    chart.data.datasets[1].data[idx] = lastPrice;
+    chart.data.datasets[1].pointBackgroundColor[idx] = color;
+
+    chart.update();
+});
+
+// ONLINE USERS
+socket.on("onlineUsers", n => {
+    onlineBox.innerText = n;
+});
+</script>
+
+</body>
+</html>
+`;
