@@ -1,5 +1,5 @@
 /******************************************************************************************
- *  ADVANCED SMOOTHED MEAN REVERSION BOT — REAL HITBTC MARKET ORDERS (ONE ORDER AT A TIME)
+ *  ADVANCED SMOOTHED MEAN REVERSION BOT — REAL HITBTC PERP MARKET ORDERS
  *  MOBILE OPTIMIZED • REAL PNL • TRADE MARKERS + ONLINE USERS
  ******************************************************************************************/
 
@@ -24,14 +24,14 @@ const CONFIG = {
 const BUFFER_SIZE = Math.ceil((CONFIG.windowMinutes * 60 * 1000) / CONFIG.tickRate);
 
 // ---------------------------- STATE ----------------------------
-let priceHistory = {};     
-let positions = {};        
-let realizedPnL = {};      
-let unrealizedPnL = {};    
-let tradeHistory = {};     
-let lastBid = {};          
-let lastAsk = {};          
-let orderLock = {};  
+let priceHistory = {};
+let positions = {};
+let realizedPnL = {};
+let unrealizedPnL = {};
+let tradeHistory = {};
+let lastBid = {};
+let lastAsk = {};
+let orderLock = {};
 
 CONFIG.SYMBOLS.forEach(s => {
     priceHistory[s] = [];
@@ -54,18 +54,18 @@ const authHeaders = {
     "Authorization": "Basic " + Buffer.from(CONFIG.API_KEY + ":" + CONFIG.API_SECRET).toString("base64")
 };
 
-// fetch mid price
-async function fetchPrice(symbol){
+// fetch PERP ticker (bid/ask)
+async function fetchPerpTicker(symbol){
     try{
-        const res = await axios.get(`https://api.hitbtc.com/api/3/public/ticker/${symbol}`);
+        const res = await axios.get(`https://api.hitbtc.com/api/3/public/ticker/${symbol}_PERP`);
         const bid = parseFloat(res.data.bid);
         const ask = parseFloat(res.data.ask);
         if(!bid || !ask) return null;
         lastBid[symbol] = bid;
         lastAsk[symbol] = ask;
-        return (bid + ask)/2;
+        return (bid + ask)/2; // mid price for chart
     } catch(err){
-        console.log(`⚠ Price fetch failed for ${symbol}:`, err.message);
+        console.log(`⚠ Failed PERP ticker for ${symbol}:`, err.message);
         return null;
     }
 }
@@ -78,7 +78,6 @@ async function fetchPositions() {
 
         CONFIG.SYMBOLS.forEach(symbol => {
             let found = false;
-
             for (const account of acctPositions) {
                 if (account.positions && Array.isArray(account.positions)) {
                     const pos = account.positions.find(p => p.symbol === symbol + "_PERP");
@@ -95,12 +94,10 @@ async function fetchPositions() {
                     }
                 }
             }
-
             if (!found) {
                 positions[symbol] = { quantity: 0, entryPrice: null, positionType: null };
             }
         });
-
     } catch (err) {
         console.log("⚠ Failed to fetch positions:", err.message);
     }
@@ -132,24 +129,26 @@ async function placeOrder(symbol, side, quantity){
     }
 }
 
-// ---------------------------- PnL Calculation ----------------------------
-function calculatePnL(symbol) {
+// ---------------------------- PnL ----------------------------
+function calculateUnrealizedPnL(symbol){
     const pos = positions[symbol];
     const bid = lastBid[symbol];
     const ask = lastAsk[symbol];
-    if(!pos.positionType || pos.quantity === 0) return 0;
+    if(!pos.positionType || pos.quantity===0 || pos.entryPrice===null) return 0;
 
-    let pnl = 0;
     const qty = Math.abs(pos.quantity);
     const entry = pos.entryPrice;
+    let pnl = 0;
 
-    if(pos.positionType === "LONG" && bid !== null){
+    if(pos.positionType==="LONG" && bid!==null){
         pnl = (bid - entry) * qty;
-    } else if(pos.positionType === "SHORT" && ask !== null){
+    } else if(pos.positionType==="SHORT" && ask!==null){
         pnl = (entry - ask) * qty;
     }
 
-    pnl -= entry * qty * CONFIG.FEE_RATE; // subtract one-time entry fee
+    // subtract one-time entry fee
+    pnl -= entry * qty * CONFIG.FEE_RATE;
+
     return pnl;
 }
 
@@ -164,7 +163,7 @@ async function runStrategy(io, symbol){
     const z = sd === 0 ? 0 : (smoothed - m)/sd;
     const time = new Date().toLocaleTimeString("en-US",{hour12:false});
 
-    unrealizedPnL[symbol] = calculatePnL(symbol);
+    unrealizedPnL[symbol] = calculateUnrealizedPnL(symbol);
 
     io.emit("stats", {
         symbol,
@@ -191,11 +190,11 @@ async function runStrategy(io, symbol){
 
 // ---------------------------- ORDER EXECUTION ----------------------------
 async function openPosition(io, symbol, type, qty, price, time){
-    const side = type === "LONG" ? "buy" : "sell";
+    const side = type==="LONG"?"buy":"sell";
     const res = await placeOrder(symbol, side, qty);
     if(res){
-        await fetchPositions();  // refresh real positions
-        tradeHistory[symbol].push({ type: `OPEN ${type}`, entry: positions[symbol].entryPrice, qty, time });
+        await fetchPositions();
+        tradeHistory[symbol].push({ type:`OPEN ${type}`, entry: positions[symbol].entryPrice, qty, time });
         io.emit("trade", tradeHistory[symbol].at(-1));
     }
 }
@@ -203,18 +202,23 @@ async function openPosition(io, symbol, type, qty, price, time){
 async function reversePosition(io, symbol, type, qty, price, time){
     const current = positions[symbol];
     if(!current.positionType) return;
-    const closeSide = current.positionType === "LONG" ? "sell" : "buy";
+    const closeSide = current.positionType==="LONG"?"sell":"buy";
+
+    // Calculate realized PnL before closing
+    const pnlBefore = calculateUnrealizedPnL(symbol);
+    realizedPnL[symbol] += pnlBefore;
+
     await placeOrder(symbol, closeSide, Math.abs(current.quantity));
-    realizedPnL[symbol] += calculatePnL(symbol);
     tradeHistory[symbol].push({
-        type: `CLOSE ${current.positionType} (REVERSE)`,
+        type:`CLOSE ${current.positionType} (REVERSE)`,
         entry: current.entryPrice,
         exit: price,
-        pnl: calculatePnL(symbol),
+        pnl: pnlBefore,
         qty: current.quantity,
         time
     });
     io.emit("trade", tradeHistory[symbol].at(-1));
+
     await fetchPositions();
     await openPosition(io, symbol, type, qty, price, time);
 }
@@ -234,20 +238,18 @@ io.on("connection", socket=>{
 app.get("/", (req,res)=>res.send(DASHBOARD_HTML));
 
 // ---------------------------- INITIAL FETCH ----------------------------
-(async () => {
-    await fetchPositions(); // fetch positions on bot start
-})();
+(async () => { await fetchPositions(); })();
 
 // main loop
 setInterval(async ()=>{
     for(const symbol of CONFIG.SYMBOLS){
-        const price = await fetchPrice(symbol);
+        const price = await fetchPerpTicker(symbol);
         if(!price) continue;
+
         priceHistory[symbol].push(price);
         if(priceHistory[symbol].length > BUFFER_SIZE) priceHistory[symbol].shift();
 
-        await fetchPositions(); // refresh positions every tick
-
+        await fetchPositions();
         io.emit("tick", { symbol, price });
         await runStrategy(io, symbol);
     }
@@ -256,8 +258,7 @@ setInterval(async ()=>{
 server.listen(3000, ()=>console.log("Bot running → http://localhost:3000"));
 
 // ---------------------------- DASHBOARD HTML ----------------------------
-const DASHBOARD_HTML = `
-<!DOCTYPE html>
+const DASHBOARD_HTML = `<!DOCTYPE html>
 <html>
 <head>
 <title>Smoothed Mean Reversion Bot</title>
