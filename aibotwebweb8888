@@ -16,7 +16,7 @@ const CONFIG = {
     zScoreThreshold: 1,
     SYMBOLS: ["ADAUSDT"],  // symbols to trade
     TRADE_QTY: 1,
-    FEE_RATE: 0.00075,  // HitBTC taker fee
+    FEE_RATE: 0.00075,  // HitBTC taker fee (one-time)
     API_KEY: "-3Mn7DL8P20iTj7QPoOSgyATuDcF-87h",
     API_SECRET: "WzxCckLuICMXcjdRL-CbgcsbpGXHePcs"
 };
@@ -24,27 +24,24 @@ const CONFIG = {
 const BUFFER_SIZE = Math.ceil((CONFIG.windowMinutes * 60 * 1000) / CONFIG.tickRate);
 
 // ---------------------------- STATE ----------------------------
-let priceHistory = {};     // { SYMBOL: [] }
-let positions = {};        // { SYMBOL: { quantity, entryPrice, positionType } }
-let realizedPnL = {};      // { SYMBOL: value }
-let unrealizedPnL = {};    // { SYMBOL: value }
-let tradeHistory = {};     // { SYMBOL: [] }
-let lastBid = {};          // { SYMBOL: bid }
-let lastAsk = {};          // { SYMBOL: ask }
+let priceHistory = {};     
+let positions = {};        
+let realizedPnL = {};      
+let unrealizedPnL = {};    
+let tradeHistory = {};     
+let lastBid = {};          
+let lastAsk = {};          
+let orderLock = {};  
 
-// ---------------------------- ORDER LOCK ----------------------------
-let orderLock = {};  // { SYMBOL: boolean }
-CONFIG.SYMBOLS.forEach(s => {
-    orderLock[s] = false;
-});
-
-// initialize
 CONFIG.SYMBOLS.forEach(s => {
     priceHistory[s] = [];
     positions[s] = { quantity: 0, entryPrice: null, positionType: null };
     realizedPnL[s] = 0;
     unrealizedPnL[s] = 0;
     tradeHistory[s] = [];
+    lastBid[s] = null;
+    lastAsk[s] = null;
+    orderLock[s] = false;
 });
 
 // ---------------------------- HELPERS ----------------------------
@@ -66,33 +63,45 @@ async function fetchPrice(symbol){
         if(!bid || !ask) return null;
         lastBid[symbol] = bid;
         lastAsk[symbol] = ask;
-        return (bid + ask) / 2;
+        return (bid + ask)/2;
     } catch(err){
         console.log(`⚠ Price fetch failed for ${symbol}:`, err.message);
         return null;
     }
 }
 
-// fetch account positions
-async function fetchPositions(){
-    try{
+// fetch account positions (cross & isolated)
+async function fetchPositions() {
+    try {
         const res = await axios.get("https://api.hitbtc.com/api/3/futures/account", { headers: authHeaders });
-        const acctPositions = res.data.positions || [];
-        CONFIG.SYMBOLS.forEach(s => {
-            const pos = acctPositions.find(p => p.symbol === s+"_PERP");
-            if(pos){
-                const qty = parseFloat(pos.quantity);
-                const entry = parseFloat(pos.price_entry);
-                positions[s] = {
-                    quantity: qty,
-                    entryPrice: entry,
-                    positionType: qty > 0 ? "LONG" : qty < 0 ? "SHORT" : null
-                };
-            } else {
-                positions[s] = { quantity: 0, entryPrice: null, positionType: null };
+        const acctPositions = res.data || [];
+
+        CONFIG.SYMBOLS.forEach(symbol => {
+            let found = false;
+
+            for (const account of acctPositions) {
+                if (account.positions && Array.isArray(account.positions)) {
+                    const pos = account.positions.find(p => p.symbol === symbol + "_PERP");
+                    if (pos) {
+                        const qty = parseFloat(pos.quantity);
+                        const entry = parseFloat(pos.price_entry);
+                        positions[symbol] = {
+                            quantity: qty,
+                            entryPrice: entry,
+                            positionType: qty > 0 ? "LONG" : qty < 0 ? "SHORT" : null
+                        };
+                        found = true;
+                        break;
+                    }
+                }
+            }
+
+            if (!found) {
+                positions[symbol] = { quantity: 0, entryPrice: null, positionType: null };
             }
         });
-    } catch(err){
+
+    } catch (err) {
         console.log("⚠ Failed to fetch positions:", err.message);
     }
 }
@@ -109,7 +118,7 @@ async function placeOrder(symbol, side, quantity){
             symbol: symbol+"_PERP",
             side,
             quantity,
-            type: "market",    // market order
+            type: "market",
             margin_mode: "cross"
         };
         const res = await axios.post("https://api.hitbtc.com/api/3/futures/order", payload, { headers: authHeaders });
@@ -123,22 +132,24 @@ async function placeOrder(symbol, side, quantity){
     }
 }
 
-// calculate unrealized PnL
-function calculatePnL(symbol){
+// ---------------------------- PnL Calculation ----------------------------
+function calculatePnL(symbol) {
     const pos = positions[symbol];
     const bid = lastBid[symbol];
     const ask = lastAsk[symbol];
-    let pnl = 0;
     if(!pos.positionType || pos.quantity === 0) return 0;
 
+    let pnl = 0;
+    const qty = Math.abs(pos.quantity);
+    const entry = pos.entryPrice;
+
     if(pos.positionType === "LONG" && bid !== null){
-        pnl = (bid - pos.entryPrice) * pos.quantity;
+        pnl = (bid - entry) * qty;
     } else if(pos.positionType === "SHORT" && ask !== null){
-        pnl = (pos.entryPrice - ask) * Math.abs(pos.quantity);
+        pnl = (entry - ask) * qty;
     }
 
-    // subtract fee
-    pnl -= Math.abs(pos.quantity) * pos.entryPrice * CONFIG.FEE_RATE;
+    pnl -= entry * qty * CONFIG.FEE_RATE; // subtract one-time entry fee
     return pnl;
 }
 
@@ -161,8 +172,8 @@ async function runStrategy(io, symbol){
         zScore: z,
         volatility: sd,
         position: positions[symbol].positionType || "NONE",
-        entryPrice: positions[symbol].entryPrice,
-        quantity: positions[symbol].quantity,
+        entryPrice: positions[symbol].entryPrice || 0,
+        quantity: positions[symbol].quantity || 0,
         realizedPnL: realizedPnL[symbol],
         unrealizedPnL: unrealizedPnL[symbol]
     });
@@ -222,6 +233,11 @@ io.on("connection", socket=>{
 
 app.get("/", (req,res)=>res.send(DASHBOARD_HTML));
 
+// ---------------------------- INITIAL FETCH ----------------------------
+(async () => {
+    await fetchPositions(); // fetch positions on bot start
+})();
+
 // main loop
 setInterval(async ()=>{
     for(const symbol of CONFIG.SYMBOLS){
@@ -229,6 +245,9 @@ setInterval(async ()=>{
         if(!price) continue;
         priceHistory[symbol].push(price);
         if(priceHistory[symbol].length > BUFFER_SIZE) priceHistory[symbol].shift();
+
+        await fetchPositions(); // refresh positions every tick
+
         io.emit("tick", { symbol, price });
         await runStrategy(io, symbol);
     }
@@ -264,6 +283,8 @@ canvas{width:100% !important;height:100% !important;}
 <div class="card"><div class="label">Z-Score</div><div class="value" id="zBox">--</div></div>
 <div class="card"><div class="label">Vol (SD)</div><div class="value" id="volBox">--</div></div>
 <div class="card"><div class="label">Position</div><div class="value" id="posBox">--</div></div>
+<div class="card"><div class="label">Entry Price</div><div class="value" id="entryBox">--</div></div>
+<div class="card"><div class="label">Quantity</div><div class="value" id="qtyBox">--</div></div>
 <div class="card"><div class="label">Realized</div><div class="value" id="pnlBox">0.00</div></div>
 <div class="card"><div class="label">Unrealized</div><div class="value" id="unrealizedPnlBox">0.00</div></div>
 <div class="card"><div class="label">Online</div><div class="value" id="onlineBox">0</div></div>
@@ -286,21 +307,32 @@ const chart = new Chart(ctx,{
     ]},
     options:{ responsive:true, maintainAspectRatio:false, animation:false, scales:{ x:{ display:false }, y:{ ticks:{ color:"white" } } } }
 });
+
 socket.on("tick", msg=>{
-    chart.data.labels.push(msg.symbol);
+    chart.data.labels.push(new Date().toLocaleTimeString());
     chart.data.datasets[0].data.push(msg.price);
     chart.data.datasets[1].data.push(null);
     chart.data.datasets[1].pointBackgroundColor.push(null);
+    if(chart.data.labels.length > ${BUFFER_SIZE}) {
+        chart.data.labels.shift();
+        chart.data.datasets[0].data.shift();
+        chart.data.datasets[1].data.shift();
+        chart.data.datasets[1].pointBackgroundColor.shift();
+    }
     chart.update("none");
 });
+
 socket.on("stats", msg=>{
     priceBox.innerText = msg.price.toFixed(5);
     zBox.innerText = msg.zScore.toFixed(2);
     volBox.innerText = msg.volatility.toFixed(5);
     posBox.innerText = msg.position || "NONE";
+    entryBox.innerText = msg.entryPrice ? msg.entryPrice.toFixed(5) : "--";
+    qtyBox.innerText = msg.quantity || 0;
     pnlBox.innerText = msg.realizedPnL.toFixed(5);
     unrealizedPnlBox.innerText = msg.unrealizedPnL.toFixed(5);
 });
+
 socket.on("trade", t=>{
     const log = document.getElementById("tradeLog");
     log.innerText = JSON.stringify(t,null,2)+"\\n"+log.innerText;
@@ -310,6 +342,7 @@ socket.on("trade", t=>{
     chart.data.datasets[1].pointBackgroundColor[idx] = color;
     chart.update();
 });
+
 socket.on("onlineUsers", n=>{ onlineBox.innerText = n; });
 </script>
 </body>
