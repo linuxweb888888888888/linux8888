@@ -16,7 +16,7 @@ const CONFIG = {
     zScoreThreshold: 1,
     SYMBOLS: ["ADAUSDT"],  // symbols to trade
     TRADE_QTY: 1,
-    FEE_RATE: 0.00075,  // HitBTC taker fee (one-time)
+    FEE_RATE: 0.00075,  // HitBTC taker fee (one-time per position)
     API_KEY: "-3Mn7DL8P20iTj7QPoOSgyATuDcF-87h",
     API_SECRET: "WzxCckLuICMXcjdRL-CbgcsbpGXHePcs"
 };
@@ -35,7 +35,7 @@ let orderLock = {};
 
 CONFIG.SYMBOLS.forEach(s => {
     priceHistory[s] = [];
-    positions[s] = { quantity: 0, entryPrice: null, positionType: null };
+    positions[s] = { quantity: 0, entryPrice: null, positionType: null, feeApplied: false };
     realizedPnL[s] = 0;
     unrealizedPnL[s] = 0;
     tradeHistory[s] = [];
@@ -87,7 +87,8 @@ async function fetchPositions() {
                         positions[symbol] = {
                             quantity: qty,
                             entryPrice: entry,
-                            positionType: qty > 0 ? "LONG" : qty < 0 ? "SHORT" : null
+                            positionType: qty > 0 ? "LONG" : qty < 0 ? "SHORT" : null,
+                            feeApplied: positions[symbol]?.feeApplied || false
                         };
                         found = true;
                         break;
@@ -95,7 +96,7 @@ async function fetchPositions() {
                 }
             }
             if (!found) {
-                positions[symbol] = { quantity: 0, entryPrice: null, positionType: null };
+                positions[symbol] = { quantity: 0, entryPrice: null, positionType: null, feeApplied: false };
             }
         });
     } catch (err) {
@@ -146,7 +147,7 @@ function calculateUnrealizedPnL(symbol){
         pnl = (entry - ask) * qty;
     }
 
-    // subtract one-time entry fee
+    // subtract one-time fee per position
     pnl -= entry * qty * CONFIG.FEE_RATE;
 
     return pnl;
@@ -194,33 +195,47 @@ async function openPosition(io, symbol, type, qty, price, time){
     const res = await placeOrder(symbol, side, qty);
     if(res){
         await fetchPositions();
+        positions[symbol].feeApplied = false; // reset feeApplied on new position
         tradeHistory[symbol].push({ type:`OPEN ${type}`, entry: positions[symbol].entryPrice, qty, time });
         io.emit("trade", tradeHistory[symbol].at(-1));
     }
 }
 
-async function reversePosition(io, symbol, type, qty, price, time){
+async function reversePosition(io, symbol, type, qty, executedPrice, time){
     const current = positions[symbol];
     if(!current.positionType) return;
-    const closeSide = current.positionType==="LONG"?"sell":"buy";
 
-    // Calculate realized PnL before closing
-    const pnlBefore = calculateUnrealizedPnL(symbol);
-    realizedPnL[symbol] += pnlBefore;
+    const closeSide = current.positionType==="LONG" ? "sell" : "buy";
+    const closeQty = Math.abs(current.quantity);
 
-    await placeOrder(symbol, closeSide, Math.abs(current.quantity));
+    // Calculate realized PnL using executed price
+    let pnl = 0;
+    if(current.positionType === "LONG"){
+        pnl = (executedPrice - current.entryPrice) * closeQty;
+    } else if(current.positionType === "SHORT"){
+        pnl = (current.entryPrice - executedPrice) * closeQty;
+    }
+
+    // subtract one-time entry fee
+    pnl -= current.entryPrice * closeQty * CONFIG.FEE_RATE;
+
+    realizedPnL[symbol] += pnl;
+
+    // Close existing position
+    await placeOrder(symbol, closeSide, closeQty);
     tradeHistory[symbol].push({
         type:`CLOSE ${current.positionType} (REVERSE)`,
         entry: current.entryPrice,
-        exit: price,
-        pnl: pnlBefore,
+        exit: executedPrice,
+        pnl,
         qty: current.quantity,
         time
     });
     io.emit("trade", tradeHistory[symbol].at(-1));
 
+    // Fetch new position and open new one
     await fetchPositions();
-    await openPosition(io, symbol, type, qty, price, time);
+    await openPosition(io, symbol, type, qty, executedPrice, time);
 }
 
 // ---------------------------- SERVER & DASHBOARD ----------------------------
