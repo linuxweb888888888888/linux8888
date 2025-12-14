@@ -1,6 +1,7 @@
 /******************************************************************************************
- *  ZERO-CROSSING Z-SCORE MEAN REVERSION BOT — HITBTC PERP MARKET ORDERS
- *  DASHBOARD + REAL-TIME PNL + TRADE MARKERS
+ * ZERO-CROSSING Z-SCORE MEAN REVERSION BOT — HITBTC PERP MARKET ORDERS
+ * DASHBOARD + REAL-TIME PNL + TRADE MARKERS
+ * ONLY OPEN TRADES IF VOLATILITY (SD) > volThreshold AND RISING
  ******************************************************************************************/
 
 const express = require("express");
@@ -8,21 +9,24 @@ const http = require("http");
 const { Server } = require("socket.io");
 const axios = require("axios");
 
-// ---------------------------- CONFIG ----------------------------
+// ============================ CONFIG ============================
 const CONFIG = {
     tickRate: 1400,
     windowMinutes: 15,
     smoothing: 1,
-    SYMBOLS: ["ADAUSDT"],  // symbols to trade
+    SYMBOLS: ["ADAUSDT"],
     TRADE_QTY: 1,
-    FEE_RATE: 0.00075,  // HitBTC taker fee
+    FEE_RATE: 0.00075,
     API_KEY: "-3Mn7DL8P20iTj7QPoOSgyATuDcF-87h",
-    API_SECRET: "WzxCckLuICMXcjdRL-CbgcsbpGXHePcs"
+    API_SECRET: "WzxCckLuICMXcjdRL-CbgcsbpGXHePcs",
+    volThreshold: 0.0004,
+    openZ: 0.5,
+    closeZ: 0.0
 };
 
-const BUFFER_SIZE = Math.ceil((CONFIG.windowMinutes * 60 * 1000) / CONFIG.tickRate);
+const BUFFER_SIZE = Math.ceil(CONFIG.windowMinutes * 60 * 1000 / CONFIG.tickRate);
 
-// ---------------------------- STATE ----------------------------
+// ============================ STATE ============================
 let priceHistory = {};
 let positions = {};
 let realizedPnL = {};
@@ -30,269 +34,194 @@ let unrealizedPnL = {};
 let tradeHistory = {};
 let lastBid = {};
 let lastAsk = {};
+let lastVolatility = {};
 let orderLock = {};
 
-CONFIG.SYMBOLS.forEach(s => {
-    priceHistory[s] = [];
-    positions[s] = { quantity: 0, entryPrice: null, positionType: null, feeApplied: false };
-    realizedPnL[s] = 0;
-    unrealizedPnL[s] = 0;
-    tradeHistory[s] = [];
-    lastBid[s] = null;
-    lastAsk[s] = null;
-    orderLock[s] = false;
+CONFIG.SYMBOLS.forEach(s=>{
+    priceHistory[s]=[];
+    positions[s]={quantity:0,entryPrice:null,positionType:null};
+    realizedPnL[s]=0;
+    unrealizedPnL[s]=0;
+    tradeHistory[s]=[];
+    lastBid[s]=null;
+    lastAsk[s]=null;
+    lastVolatility[s]=null;
+    orderLock[s]=false;
 });
 
-// ---------------------------- HELPERS ----------------------------
-function mean(arr){ return arr.length ? arr.reduce((a,b)=>a+b,0)/arr.length : 0; }
-function stddev(arr,m){ if(arr.length<2) return 0; const sq = arr.map(v => (v-m)**2); return Math.sqrt(mean(sq)); }
-function smooth(arr,n){ return arr.length<n ? arr[arr.length-1] : mean(arr.slice(-n)); }
+// ============================ HELPERS ============================
+const mean = a => a.reduce((x,y)=>x+y,0)/a.length;
+const stddev = (a,m)=>Math.sqrt(mean(a.map(v=>(v-m)**2)));
+const smooth = (a,n)=>n<=1?a[a.length-1]:mean(a.slice(-n));
 
-// ---------------------------- HITBTC API ----------------------------
+// ============================ HITBTC ============================
 const authHeaders = {
-    "Authorization": "Basic " + Buffer.from(CONFIG.API_KEY + ":" + CONFIG.API_SECRET).toString("base64")
+    Authorization:"Basic "+Buffer.from(CONFIG.API_KEY+":"+CONFIG.API_SECRET).toString("base64")
 };
 
-// fetch PERP ticker (bid/ask)
 async function fetchPerpTicker(symbol){
-    try{
-        const res = await axios.get(`https://api.hitbtc.com/api/3/public/ticker/${symbol}_PERP`);
-        const bid = parseFloat(res.data.bid);
-        const ask = parseFloat(res.data.ask);
-        if(!bid || !ask) return null;
-        lastBid[symbol] = bid;
-        lastAsk[symbol] = ask;
-        return (bid + ask)/2; // mid price for chart
-    } catch(err){
-        console.log(`⚠ Failed PERP ticker for ${symbol}:`, err.message);
-        return null;
-    }
+    const r = await axios.get(`https://api.hitbtc.com/api/3/public/ticker/${symbol}_PERP`);
+    lastBid[symbol]=+r.data.bid;
+    lastAsk[symbol]=+r.data.ask;
+    return (lastBid[symbol]+lastAsk[symbol])/2;
 }
 
-// fetch account positions
-async function fetchPositions() {
-    try {
-        const res = await axios.get("https://api.hitbtc.com/api/3/futures/account", { headers: authHeaders });
-        const acctPositions = res.data || [];
-
-        CONFIG.SYMBOLS.forEach(symbol => {
-            let found = false;
-            for (const account of acctPositions) {
-                if (account.positions && Array.isArray(account.positions)) {
-                    const pos = account.positions.find(p => p.symbol === symbol + "_PERP");
-                    if (pos) {
-                        const qty = parseFloat(pos.quantity);
-                        const entry = parseFloat(pos.price_entry);
-                        positions[symbol] = {
-                            quantity: qty,
-                            entryPrice: entry,
-                            positionType: qty > 0 ? "LONG" : qty < 0 ? "SHORT" : null,
-                            feeApplied: positions[symbol]?.feeApplied || false
-                        };
-                        found = true;
-                        break;
-                    }
-                }
+async function fetchPositions(){
+    const r = await axios.get("https://api.hitbtc.com/api/3/futures/account",{headers:authHeaders});
+    CONFIG.SYMBOLS.forEach(sym=>{
+        let found=false;
+        for(const a of r.data||[]){
+            const p=a.positions?.find(x=>x.symbol===sym+"_PERP");
+            if(p){
+                const q=+p.quantity;
+                positions[sym]={quantity:q,entryPrice:+p.price_entry,positionType:q>0?"LONG":q<0?"SHORT":null};
+                found=true;
+                break;
             }
-            if (!found) {
-                positions[symbol] = { quantity: 0, entryPrice: null, positionType: null, feeApplied: false };
-            }
-        });
-    } catch (err) {
-        console.log("⚠ Failed to fetch positions:", err.message);
-    }
+        }
+        if(!found) positions[sym]={quantity:0,entryPrice:null,positionType:null};
+    });
 }
 
-// place market order
-async function placeOrder(symbol, side, quantity){
-    if(orderLock[symbol]) {
-        console.log(`⏳ Order locked, skipping ${symbol} ${side}`);
-        return null;
-    }
-    orderLock[symbol] = true;
+async function placeOrder(symbol,side,qty){
+    if(orderLock[symbol]) return;
+    orderLock[symbol]=true;
     try{
-        const payload = {
-            symbol: symbol+"_PERP",
+        await axios.post("https://api.hitbtc.com/api/3/futures/order",{
+            symbol:symbol+"_PERP",
             side,
-            quantity,
-            type: "market",
-            margin_mode: "cross"
-        };
-        const res = await axios.post("https://api.hitbtc.com/api/3/futures/order", payload, { headers: authHeaders });
-        console.log(`✅ Market order placed: ${symbol} ${side} ${quantity}`);
-        return res.data;
-    } catch(err){
-        console.log(`⚠ Failed market order ${symbol} ${side}:`, err.response?.data || err.message);
-        return null;
-    } finally {
-        orderLock[symbol] = false;
-    }
+            quantity:qty,
+            type:"market",
+            margin_mode:"cross"
+        },{headers:authHeaders});
+    }finally{ orderLock[symbol]=false; }
 }
 
-// ---------------------------- PnL ----------------------------
-function calculateUnrealizedPnL(symbol){
-    const pos = positions[symbol];
-    const bid = lastBid[symbol];
-    const ask = lastAsk[symbol];
-    if(!pos.positionType || pos.quantity===0 || pos.entryPrice===null) return 0;
-
-    const qty = Math.abs(pos.quantity);
-    const entry = pos.entryPrice;
-    let pnl = 0;
-
-    if(pos.positionType==="LONG" && bid!==null){
-        pnl = (bid - entry) * qty;
-    } else if(pos.positionType==="SHORT" && ask!==null){
-        pnl = (entry - ask) * qty;
-    }
-
-    pnl -= entry * qty * CONFIG.FEE_RATE;
-
-    return pnl;
+// ============================ PNL ============================
+function calcUnrealized(symbol){
+    const p=positions[symbol];
+    if(!p.positionType) return 0;
+    const q=Math.abs(p.quantity);
+    let pnl=p.positionType==="LONG"
+        ? (lastBid[symbol]-p.entryPrice)*q
+        : (p.entryPrice-lastAsk[symbol])*q;
+    return pnl - p.entryPrice*q*CONFIG.FEE_RATE;
 }
 
-// ---------------------------- STRATEGY (ZERO-CROSSING) ----------------------------
-async function runStrategy(io, symbol){
-    const prices = priceHistory[symbol];
-    if(prices.length < 50) return io.emit("warmup", { symbol, progress: prices.length, target: BUFFER_SIZE });
+// ============================ STRATEGY ============================
+async function runStrategy(io,symbol){
+    const prices=priceHistory[symbol];
+    if(prices.length<50) return;
 
-    const smoothed = smooth(prices, CONFIG.smoothing);
-    const m = mean(prices);
-    const sd = stddev(prices, m);
-    const z = sd === 0 ? 0 : (smoothed - m)/sd;
-    const time = new Date().toLocaleTimeString("en-US",{hour12:false});
+    const sm=smooth(prices,CONFIG.smoothing);
+    const m=mean(prices);
+    const sd=stddev(prices,m);
+    const z=(sm-m)/sd;
 
-    unrealizedPnL[symbol] = calculateUnrealizedPnL(symbol);
+    unrealizedPnL[symbol]=calcUnrealized(symbol);
 
-    io.emit("stats", {
+    io.emit("stats",{
         symbol,
-        price: smoothed,
-        zScore: z,
-        volatility: sd,
-        position: positions[symbol].positionType || "NONE",
-        entryPrice: positions[symbol].entryPrice || 0,
-        quantity: positions[symbol].quantity || 0,
-        realizedPnL: realizedPnL[symbol],
-        unrealizedPnL: unrealizedPnL[symbol]
+        price:sm,
+        zScore:z,
+        volatility:sd,
+        position:positions[symbol].positionType||"NONE",
+        entryPrice:positions[symbol].entryPrice||0,
+        quantity:positions[symbol].quantity||0,
+        realizedPnL:realizedPnL[symbol],
+        unrealizedPnL:unrealizedPnL[symbol]
     });
 
-    const qty = CONFIG.TRADE_QTY;
-    const posType = positions[symbol].positionType;
+    const prevSD=lastVolatility[symbol];
+    lastVolatility[symbol]=sd;
 
-    // LONG: open if z>0 and no position, close if z<=0
-    if(z > 0){
-        if(posType === "SHORT") await closePosition(io, symbol, time);
-        if(!posType) await openPosition(io, symbol, "LONG", qty, smoothed, time);
-    }
-    if(z <= 0 && posType === "LONG"){
-        await closePosition(io, symbol, time);
+    if(sd<CONFIG.volThreshold || prevSD===null || sd<=prevSD) return;
+
+    const pos=positions[symbol].positionType;
+
+    if(z>CONFIG.openZ){
+        if(pos==="SHORT") await closePosition(io,symbol);
+        if(!pos) await openPosition(io,symbol,"LONG");
     }
 
-    // SHORT: open if z<0 and no position, close if z>=0
-    if(z < 0){
-        if(posType === "LONG") await closePosition(io, symbol, time);
-        if(!posType) await openPosition(io, symbol, "SHORT", qty, smoothed, time);
+    if(z<-CONFIG.openZ){
+        if(pos==="LONG") await closePosition(io,symbol);
+        if(!pos) await openPosition(io,symbol,"SHORT");
     }
-    if(z >= 0 && posType === "SHORT"){
-        await closePosition(io, symbol, time);
-    }
+
+    if(pos==="LONG" && z<CONFIG.closeZ) await closePosition(io,symbol);
+    if(pos==="SHORT" && z>-CONFIG.closeZ) await closePosition(io,symbol);
 }
 
-// ---------------------------- ORDER EXECUTION ----------------------------
-async function openPosition(io, symbol, type, qty, price, time){
-    const side = type==="LONG"?"buy":"sell";
-    const res = await placeOrder(symbol, side, qty);
-    if(res){
-        await fetchPositions();
-        positions[symbol].feeApplied = false;
-        tradeHistory[symbol].push({ type:`OPEN ${type}`, entry: positions[symbol].entryPrice, qty, time });
-        io.emit("trade", tradeHistory[symbol].at(-1));
-    }
+// ============================ ORDERS ============================
+async function openPosition(io,symbol,type){
+    await placeOrder(symbol,type==="LONG"?"buy":"sell",CONFIG.TRADE_QTY);
+    await fetchPositions();
+    tradeHistory[symbol].push({type:`OPEN ${type}`,idx:priceHistory[symbol].length-1});
+    io.emit("trade",tradeHistory[symbol].at(-1));
 }
 
-async function closePosition(io, symbol, time){
-    const current = positions[symbol];
-    if(!current.positionType) return;
-
-    const closeSide = current.positionType==="LONG" ? "sell" : "buy";
-    const qty = Math.abs(current.quantity);
-    const exitPrice = current.positionType==="LONG" ? lastBid[symbol] : lastAsk[symbol];
-
-    // Realized PnL
-    let pnl = 0;
-    if(current.positionType === "LONG") pnl = (exitPrice - current.entryPrice) * qty;
-    else pnl = (current.entryPrice - exitPrice) * qty;
-
-    pnl -= current.entryPrice * qty * CONFIG.FEE_RATE;
-    realizedPnL[symbol] += pnl;
-
-    // Close order
-    await placeOrder(symbol, closeSide, qty);
-    tradeHistory[symbol].push({
-        type:`CLOSE ${current.positionType}`,
-        entry: current.entryPrice,
-        exit: exitPrice,
-        pnl,
-        qty: current.quantity,
-        time
-    });
-    io.emit("trade", tradeHistory[symbol].at(-1));
-
-    // Reset position
-    positions[symbol] = { quantity: 0, entryPrice: null, positionType: null, feeApplied: false };
+async function closePosition(io,symbol){
+    const p=positions[symbol];
+    if(!p.positionType) return;
+    const side=p.positionType==="LONG"?"sell":"buy";
+    const qty=Math.abs(p.quantity);
+    const exit=p.positionType==="LONG"?lastBid[symbol]:lastAsk[symbol];
+    let pnl=p.positionType==="LONG"
+        ? (exit-p.entryPrice)*qty
+        : (p.entryPrice-exit)*qty;
+    pnl-=p.entryPrice*qty*CONFIG.FEE_RATE;
+    realizedPnL[symbol]+=pnl;
+    await placeOrder(symbol,side,qty);
+    tradeHistory[symbol].push({type:`CLOSE ${p.positionType}`,pnl,idx:priceHistory[symbol].length-1});
+    io.emit("trade",tradeHistory[symbol].at(-1));
+    positions[symbol]={quantity:0,entryPrice:null,positionType:null};
 }
 
-// ---------------------------- SERVER & DASHBOARD ----------------------------
-const app = express();
-const server = http.createServer(app);
-const io = new Server(server);
-let onlineUsers = 0;
+// ============================ SERVER ============================
+const app=express();
+const server=http.createServer(app);
+const io=new Server(server);
+let online=0;
 
-io.on("connection", socket=>{
-    onlineUsers++;
-    io.emit("onlineUsers", onlineUsers);
-    socket.on("disconnect", ()=>{ onlineUsers--; io.emit("onlineUsers", onlineUsers); });
+io.on("connection",s=>{
+    online++;
+    io.emit("onlineUsers",online);
+    s.on("disconnect",()=>io.emit("onlineUsers",--online));
 });
 
-app.get("/", (req,res)=>res.send(DASHBOARD_HTML));
+app.get("/",(r,res)=>res.send(DASHBOARD_HTML));
+(async()=>{await fetchPositions();})();
 
-// ---------------------------- INITIAL FETCH ----------------------------
-(async () => { await fetchPositions(); })();
-
-// main loop
-setInterval(async ()=>{
-    for(const symbol of CONFIG.SYMBOLS){
-        const price = await fetchPerpTicker(symbol);
-        if(!price) continue;
-
-        priceHistory[symbol].push(price);
-        if(priceHistory[symbol].length > BUFFER_SIZE) priceHistory[symbol].shift();
-
+setInterval(async()=>{
+    for(const s of CONFIG.SYMBOLS){
+        const price=await fetchPerpTicker(s);
+        priceHistory[s].push(price);
+        if(priceHistory[s].length>BUFFER_SIZE) priceHistory[s].shift();
         await fetchPositions();
-        io.emit("tick", { symbol, price });
-        await runStrategy(io, symbol);
+        io.emit("tick",{symbol:s,price});
+        await runStrategy(io,s);
     }
-}, CONFIG.tickRate);
+},CONFIG.tickRate);
 
-server.listen(3000, ()=>console.log("Bot running → http://localhost:3000"));
+server.listen(3000,()=>console.log("Bot running → http://localhost:3000"));
 
-// ---------------------------- DASHBOARD HTML ----------------------------
+// ============================ DASHBOARD ============================
 const DASHBOARD_HTML = `<!DOCTYPE html>
 <html>
 <head>
-<title>Zero-Crossing Z-Score Bot</title>
-<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0">
+<title>Z-Score Bot</title>
+<meta name="viewport" content="width=device-width,initial-scale=1">
 <style>
-body{margin:0;background:#121212;color:#fff;font-family:"Roboto",sans-serif;overflow:hidden;}
-#topbar{display:flex;flex-wrap:wrap;gap:10px;padding:10px;}
-.card{background:#1f1f1f;padding:12px 14px;border-radius:12px;box-shadow:0 2px 8px rgba(0,0,0,0.5);min-width:90px;flex:1;text-align:center;}
-.label{font-size:12px;opacity:0.7;}
-.value{font-size:18px;margin-top:4px;}
-#layout{display:flex;flex-direction:column;height:calc(100vh - 120px);}
-#left{flex:1;min-height:45vh;}
-#right{flex:1;overflow-y:auto;padding:10px;background:#151515;border-top:1px solid #333;}
-canvas{width:100% !important;height:100% !important;}
-@media(max-width:480px){.value{font-size:16px;}#layout{height:calc(100vh - 160px);}#left{min-height:40vh;}}
+body{margin:0;background:#121212;color:#fff;font-family:sans-serif;overflow:hidden}
+#topbar{display:flex;flex-wrap:wrap;gap:10px;padding:10px}
+.card{background:#1f1f1f;padding:12px;border-radius:12px;flex:1;text-align:center}
+.label{font-size:12px;opacity:.7}
+.value{font-size:18px}
+#layout{display:flex;flex-direction:column;height:calc(100vh - 120px)}
+#left{flex:1;min-height:45vh}
+#right{flex:1;overflow:auto;padding:10px;background:#151515}
+canvas{width:100%!important;height:100%!important}
 </style>
 <script src="https://cdn.jsdelivr.net/npm/socket.io-client@4/dist/socket.io.min.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
@@ -300,71 +229,62 @@ canvas{width:100% !important;height:100% !important;}
 <body>
 <div id="topbar">
 <div class="card"><div class="label">Price</div><div class="value" id="priceBox">--</div></div>
-<div class="card"><div class="label">Z-Score</div><div class="value" id="zBox">--</div></div>
-<div class="card"><div class="label">Vol (SD)</div><div class="value" id="volBox">--</div></div>
-<div class="card"><div class="label">Position</div><div class="value" id="posBox">--</div></div>
-<div class="card"><div class="label">Entry Price</div><div class="value" id="entryBox">--</div></div>
-<div class="card"><div class="label">Quantity</div><div class="value" id="qtyBox">--</div></div>
-<div class="card"><div class="label">Realized</div><div class="value" id="pnlBox">0.00</div></div>
-<div class="card"><div class="label">Unrealized</div><div class="value" id="unrealizedPnlBox">0.00</div></div>
+<div class="card"><div class="label">Z</div><div class="value" id="zBox">--</div></div>
+<div class="card"><div class="label">Vol</div><div class="value" id="volBox">--</div></div>
+<div class="card"><div class="label">Pos</div><div class="value" id="posBox">--</div></div>
+<div class="card"><div class="label">Entry</div><div class="value" id="entryBox">--</div></div>
+<div class="card"><div class="label">Qty</div><div class="value" id="qtyBox">--</div></div>
+<div class="card"><div class="label">Real</div><div class="value" id="pnlBox">0</div></div>
+<div class="card"><div class="label">Unreal</div><div class="value" id="unrealizedPnlBox">0</div></div>
 <div class="card"><div class="label">Online</div><div class="value" id="onlineBox">0</div></div>
 </div>
 <div id="layout">
 <div id="left"><canvas id="chart"></canvas></div>
-<div id="right">
-<h3>Trades</h3>
-<div id="tradeLog" style="font-family:monospace;white-space:pre-wrap;"></div>
-</div>
+<div id="right"><pre id="tradeLog"></pre></div>
 </div>
 <script>
-const socket = io();
-const ctx = document.getElementById("chart").getContext("2d");
-const chart = new Chart(ctx,{
-    type:"line",
-    data:{ labels:[], datasets:[
-        { label:"Price", data:[], borderWidth:2, borderColor:"white", pointRadius:0 },
-        { label:"Trades", data:[], borderColor:"transparent", pointBackgroundColor:[], pointRadius:7, showLine:false }
-    ]},
-    options:{ responsive:true, maintainAspectRatio:false, animation:false, scales:{ x:{ display:false }, y:{ ticks:{ color:"white" } } } }
+const socket=io();
+const ctx=document.getElementById("chart").getContext("2d");
+const chart=new Chart(ctx,{
+ type:"line",
+ data:{labels:[],datasets:[
+  {label:"Price",data:[],borderColor:"white",borderWidth:2,pointRadius:0},
+  {label:"Trades",data:[],showLine:false,pointRadius:7,pointBackgroundColor:[]}
+ ]},
+ options:{responsive:true,maintainAspectRatio:false,animation:false,scales:{x:{display:false}}}
 });
-
-socket.on("tick", msg=>{
-    chart.data.labels.push(new Date().toLocaleTimeString());
-    chart.data.datasets[0].data.push(msg.price);
-    chart.data.datasets[1].data.push(null);
-    chart.data.datasets[1].pointBackgroundColor.push(null);
-    if(chart.data.labels.length > ${BUFFER_SIZE}) {
-        chart.data.labels.shift();
-        chart.data.datasets[0].data.shift();
-        chart.data.datasets[1].data.shift();
-        chart.data.datasets[1].pointBackgroundColor.shift();
-    }
-    chart.update("none");
+socket.on("tick",m=>{
+ chart.data.labels.push("");
+ chart.data.datasets[0].data.push(m.price);
+ chart.data.datasets[1].data.push(null);
+ chart.data.datasets[1].pointBackgroundColor.push(null);
+ if(chart.data.labels.length>${BUFFER_SIZE}){
+  chart.data.labels.shift();
+  chart.data.datasets[0].data.shift();
+  chart.data.datasets[1].data.shift();
+  chart.data.datasets[1].pointBackgroundColor.shift();
+ }
+ chart.update("none");
 });
-
-socket.on("stats", msg=>{
-    priceBox.innerText = msg.price.toFixed(5);
-    zBox.innerText = msg.zScore.toFixed(2);
-    volBox.innerText = msg.volatility.toFixed(5);
-    posBox.innerText = msg.position || "NONE";
-    entryBox.innerText = msg.entryPrice ? msg.entryPrice.toFixed(5) : "--";
-    qtyBox.innerText = msg.quantity || 0;
-    pnlBox.innerText = msg.realizedPnL.toFixed(5);
-    unrealizedPnlBox.innerText = msg.unrealizedPnL.toFixed(5);
+socket.on("stats",m=>{
+ priceBox.innerText=m.price.toFixed(5);
+ zBox.innerText=m.zScore.toFixed(2);
+ volBox.innerText=m.volatility.toFixed(5);
+ posBox.innerText=m.position;
+ entryBox.innerText=m.entryPrice?m.entryPrice.toFixed(5):"--";
+ qtyBox.innerText=m.quantity;
+ pnlBox.innerText=m.realizedPnL.toFixed(5);
+ unrealizedPnlBox.innerText=m.unrealizedPnL.toFixed(5);
 });
-
-socket.on("trade", t=>{
-    const log = document.getElementById("tradeLog");
-    log.innerText = JSON.stringify(t,null,2)+"\\n"+log.innerText;
-    const idx = chart.data.datasets[0].data.length-1;
-    const color = t.type.includes("LONG")?"lime":t.type.includes("SHORT")?"red":"yellow";
-    chart.data.datasets[1].data[idx] = chart.data.datasets[0].data[idx];
-    chart.data.datasets[1].pointBackgroundColor[idx] = color;
-    chart.update();
+socket.on("trade",t=>{
+ tradeLog.innerText=JSON.stringify(t,null,2)+"\\n"+tradeLog.innerText;
+ const idx=t.idx;
+ const color=t.type.includes("LONG")?"lime":t.type.includes("SHORT")?"red":"yellow";
+ chart.data.datasets[1].data[idx]=chart.data.datasets[0].data[idx];
+ chart.data.datasets[1].pointBackgroundColor[idx]=color;
+ chart.update();
 });
-
-socket.on("onlineUsers", n=>{ onlineBox.innerText = n; });
+socket.on("onlineUsers",n=>onlineBox.innerText=n);
 </script>
 </body>
-</html>
-`;
+</html>`;
