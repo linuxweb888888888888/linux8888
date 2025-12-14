@@ -1,6 +1,6 @@
 /******************************************************************************************
- *  ADVANCED SMOOTHED MEAN REVERSION BOT — REAL HITBTC PERP MARKET ORDERS
- *  MOBILE OPTIMIZED • REAL PNL • TRADE MARKERS + ONLINE USERS
+ *  ZERO-CROSSING Z-SCORE MEAN REVERSION BOT — HITBTC PERP MARKET ORDERS
+ *  DASHBOARD + REAL-TIME PNL + TRADE MARKERS
  ******************************************************************************************/
 
 const express = require("express");
@@ -13,10 +13,9 @@ const CONFIG = {
     tickRate: 1400,
     windowMinutes: 15,
     smoothing: 1,
-    zScoreThreshold: 1,
     SYMBOLS: ["ADAUSDT"],  // symbols to trade
     TRADE_QTY: 1,
-    FEE_RATE: 0.00075,  // HitBTC taker fee (one-time per position)
+    FEE_RATE: 0.00075,  // HitBTC taker fee
     API_KEY: "-3Mn7DL8P20iTj7QPoOSgyATuDcF-87h",
     API_SECRET: "WzxCckLuICMXcjdRL-CbgcsbpGXHePcs"
 };
@@ -70,7 +69,7 @@ async function fetchPerpTicker(symbol){
     }
 }
 
-// fetch account positions (cross & isolated)
+// fetch account positions
 async function fetchPositions() {
     try {
         const res = await axios.get("https://api.hitbtc.com/api/3/futures/account", { headers: authHeaders });
@@ -104,7 +103,7 @@ async function fetchPositions() {
     }
 }
 
-// place market order (one at a time)
+// place market order
 async function placeOrder(symbol, side, quantity){
     if(orderLock[symbol]) {
         console.log(`⏳ Order locked, skipping ${symbol} ${side}`);
@@ -147,13 +146,12 @@ function calculateUnrealizedPnL(symbol){
         pnl = (entry - ask) * qty;
     }
 
-    // subtract one-time fee per position
     pnl -= entry * qty * CONFIG.FEE_RATE;
 
     return pnl;
 }
 
-// ---------------------------- STRATEGY ----------------------------
+// ---------------------------- STRATEGY (ZERO-CROSSING) ----------------------------
 async function runStrategy(io, symbol){
     const prices = priceHistory[symbol];
     if(prices.length < 50) return io.emit("warmup", { symbol, progress: prices.length, target: BUFFER_SIZE });
@@ -179,13 +177,24 @@ async function runStrategy(io, symbol){
     });
 
     const qty = CONFIG.TRADE_QTY;
+    const posType = positions[symbol].positionType;
 
-    if(z >= CONFIG.zScoreThreshold){
-        if(positions[symbol].positionType === "SHORT") await reversePosition(io, symbol, "LONG", qty, smoothed, time);
-        if(!positions[symbol].positionType) await openPosition(io, symbol, "LONG", qty, smoothed, time);
-    } else if(z <= -CONFIG.zScoreThreshold){
-        if(positions[symbol].positionType === "LONG") await reversePosition(io, symbol, "SHORT", qty, smoothed, time);
-        if(!positions[symbol].positionType) await openPosition(io, symbol, "SHORT", qty, smoothed, time);
+    // LONG: open if z>0 and no position, close if z<=0
+    if(z > 0){
+        if(posType === "SHORT") await closePosition(io, symbol, time);
+        if(!posType) await openPosition(io, symbol, "LONG", qty, smoothed, time);
+    }
+    if(z <= 0 && posType === "LONG"){
+        await closePosition(io, symbol, time);
+    }
+
+    // SHORT: open if z<0 and no position, close if z>=0
+    if(z < 0){
+        if(posType === "LONG") await closePosition(io, symbol, time);
+        if(!posType) await openPosition(io, symbol, "SHORT", qty, smoothed, time);
+    }
+    if(z >= 0 && posType === "SHORT"){
+        await closePosition(io, symbol, time);
     }
 }
 
@@ -195,47 +204,42 @@ async function openPosition(io, symbol, type, qty, price, time){
     const res = await placeOrder(symbol, side, qty);
     if(res){
         await fetchPositions();
-        positions[symbol].feeApplied = false; // reset feeApplied on new position
+        positions[symbol].feeApplied = false;
         tradeHistory[symbol].push({ type:`OPEN ${type}`, entry: positions[symbol].entryPrice, qty, time });
         io.emit("trade", tradeHistory[symbol].at(-1));
     }
 }
 
-async function reversePosition(io, symbol, type, qty, executedPrice, time){
+async function closePosition(io, symbol, time){
     const current = positions[symbol];
     if(!current.positionType) return;
 
     const closeSide = current.positionType==="LONG" ? "sell" : "buy";
-    const closeQty = Math.abs(current.quantity);
+    const qty = Math.abs(current.quantity);
+    const exitPrice = current.positionType==="LONG" ? lastBid[symbol] : lastAsk[symbol];
 
-    // Calculate realized PnL using executed price
+    // Realized PnL
     let pnl = 0;
-    if(current.positionType === "LONG"){
-        pnl = (executedPrice - current.entryPrice) * closeQty;
-    } else if(current.positionType === "SHORT"){
-        pnl = (current.entryPrice - executedPrice) * closeQty;
-    }
+    if(current.positionType === "LONG") pnl = (exitPrice - current.entryPrice) * qty;
+    else pnl = (current.entryPrice - exitPrice) * qty;
 
-    // subtract one-time entry fee
-    pnl -= current.entryPrice * closeQty * CONFIG.FEE_RATE;
-
+    pnl -= current.entryPrice * qty * CONFIG.FEE_RATE;
     realizedPnL[symbol] += pnl;
 
-    // Close existing position
-    await placeOrder(symbol, closeSide, closeQty);
+    // Close order
+    await placeOrder(symbol, closeSide, qty);
     tradeHistory[symbol].push({
-        type:`CLOSE ${current.positionType} (REVERSE)`,
+        type:`CLOSE ${current.positionType}`,
         entry: current.entryPrice,
-        exit: executedPrice,
+        exit: exitPrice,
         pnl,
         qty: current.quantity,
         time
     });
     io.emit("trade", tradeHistory[symbol].at(-1));
 
-    // Fetch new position and open new one
-    await fetchPositions();
-    await openPosition(io, symbol, type, qty, executedPrice, time);
+    // Reset position
+    positions[symbol] = { quantity: 0, entryPrice: null, positionType: null, feeApplied: false };
 }
 
 // ---------------------------- SERVER & DASHBOARD ----------------------------
@@ -276,7 +280,7 @@ server.listen(3000, ()=>console.log("Bot running → http://localhost:3000"));
 const DASHBOARD_HTML = `<!DOCTYPE html>
 <html>
 <head>
-<title>Smoothed Mean Reversion Bot</title>
+<title>Zero-Crossing Z-Score Bot</title>
 <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0">
 <style>
 body{margin:0;background:#121212;color:#fff;font-family:"Roboto",sans-serif;overflow:hidden;}
