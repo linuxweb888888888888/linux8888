@@ -89,7 +89,6 @@ async function syncPositions(io) {
         state.positions.qty = qty;
         state.positions.entry = entry;
 
-        // ==== Initialize openSupport/openResistance if existing position has 0 ====
         if (state.positions.side && qty > 0 && state.positions.openSupport === 0 && state.positions.openResistance === 0) {
             state.positions.openSupport = state.support || state.price;
             state.positions.openResistance = state.resistance || state.price;
@@ -165,34 +164,30 @@ async function strategy(io) {
     const dynamicSupport = window.length ? Math.min(...window) : price;
 
     const pos = state.positions;
-    const EPSILON = 0.00001;
 
-    // ======= DEBUG LOG =======
     io.emit('log', `DEBUG | side=${pos.side} price=${price.toFixed(4)} openSupport=${pos.openSupport.toFixed(4)} openResistance=${pos.openResistance.toFixed(4)}`);
 
-    // ================== FORCE-CLOSE ==================
-    if (pos.side === 'LONG' && pos.openSupport > 0 && price <= pos.openSupport + EPSILON) {
+    // === FORCE CLOSE POSITIONS ===
+    if (pos.side === 'LONG' && pos.openSupport > 0 && price <= pos.openSupport) {
         io.emit('log', `🛑 FORCE LONG EXIT | ${price.toFixed(4)} <= ${pos.openSupport.toFixed(4)}`);
         await closePosition(io);
         state.status = 'CLOSED LONG';
-    } 
-    else if (pos.side === 'SHORT' && pos.openResistance > 0 && price >= pos.openResistance - EPSILON) {
+    } else if (pos.side === 'SHORT' && pos.openResistance > 0 && price >= pos.openResistance) {
         io.emit('log', `🛑 FORCE SHORT EXIT | ${price.toFixed(4)} >= ${pos.openResistance.toFixed(4)}`);
         await closePosition(io);
         state.status = 'CLOSED SHORT';
-    }
-    // ================== HOLD LOG ==================
+    } 
+    // === HOLD POSITION ===
     else if (pos.side === 'LONG') {
         io.emit('log', `➡️ HOLD LONG | ${price.toFixed(4)} >= ${pos.openSupport.toFixed(4)}`);
         state.status = 'RIDING LONG';
     } else if (pos.side === 'SHORT') {
         io.emit('log', `➡️ HOLD SHORT | ${price.toFixed(4)} <= ${pos.openResistance.toFixed(4)}`);
         state.status = 'RIDING SHORT';
-    }
-
-    // ================== ENTRY IF NO POSITION ==================
+    } 
+    // === OPEN NEW POSITION ===
     else if (!pos.side) {
-        if (price >= dynamicResistance) { // LONG
+        if (price >= dynamicResistance) {
             state.positions.side = 'LONG';
             state.positions.qty = CONFIG.TRADE_QTY;
             state.positions.entry = price;
@@ -202,7 +197,7 @@ async function strategy(io) {
             io.emit('log', `📈 BREAKOUT | ${price.toFixed(4)} >= ${dynamicResistance.toFixed(4)}`);
             await placeOrder('buy', CONFIG.TRADE_QTY, io);
             state.status = 'OPEN LONG';
-        } else if (price <= dynamicSupport) { // SHORT
+        } else if (price <= dynamicSupport) {
             state.positions.side = 'SHORT';
             state.positions.qty = CONFIG.TRADE_QTY;
             state.positions.entry = price;
@@ -353,3 +348,4 @@ socket.on('log', m=>{
 </body>
 </html>
 `;
+
