@@ -1,7 +1,8 @@
 /******************************************************************************************
  * ⚡ LIVE ADAUSDT BOT — PHEMEX PERPETUAL SWAP (CCXT)
  * - Instant breakout entries over dynamic support/resistance
- * - Instant exit on crossing frozen S/R
+ * - Force-close LONG when touching support
+ * - Force-close SHORT when touching resistance
  * - Dashboard + Chart.js with frozen S/R lines
  * - Full logs including HOLD, EXIT, and DEBUG
  ******************************************************************************************/
@@ -164,17 +165,19 @@ async function strategy(io) {
     const dynamicSupport = window.length ? Math.min(...window) : price;
 
     const pos = state.positions;
+    const EPSILON = 0.00001;
 
     // ======= DEBUG LOG =======
     io.emit('log', `DEBUG | side=${pos.side} price=${price.toFixed(4)} openSupport=${pos.openSupport.toFixed(4)} openResistance=${pos.openResistance.toFixed(4)}`);
 
-    // ================== EXIT FIRST ==================
-    if (pos.side === 'LONG' && pos.openSupport > 0 && price < pos.openSupport) {
-        io.emit('log', `🛑 LONG EXIT | ${price.toFixed(4)} < ${pos.openSupport.toFixed(4)}`);
+    // ================== FORCE-CLOSE ==================
+    if (pos.side === 'LONG' && pos.openSupport > 0 && price <= pos.openSupport + EPSILON) {
+        io.emit('log', `🛑 FORCE LONG EXIT | ${price.toFixed(4)} <= ${pos.openSupport.toFixed(4)}`);
         await closePosition(io);
         state.status = 'CLOSED LONG';
-    } else if (pos.side === 'SHORT' && pos.openResistance > 0 && price > pos.openResistance) {
-        io.emit('log', `🛑 SHORT EXIT | ${price.toFixed(4)} > ${pos.openResistance.toFixed(4)}`);
+    } 
+    else if (pos.side === 'SHORT' && pos.openResistance > 0 && price >= pos.openResistance - EPSILON) {
+        io.emit('log', `🛑 FORCE SHORT EXIT | ${price.toFixed(4)} >= ${pos.openResistance.toFixed(4)}`);
         await closePosition(io);
         state.status = 'CLOSED SHORT';
     }
