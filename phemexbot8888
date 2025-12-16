@@ -88,6 +88,12 @@ async function syncPositions(io) {
         state.positions.qty = qty;
         state.positions.entry = entry;
 
+        // ==== Initialize openSupport/openResistance if existing position has 0 ====
+        if (state.positions.side && qty > 0 && state.positions.openSupport === 0 && state.positions.openResistance === 0) {
+            state.positions.openSupport = state.support || state.price;
+            state.positions.openResistance = state.resistance || state.price;
+        }
+
         let orders = [];
         try { orders = await exchange.fetchOpenOrders(CONFIG.ORDER_SYMBOL); }
         catch(e){ io.emit('log', `OPEN ORDERS ERROR: ${e.message}`); orders = []; }
@@ -329,8 +335,8 @@ socket.on('stats', d=>{
     chart.data.datasets[0].data.push(d.price ?? d.price);
     chart.data.datasets[1].data.push(d.resistance ?? d.price);
     chart.data.datasets[2].data.push(d.support ?? d.price);
-    chart.data.datasets[3].data.push(d.entryResistance ?? d.price);
-    chart.data.datasets[4].data.push(d.entrySupport ?? d.price);
+    chart.data.datasets[3].data.push(d.entryResistance || d.resistance);
+    chart.data.datasets[4].data.push(d.entrySupport || d.support);
     chart.update('none');
 });
 
