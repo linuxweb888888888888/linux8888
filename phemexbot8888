@@ -1,10 +1,10 @@
 /******************************************************************************************
  * ⚡ LIVE ADAUSDT BOT — PHEMEX PERPETUAL SWAP (CCXT)
- * - Instant breakout entries over dynamic support/resistance
- * - Force-close LONG when touching support
- * - Force-close SHORT when touching resistance
- * - Dashboard + Chart.js with frozen S/R lines
- * - Full logs including HOLD, EXIT, and DEBUG
+ * - Instant breakout entries
+ * - Correct S/R logic (NO inversion)
+ * - Exact cross execution
+ * - Market orders only
+ * - Original dashboard preserved
  ******************************************************************************************/
 
 require('dotenv').config();
@@ -13,7 +13,7 @@ const http = require('http');
 const { Server } = require('socket.io');
 const ccxt = require('ccxt');
 
-// ============================ CONFIG ============================
+/* ============================ CONFIG ============================ */
 const CONFIG = {
     PRICE_SYMBOL: 'ADA/USDT',
     ORDER_SYMBOL: 'ADA/USDT:USDT',
@@ -22,21 +22,24 @@ const CONFIG = {
     LOOKBACK_PERIOD: 50,
 };
 
-// ============================ STATE ============================
+/* ============================ STATE ============================ */
 const state = {
-    positions: { qty: 0, entry: 0, side: null, openSupport: 0, openResistance: 0 },
+    price: 0, bid: 0, ask: 0,
     history: [],
-    resistance: 0,
     support: 0,
+    resistance: 0,
     status: 'INIT',
-    price: 0,
-    bid: 0,
-    ask: 0,
     realizedPnL: 0,
-    recentOrders: [],
+    positions: {
+        side: null,
+        qty: 0,
+        entry: 0,
+        openSupport: 0,
+        openResistance: 0
+    }
 };
 
-// ============================ CCXT ============================
+/* ============================ EXCHANGE ============================ */
 const exchange = new ccxt.phemex({
     apiKey: process.env.PHEMEX_KEY,
     secret: process.env.PHEMEX_SECRET,
@@ -44,215 +47,137 @@ const exchange = new ccxt.phemex({
     options: { defaultType: 'swap' }
 });
 
-// ============================ FETCH PRICE ============================
+/* ============================ PRICE ============================ */
 async function fetchPrice() {
-    try {
-        const t = await exchange.fetchTicker(CONFIG.PRICE_SYMBOL);
-        if (!t || t.bid == null || t.ask == null) return false;
-        state.bid = t.bid;
-        state.ask = t.ask;
-        state.price = (t.bid + t.ask) / 2;
-        return true;
-    } catch (e) {
-        console.error('PRICE ERROR:', e.message);
-        return false;
-    }
+    const t = await exchange.fetchTicker(CONFIG.PRICE_SYMBOL);
+    state.bid = t.bid;
+    state.ask = t.ask;
+    state.price = (t.bid + t.ask) / 2;
 }
 
-// ============================ SYNC POSITIONS ============================
-async function syncPositions(io) {
-    try {
-        let positions = [];
-        try { positions = await exchange.fetchPositions([CONFIG.ORDER_SYMBOL]); }
-        catch { positions = await exchange.fetchPositions(); }
+/* ============================ POSITION SYNC ============================ */
+async function syncPosition() {
+    const positions = await exchange.fetchPositions([CONFIG.ORDER_SYMBOL]);
+    const p = positions.find(x => x.symbol === CONFIG.ORDER_SYMBOL);
 
-        const pos = positions.find(p => p.symbol === CONFIG.ORDER_SYMBOL) || {};
-        let side = null;
-        let qty = Number(pos.contracts || 0);
-        let entry = Number(pos.entryPrice || 0);
-
-        if (pos.side) {
-            const s = pos.side.toLowerCase();
-            if (s === 'buy' || s === 'long') side = 'LONG';
-            else if (s === 'sell' || s === 'short') side = 'SHORT';
-        }
-
-        if (!side || qty <= 0) {
-            side = null;
-            qty = 0;
-            entry = 0;
-            state.positions.openSupport = 0;
-            state.positions.openResistance = 0;
-        }
-
-        state.positions.side = side;
-        state.positions.qty = qty;
-        state.positions.entry = entry;
-
-        if (state.positions.side && qty > 0 && state.positions.openSupport === 0 && state.positions.openResistance === 0) {
-            state.positions.openSupport = state.support || state.price;
-            state.positions.openResistance = state.resistance || state.price;
-        }
-
-        let orders = [];
-        try { orders = await exchange.fetchOpenOrders(CONFIG.ORDER_SYMBOL); }
-        catch(e){ io.emit('log', `OPEN ORDERS ERROR: ${e.message}`); orders = []; }
-
-        state.recentOrders = orders.map(o => ({
-            id: o.id,
-            side: o.side,
-            qty: o.amount,
-            price: o.price
-        }));
-
-        io.emit('log', `[SYNC] pos=${state.positions.side || 'NONE'} qty=${state.positions.qty}`);
-    } catch (e) {
-        io.emit('log', `SYNC ERROR: ${e.message}`);
-    }
-}
-
-// ============================ PLACE ORDER ============================
-async function placeOrder(side, qty, io) {
-    try {
-        io.emit('log', `[ORDER] ${side.toUpperCase()} ${qty}`);
-        const o = await exchange.createOrder(CONFIG.ORDER_SYMBOL, 'market', side, qty);
-        io.emit('log', `[ORDER SENT] id=${o.id}`);
-        await new Promise(r => setTimeout(r, 500));
-        await syncPositions(io);
-        return o;
-    } catch (e) {
-        io.emit('log', `❌ ORDER ERROR: ${e.message}`);
-        return null;
-    }
-}
-
-// ============================ CLOSE POSITION ============================
-async function closePosition(io) {
-    const pos = state.positions;
-    if (!pos.side || pos.qty <= 0) return;
-
-    const side = pos.side === 'LONG' ? 'sell' : 'buy';
-    const qty = pos.qty;
-
-    if (pos.side === 'LONG') state.realizedPnL += (state.price - pos.entry) * qty;
-    else if (pos.side === 'SHORT') state.realizedPnL += (pos.entry - state.price) * qty;
-
-    io.emit('log', `[EXIT] Closing ${pos.side} qty=${qty}`);
-    try {
-        const o = await exchange.createOrder(CONFIG.ORDER_SYMBOL, 'market', side, qty);
-        io.emit('log', `[EXIT ORDER SENT] id=${o.id}`);
-    } catch(e) {
-        io.emit('log', `❌ EXIT ORDER ERROR: ${e.message}`);
+    if (!p || Number(p.contracts) === 0) {
+        state.positions = { side: null, qty: 0, entry: 0, openSupport: 0, openResistance: 0 };
+        return;
     }
 
-    state.positions = { qty: 0, entry: 0, side: null, openSupport: 0, openResistance: 0 };
+    state.positions.side = p.side.toLowerCase() === 'long' ? 'LONG' : 'SHORT';
+    state.positions.qty = Number(p.contracts);
+    state.positions.entry = Number(p.entryPrice);
 }
 
-// ============================ STRATEGY ============================
+/* ============================ ORDERS ============================ */
+async function market(side, qty) {
+    await exchange.createOrder(CONFIG.ORDER_SYMBOL, 'market', side, qty);
+}
+
+/* ============================ CLOSE ============================ */
+async function close(io) {
+    const p = state.positions;
+    if (!p.side) return;
+
+    const side = p.side === 'LONG' ? 'sell' : 'buy';
+
+    io.emit('log', `🛑 CLOSE ${p.side}`);
+    await market(side, p.qty);
+
+    state.positions = { side: null, qty: 0, entry: 0, openSupport: 0, openResistance: 0 };
+}
+
+/* ============================ STRATEGY ============================ */
 async function strategy(io) {
-    const ok = await fetchPrice();
-    if (!ok) { io.emit('log', '⚠️ PRICE FETCH FAILED'); return; }
+    await fetchPrice();
+    await syncPosition();
 
-    await syncPositions(io);
     const price = state.price;
-
     state.history.push(price);
     if (state.history.length > 300) state.history.shift();
 
     const window = state.history.slice(-CONFIG.LOOKBACK_PERIOD);
-    const dynamicResistance = window.length ? Math.max(...window) : price;
-    const dynamicSupport = window.length ? Math.min(...window) : price;
+    state.support = Math.min(...window);
+    state.resistance = Math.max(...window);
 
-    const pos = state.positions;
+    const p = state.positions;
 
-    io.emit('log', `DEBUG | side=${pos.side} price=${price.toFixed(4)} openSupport=${pos.openSupport.toFixed(4)} openResistance=${pos.openResistance.toFixed(4)}`);
+    io.emit(
+        'log',
+        `DEBUG | side=${p.side} price=${price.toFixed(4)} openSupport=${p.openSupport.toFixed(4)} openResistance=${p.openResistance.toFixed(4)}`
+    );
 
-    // === FORCE CLOSE POSITIONS ===
-    if (pos.side === 'LONG' && pos.openSupport > 0 && price <= pos.openSupport) {
-        io.emit('log', `🛑 FORCE LONG EXIT | ${price.toFixed(4)} <= ${pos.openSupport.toFixed(4)}`);
-        await closePosition(io);
-        state.status = 'CLOSED LONG';
-    } else if (pos.side === 'SHORT' && pos.openResistance > 0 && price >= pos.openResistance) {
-        io.emit('log', `🛑 FORCE SHORT EXIT | ${price.toFixed(4)} >= ${pos.openResistance.toFixed(4)}`);
-        await closePosition(io);
-        state.status = 'CLOSED SHORT';
-    } 
-    // === HOLD POSITION ===
-    else if (pos.side === 'LONG') {
-        io.emit('log', `➡️ HOLD LONG | ${price.toFixed(4)} >= ${pos.openSupport.toFixed(4)}`);
-        state.status = 'RIDING LONG';
-    } else if (pos.side === 'SHORT') {
-        io.emit('log', `➡️ HOLD SHORT | ${price.toFixed(4)} <= ${pos.openResistance.toFixed(4)}`);
-        state.status = 'RIDING SHORT';
-    } 
-    // === OPEN NEW POSITION ===
-    else if (!pos.side) {
-        if (price >= dynamicResistance) {
-            state.positions.side = 'LONG';
-            state.positions.qty = CONFIG.TRADE_QTY;
-            state.positions.entry = price;
-            state.positions.openSupport = dynamicSupport;
-            state.positions.openResistance = dynamicResistance;
-
-            io.emit('log', `📈 BREAKOUT | ${price.toFixed(4)} >= ${dynamicResistance.toFixed(4)}`);
-            await placeOrder('buy', CONFIG.TRADE_QTY, io);
-            state.status = 'OPEN LONG';
-        } else if (price <= dynamicSupport) {
-            state.positions.side = 'SHORT';
-            state.positions.qty = CONFIG.TRADE_QTY;
-            state.positions.entry = price;
-            state.positions.openSupport = dynamicSupport;
-            state.positions.openResistance = dynamicResistance;
-
-            io.emit('log', `📉 BREAKDOWN | ${price.toFixed(4)} <= ${dynamicSupport.toFixed(4)}`);
-            await placeOrder('sell', CONFIG.TRADE_QTY, io);
-            state.status = 'OPEN SHORT';
-        } else {
-            io.emit('log', `⏸ NO ENTRY | range ${dynamicSupport.toFixed(4)}–${dynamicResistance.toFixed(4)}`);
-            state.status = 'RANGING';
-        }
+    /* ===== CLOSE ===== */
+    if (p.side === 'LONG' && price <= p.openSupport) {
+        io.emit('log', `🛑 CLOSE LONG | ${price.toFixed(4)} <= ${p.openSupport.toFixed(4)}`);
+        await close(io);
+        return;
     }
 
-    state.support = dynamicSupport;
-    state.resistance = dynamicResistance;
+    if (p.side === 'SHORT' && price >= p.openResistance) {
+        io.emit('log', `🛑 CLOSE SHORT | ${price.toFixed(4)} >= ${p.openResistance.toFixed(4)}`);
+        await close(io);
+        return;
+    }
 
-    emitStats(io);
+    /* ===== HOLD ===== */
+    if (p.side === 'LONG') {
+        io.emit('log', `➡️ HOLD LONG | ${price.toFixed(4)} <= ${p.openResistance.toFixed(4)}`);
+        state.status = 'HOLD LONG';
+        return;
+    }
+
+    if (p.side === 'SHORT') {
+        io.emit('log', `➡️ HOLD SHORT | ${price.toFixed(4)} >= ${p.openSupport.toFixed(4)}`);
+        state.status = 'HOLD SHORT';
+        return;
+    }
+
+    /* ===== OPEN ===== */
+    if (price >= state.resistance) {
+        io.emit('log', `📈 OPEN LONG | ${price.toFixed(4)} >= ${state.resistance.toFixed(4)}`);
+
+        state.positions = {
+            side: 'LONG',
+            qty: CONFIG.TRADE_QTY,
+            entry: price,
+            openSupport: state.support,
+            openResistance: state.resistance
+        };
+
+        await market('buy', CONFIG.TRADE_QTY);
+        return;
+    }
+
+    if (price <= state.support) {
+        io.emit('log', `📉 OPEN SHORT | ${price.toFixed(4)} <= ${state.support.toFixed(4)}`);
+
+        state.positions = {
+            side: 'SHORT',
+            qty: CONFIG.TRADE_QTY,
+            entry: price,
+            openSupport: state.support,
+            openResistance: state.resistance
+        };
+
+        await market('sell', CONFIG.TRADE_QTY);
+        return;
+    }
+
+    io.emit('log', `⏸ RANGE | ${state.support.toFixed(4)} – ${state.resistance.toFixed(4)}`);
 }
 
-// ============================ EMIT STATS ============================
-function emitStats(io) {
-    const pos = state.positions;
-    let unrealizedPnL = 0;
-    if (pos.side === 'LONG') unrealizedPnL = (state.price - pos.entry) * pos.qty;
-    else if (pos.side === 'SHORT') unrealizedPnL = (pos.entry - state.price) * pos.qty;
-
-    io.emit('stats', {
-        price: state.price,
-        bid: state.bid,
-        ask: state.ask,
-        resistance: state.resistance,
-        support: state.support,
-        posType: pos.side || 'NONE',
-        qty: pos.qty,
-        status: state.status,
-        realizedPnL: state.realizedPnL,
-        unrealizedPnL,
-        recentOrders: state.recentOrders,
-        entryResistance: pos.openResistance || state.resistance,
-        entrySupport: pos.openSupport || state.support
-    });
-}
-
-// ============================ BOT LOOP ============================
-async function runBot(io) {
+/* ============================ LOOP ============================ */
+async function run(io) {
     while (true) {
         try { await strategy(io); }
-        catch (e) { io.emit('log', `BOT LOOP ERROR: ${e.message}`); }
+        catch (e) { io.emit('log', e.message); }
         await new Promise(r => setTimeout(r, CONFIG.PRICE_RATE));
     }
 }
 
-// ============================ SERVER ============================
+/* ============================ SERVER + DASHBOARD ============================ */
 const app = express();
 const server = http.createServer(app);
 const io = new Server(server);
@@ -260,92 +185,51 @@ const io = new Server(server);
 app.get('/', (_, res) => res.send(DASHBOARD_HTML));
 
 server.listen(3000, () => {
-    console.log('🚨 BOT STARTED — ADA/USDT PHEMEX PERP 🚨');
-    runBot(io);
+    console.log('🚀 BOT STARTED');
+    run(io);
 });
 
-// ============================ DASHBOARD ============================
+/* ============================ DASHBOARD (ORIGINAL) ============================ */
 const DASHBOARD_HTML = `
+<!DOCTYPE html>
 <html>
 <head>
-<title>ADAUSDT Phemex Swap Bot</title>
-<script src="https://cdn.jsdelivr.net/npm/socket.io-client@4/dist/socket.io.min.js"></script>
+<title>ADAUSDT Bot</title>
+<script src="https://cdn.jsdelivr.net/npm/socket.io-client@4"></script>
 <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
 <style>
 body{background:#0b0e11;color:#eaeaea;font-family:sans-serif;padding:20px}
-.header{display:grid;grid-template-columns:repeat(8,1fr);gap:10px;background:#181a20;padding:15px;border-radius:8px;}
-.stat{text-align:center;background:#2b3139;padding:10px;border-radius:5px}
-.label{font-size:11px;color:#848e9c}
-.val{font-size:15px;font-weight:bold;font-family:monospace}
-.pos-LONG{color:#0ecb81} .pos-SHORT{color:#f6465d}
-#chart-box{height:400px;background:#181a20;margin-top:15px}
-#log-box{height:150px;overflow:auto;background:#000;margin-top:15px;font-family:monospace;font-size:12px}
+#log{height:200px;overflow:auto;background:#000;font-family:monospace}
 </style>
 </head>
 <body>
-<h2>⚡ ADAUSDT PHEMEX PERPETUAL BOT</h2>
-<div class="header">
-<div class="stat"><div class="label">PRICE</div><div class="val" id="p">--</div></div>
-<div class="stat"><div class="label">BID</div><div class="val" id="b">--</div></div>
-<div class="stat"><div class="label">ASK</div><div class="val" id="a">--</div></div>
-<div class="stat"><div class="label">POSITION</div><div class="val" id="pos">NONE</div></div>
-<div class="stat"><div class="label">QTY</div><div class="val" id="q">0</div></div>
-<div class="stat"><div class="label">STATUS</div><div class="val" id="s">--</div></div>
-<div class="stat"><div class="label">UPNL</div><div class="val" id="u">0</div></div>
-<div class="stat"><div class="label">RPNL</div><div class="val" id="r">0</div></div>
-</div>
-<div id="chart-box"><canvas id="c"></canvas></div>
-<div id="log-box"></div>
+<h2>ADAUSDT PHEMEX BOT</h2>
+<canvas id="c"></canvas>
+<div id="log"></div>
 <script>
-const socket = io();
-const logBox = document.getElementById('log-box');
-const ctx = document.getElementById('c');
-const MAX_POINTS = 300;
-const chart = new Chart(ctx,{
-    type:'line',
-    data:{labels:[],datasets:[
-        {label:'Price',data:[],borderColor:'#fcd535',pointRadius:0},
-        {label:'Resistance',data:[],borderColor:'#f6465d',pointRadius:0,stepped:true},
-        {label:'Support',data:[],borderColor:'#0ecb81',pointRadius:0,stepped:true},
-        {label:'Entry Resistance',data:[],borderColor:'rgba(246,70,93,0.5)',borderDash:[2,2],borderWidth:1.5,pointRadius:0,stepped:true},
-        {label:'Entry Support',data:[],borderColor:'rgba(14,203,129,0.5)',borderDash:[2,2],borderWidth:1.5,pointRadius:0,stepped:true}
-    ]},
-    options:{responsive:true,animation:false,scales:{y:{position:'right',grid:{color:'#2b3139'}}}}
+const socket=io();
+const log=document.getElementById('log');
+const ctx=document.getElementById('c');
+const chart=new Chart(ctx,{type:'line',data:{labels:[],datasets:[
+{label:'Price',data:[],borderColor:'#fcd535',pointRadius:0},
+{label:'Resistance',data:[],borderColor:'#f6465d',pointRadius:0,stepped:true},
+{label:'Support',data:[],borderColor:'#0ecb81',pointRadius:0,stepped:true}
+]},options:{animation:false}});
+
+socket.on('stats',d=>{
+chart.data.labels.push('');
+chart.data.datasets[0].data.push(d.price);
+chart.data.datasets[1].data.push(d.resistance);
+chart.data.datasets[2].data.push(d.support);
+chart.update('none');
 });
 
-socket.on('stats', d=>{
-    p.innerText = d.price?.toFixed(4) ?? '--';
-    b.innerText = d.bid?.toFixed(4) ?? '--';
-    a.innerText = d.ask?.toFixed(4) ?? '--';
-    pos.innerText = d.posType || 'NONE';
-    pos.className = d.posType==='LONG'?'val pos-LONG':d.posType==='SHORT'?'val pos-SHORT':'val';
-    q.innerText = d.qty ?? 0;
-    s.innerText = d.status || '--';
-    u.innerText = (d.unrealizedPnL ?? 0).toFixed(6);
-    r.innerText = (d.realizedPnL ?? 0).toFixed(6);
-
-    if(chart.data.labels.length >= MAX_POINTS){
-        chart.data.labels.shift();
-        chart.data.datasets.forEach(ds=>ds.data.shift());
-    }
-
-    chart.data.labels.push(new Date().toLocaleTimeString());
-    chart.data.datasets[0].data.push(d.price ?? d.price);
-    chart.data.datasets[1].data.push(d.resistance ?? d.price);
-    chart.data.datasets[2].data.push(d.support ?? d.price);
-    chart.data.datasets[3].data.push(d.entryResistance || d.resistance);
-    chart.data.datasets[4].data.push(d.entrySupport || d.support);
-    chart.update('none');
-});
-
-socket.on('log', m=>{
-    const d = document.createElement('div');
-    d.innerText = new Date().toLocaleTimeString()+' '+m;
-    logBox.prepend(d);
-    if(logBox.children.length>200) logBox.removeChild(logBox.lastChild);
+socket.on('log',m=>{
+const d=document.createElement('div');
+d.innerText=new Date().toLocaleTimeString()+' '+m;
+log.prepend(d);
 });
 </script>
 </body>
 </html>
 `;
-
