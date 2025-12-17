@@ -1,5 +1,6 @@
 /******************************************************************************************
- * ⚡ ADAUSDT PHEMEX BOT — FULL DASHBOARD + ROI SCALING
+ * ⚡ ADAUSDT PHEMEX BOT — FULL DASHBOARD + ROI SCALING 0.2%
+ * - No direction change until current position is closed
  ******************************************************************************************/
 
 require('dotenv').config();
@@ -15,7 +16,7 @@ const CONFIG = {
     PRICE_RATE: 2000,
     LOOKBACK_PERIOD: 50,
     FREEZE_DURATION: 5000,
-    MIN_ROI: 4
+    ROI_THRESHOLD: 0.2 // ROI threshold %
 };
 
 const state = {
@@ -155,37 +156,38 @@ async function strategy(io) {
 
     io.emit('log', `DEBUG | side=${pos.side} price=${price.toFixed(4)} ROI=${roi.toFixed(2)}%`);
 
-    // ===== LIVE RESISTANCE =====
+    // ===== SCALE OR CLOSE POSITION =====
+    if (pos.side) {
+        if (roi < CONFIG.ROI_THRESHOLD) {
+            io.emit('log', `➕ SCALE ${pos.side} | ROI ${roi.toFixed(2)}% < ${CONFIG.ROI_THRESHOLD}%`);
+            await placeOrder(pos.side === 'LONG' ? 'buy' : 'sell', CONFIG.TRADE_QTY, io);
+            state.status = 'SCALING';
+        } else {
+            io.emit('log', `🛑 CLOSE ${pos.side} | ROI ${roi.toFixed(2)}% >= ${CONFIG.ROI_THRESHOLD}%`);
+            await closePosition(io);
+            state.status = 'CLOSED';
+        }
+        state.support = liveS;
+        state.resistance = liveR;
+        emitStats(io);
+        return;
+    }
+
+    // ===== OPEN NEW POSITION IF NONE =====
     if (price >= liveR) {
-        if (pos.side === 'LONG' && roi < CONFIG.MIN_ROI) {
-            io.emit('log', `➕ SCALE LONG | ROI ${roi.toFixed(2)}% < ${CONFIG.MIN_ROI}%`);
-            await placeOrder('buy', CONFIG.TRADE_QTY, io);
-            return;
-        }
-        if (pos.side === 'SHORT') await closePosition(io);
-        if (pos.side !== 'LONG') await placeOrder('buy', CONFIG.TRADE_QTY, io);
+        await placeOrder('buy', CONFIG.TRADE_QTY, io);
         state.positions.openResistance = liveR;
         state.positions.openSupport = liveS;
-        state.status = 'REVERSAL LONG';
-        return;
-    }
-
-    // ===== LIVE SUPPORT =====
-    if (price <= liveS) {
-        if (pos.side === 'SHORT' && roi < CONFIG.MIN_ROI) {
-            io.emit('log', `➕ SCALE SHORT | ROI ${roi.toFixed(2)}% < ${CONFIG.MIN_ROI}%`);
-            await placeOrder('sell', CONFIG.TRADE_QTY, io);
-            return;
-        }
-        if (pos.side === 'LONG') await closePosition(io);
-        if (pos.side !== 'SHORT') await placeOrder('sell', CONFIG.TRADE_QTY, io);
+        state.status = 'OPEN LONG';
+    } else if (price <= liveS) {
+        await placeOrder('sell', CONFIG.TRADE_QTY, io);
         state.positions.openSupport = liveS;
         state.positions.openResistance = liveR;
-        state.status = 'REVERSAL SHORT';
-        return;
+        state.status = 'OPEN SHORT';
+    } else {
+        state.status = 'RANGING';
     }
 
-    state.status = pos.side ? 'HOLD' : 'RANGING';
     state.support = liveS;
     state.resistance = liveR;
     emitStats(io);
@@ -270,7 +272,7 @@ socket.on('stats', d=>{
     pos.className = d.posType==='LONG'?'val pos-LONG':d.posType==='SHORT'?'val pos-SHORT':'val';
     q.innerText = d.qty ?? 0;
     e.innerText = d.entry?.toFixed(4) ?? 0;
-    roi.innerText = d.roi?.toFixed(2) ?? 0;
+    roi.innerText = d.roi?.toFixed(3) ?? 0;
     s.innerText = d.status || '--';
     u.innerText = (d.unrealizedPnL ?? 0).toFixed(6);
     r.innerText = (d.realizedPnL ?? 0).toFixed(6);
