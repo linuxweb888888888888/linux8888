@@ -9,11 +9,19 @@ const express = require('express');
 const http = require('http');
 const { Server } = require('socket.io');
 const ccxt = require('ccxt');
+const minimist = require('minimist');
+
+// ==================== PARSE ARGV ====================
+const args = minimist(process.argv.slice(2));
+
+const COIN = args.coin?.toUpperCase() || 'ADA';       // default ADA
+const TRADE_QTY = parseFloat(args.quantity) || 0.01;  // default 0.01
+const PORT = parseInt(args.port);             // default 3000
 
 const CONFIG = {
-    PRICE_SYMBOL: 'ADA/USDT',
-    ORDER_SYMBOL: 'ADA/USDT:USDT',
-    TRADE_QTY: 0.01,
+    PRICE_SYMBOL: `${COIN}/USDT`,
+    ORDER_SYMBOL: `${COIN}/USDT:USDT`,
+    TRADE_QTY,
     PRICE_RATE: 2000,
     LOOKBACK_PERIOD: 50,
     FREEZE_DURATION: 5000,
@@ -216,8 +224,8 @@ const io = new Server(server);
 
 app.get('/', (_, res) => res.send(DASHBOARD_HTML));
 
-server.listen(3000, () => {
-    console.log('🚀 BOT STARTED');
+server.listen(PORT, () => {
+    console.log(`🌐 Dashboard running on http://localhost:${PORT}`);
     runBot(io);
 });
 
@@ -240,7 +248,7 @@ body{background:#0b0e11;color:#eaeaea;font-family:sans-serif;padding:20px}
 </style>
 </head>
 <body>
-<h2>⚡ ADAUSDT PHEMEX PERPETUAL BOT</h2>
+<h2>⚡ GENIUS BOT</h2>
 <div class="header">
 <div class="stat"><div class="label">PRICE</div><div class="val" id="p">--</div></div>
 <div class="stat"><div class="label">BID</div><div class="val" id="b">--</div></div>
