@@ -1,7 +1,9 @@
 /******************************************************************************************
- * ⚡ ADAUSDT PHEMEX BOT — FULL DASHBOARD + ROI SCALING 0.2%
- * - Only scale/open at exact support/resistance
- * - No direction change until current position is closed
+ * ⚡ ADAUSDT PHEMEX BOT — FULL DASHBOARD + ROI SCALE/CLOSE/REVERSE
+ * - Reverse if ROI < -0.2% at support/resistance
+ * - Scale if ROI between -0.2% and 0.2% at support/resistance
+ * - Close if ROI >= 0.2% at support/resistance
+ * - Only open/scale/reverse/close at exact support/resistance
  ******************************************************************************************/
 
 require('dotenv').config();
@@ -14,9 +16,9 @@ const minimist = require('minimist');
 // ==================== PARSE ARGV ====================
 const args = minimist(process.argv.slice(2));
 
-const COIN = args.coin?.toUpperCase() || 'ADA';       // default ADA
-const TRADE_QTY = parseFloat(args.quantity) || 0.01;  // default 0.01
-const PORT = parseInt(args.port);             // default 3000
+const COIN = args.coin?.toUpperCase() || 'ADA';
+const TRADE_QTY = parseFloat(args.quantity) || 0.01;
+const PORT = parseInt(args.port) || 3000;
 
 const CONFIG = {
     PRICE_SYMBOL: `${COIN}/USDT`,
@@ -25,7 +27,7 @@ const CONFIG = {
     PRICE_RATE: 2000,
     LOOKBACK_PERIOD: 50,
     FREEZE_DURATION: 5000,
-    ROI_THRESHOLD: 0.2 // ROI threshold %
+    ROI_THRESHOLD: 0.2 // 0.2% threshold
 };
 
 const state = {
@@ -165,20 +167,26 @@ async function strategy(io) {
 
     io.emit('log', `DEBUG | side=${pos.side} price=${price.toFixed(4)} ROI=${roi.toFixed(2)}%`);
 
-    // ===== SCALE OR CLOSE POSITION =====
+    // ===== SCALE/CLOSE/REVERSE LOGIC =====
     if (pos.side) {
         if (price === state.support || price === state.resistance) {
-            if (roi < CONFIG.ROI_THRESHOLD) {
-                io.emit('log', `➕ SCALE ${pos.side} | ROI ${roi.toFixed(2)}% < ${CONFIG.ROI_THRESHOLD}%`);
+            if (roi < -CONFIG.ROI_THRESHOLD) {
+                io.emit('log', `🔄 REVERSE ${pos.side} | ROI ${roi.toFixed(2)}% < -${CONFIG.ROI_THRESHOLD}%`);
+                await closePosition(io);
+                const newSide = pos.side === 'LONG' ? 'sell' : 'buy';
+                await placeOrder(newSide, CONFIG.TRADE_QTY, io);
+                state.status = 'REVERSED';
+            } else if (roi >= -CONFIG.ROI_THRESHOLD && roi < CONFIG.ROI_THRESHOLD) {
+                io.emit('log', `➕ SCALE ${pos.side} | ROI ${roi.toFixed(2)}% between -${CONFIG.ROI_THRESHOLD}% and ${CONFIG.ROI_THRESHOLD}%`);
                 await placeOrder(pos.side === 'LONG' ? 'buy' : 'sell', CONFIG.TRADE_QTY, io);
                 state.status = 'SCALING';
-            } else {
+            } else if (roi >= CONFIG.ROI_THRESHOLD) {
                 io.emit('log', `🛑 CLOSE ${pos.side} | ROI ${roi.toFixed(2)}% >= ${CONFIG.ROI_THRESHOLD}%`);
                 await closePosition(io);
                 state.status = 'CLOSED';
             }
         } else {
-            io.emit('log', `⏸ HOLD ${pos.side} | Price in-between S/R, ROI=${roi.toFixed(2)}%`);
+            io.emit('log', `⏸ HOLD ${pos.side} | Price not at support/resistance, ROI=${roi.toFixed(2)}%`);
             state.status = 'HOLDING';
         }
 
