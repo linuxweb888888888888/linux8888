@@ -1,498 +1,352 @@
-#!/usr/bin/env python3
-import ccxt
-import time
-import numpy as np
-import pandas as pd
-from rich.console import Console
-from rich.table import Table
-from rich.panel import Panel
-from rich.live import Live
-from sklearn.linear_model import SGDRegressor
-from sklearn.preprocessing import StandardScaler
-import subprocess
-import os
-import random
-
-console = Console()
-
-# ============================
-# CONFIG
-# ============================
-SYMBOL = "ATOM/USDT"
-BASE = "ATOM"
-QUOTE = "USDT"
-MIN_QTY = 0.001
-MAX_POSITIONS = 10
-FEE_RATE = 0.001
-UPDATE_INTERVAL = 1
-MODEL_WINDOW = 50
-CONF_THRESHOLD = 0.2
-MAX_CONFIDENCE = 1
-HTML_DASHBOARD_FILE = "/var/www/html/dashboard.html"
-SOFT_STOP_LOSS = -0.05
-ULTRA_FAST_WINDOW = 5
-TRAILING_MULTIPLIER = 1.5
-WALLET_RISK_BASE = 0.35
-SIM_PNL_WEIGHT = 0.3
-MAX_SIM_POSITIONS = 20
-MICRO_PROFIT_TARGET = 0.001  # 0.1% target
-
-# ============================
-# EXCHANGE INIT
-# ============================
-exchange = ccxt.hitbtc({"enableRateLimit": True})
-
-# ============================
-# STATE
-# ============================
-open_positions = []
-background_sim_positions = []
-profit_history = []
-pred_history = []
-model = SGDRegressor(max_iter=1, tol=None, learning_rate="invscaling", eta0=0.01, warm_start=True)
-model_initialized = False
-scaler_X = StandardScaler()
-scaler_y = StandardScaler()
-wallet_learning = {"signal_history": [], "adjustment_factor": 1.0, "wallet_history": []}
-current_direction = None
-starting_wallet = None
-tick_history = []
-
-# ============================
-# DATA FUNCTIONS
-# ============================
-def get_ohlcv():
-    try:
-        data = exchange.fetch_ohlcv(SYMBOL, timeframe="1m", limit=MODEL_WINDOW)
-        df = pd.DataFrame(data, columns=["time","open","high","low","close","volume"])
-        return df
-    except:
-        return None
-
-def get_tick_data():
-    try:
-        orderbook = exchange.fetch_order_book(SYMBOL)
-        bid = orderbook['bids'][0][0] if orderbook['bids'] else 0
-        ask = orderbook['asks'][0][0] if orderbook['asks'] else 0
-        mid = (bid + ask)/2 if bid and ask else None
-        return bid, ask, mid
-    except:
-        return None, None, None
-
-def get_wallet_balance():
-    try:
-        if not os.path.exists("/wallet.sh"): return 0
-        result = subprocess.run(["bash", "/wallet.sh"], capture_output=True, text=True)
-        return float(result.stdout.strip())
-    except:
-        return 0
-
-def get_coin_real_info():
-    try:
-        if not open_positions:  # Only when open positions exist
-            return None
-        if not os.path.exists("/coinrealinfo.sh"): return None
-        result = subprocess.run(["bash", "/coinrealinfo.sh", BASE+QUOTE+"_PERP"], capture_output=True, text=True)
-        lines = result.stdout.strip().split("\n")
-        entry = qty = pnl = None
-        for line in lines:
-            if line.startswith("Quantity:"): qty=float(line.split(":")[1].strip())
-            elif line.startswith("Entry Price:"): entry=float(line.split(":")[1].strip())
-            elif line.startswith("PnL:"): pnl=float(line.split(":")[1].strip())
-        if entry is not None and qty is not None and pnl is not None:
-            return {"entry": entry, "qty": qty, "pnl": pnl}
-        return None
-    except:
-        return None
-
-# ============================
-# MODEL FUNCTIONS
-# ============================
-def train_model_incremental(df):
-    global model_initialized
-    try:
-        df['mid'] = (df['high'] + df['low'])/2
-        X = np.arange(len(df)).reshape(-1,1)
-        y = df['mid'].values.reshape(-1,1)
-        if not model_initialized:
-            X_scaled = scaler_X.fit_transform(X)
-            y_scaled = scaler_y.fit_transform(y).ravel()
-            model.partial_fit(X_scaled, y_scaled)
-            model_initialized = True
-        else:
-            X_scaled = scaler_X.transform(X[-5:])
-            y_scaled = scaler_y.transform(y[-5:]).ravel()
-            model.partial_fit(X_scaled, y_scaled)
-    except:
-        pass
-
-def predict_pnl_direction(df):
-    try:
-        if not model_initialized: return 0,0
-        bid, ask, mid = get_tick_data()
-        if mid is None: return 0,0
-        X_future = np.array([[len(df)]])
-        X_scaled = scaler_X.transform(X_future)
-        pred_scaled = model.predict(X_scaled)[0]
-        pred = scaler_y.inverse_transform([[pred_scaled]])[0][0]
-        change = pred - mid
-        sim_effect = 0
-        for pos in background_sim_positions:
-            pnl_val = pos.get("realized_pnl")
-            if pnl_val is not None:
-                sim_effect += pnl_val
-            else:
-                sim_effect += (mid - pos['entry']) if pos['side']=='buy' else (pos['entry'] - mid)
-        if background_sim_positions: sim_effect /= len(background_sim_positions)
-        change += sim_effect
-        change = max(min(change, mid*0.01), -mid*0.01)
-        confidence = min(MAX_CONFIDENCE, max(0.01, abs(change)/(mid*0.01)))
-        pred_history.append(change)
-        if len(pred_history) > 3: pred_history.pop(0)
-        smoothed_change = sum(pred_history)/len(pred_history)
-        return smoothed_change, confidence
-    except:
-        return 0,0
-
-# ============================
-# ULTRA-FAST SIGNALS
-# ============================
-def get_ultra_fast_signal():
-    if len(tick_history) < 3: return "hold"
-    delta = tick_history[-1] - tick_history[-3]
-    if delta > 0: return "buy"
-    if delta < 0: return "sell"
-    return "hold"
-
-def get_orderbook_signal(orderbook):
-    try:
-        bid_vol = sum([b[1] for b in orderbook['bids'][:5]])
-        ask_vol = sum([a[1] for a in orderbook['asks'][:5]])
-        if bid_vol > ask_vol * 1.2: return "buy"
-        elif ask_vol > bid_vol * 1.2: return "sell"
-        return "hold"
-    except:
-        return "hold"
-
-# ============================
-# ORDER FUNCTIONS
-# ============================
-def execute_real_order(side, qty):
-    inverted_side = 'sell' if side=='buy' else 'buy'
-    qty_str = f"{round(qty,6):.6f}"
-    try:
-        if not os.path.exists("/placeorder.sh"): return False
-        result = subprocess.run(["bash", "/placeorder.sh", BASE, qty_str, inverted_side], capture_output=True, text=True)
-        out = result.stdout.strip()
-        return "SUCCESS" in out.upper()
-    except: return False
-
-def calc_order_qty(wallet, price, predicted_profit=0):
-    adjustment = wallet_learning.get("adjustment_factor", 1.0)
-    use_usdt = wallet * WALLET_RISK_BASE * adjustment
-    multiplier = min(TRAILING_MULTIPLIER, 1 + predicted_profit*5)
-    qty = use_usdt / price * multiplier
-    return max(MIN_QTY, np.floor(qty*1000000)/1000000)
-
-def add_position(side, qty, entry_price):
-    coin_info = get_coin_real_info()
-    if coin_info:
-        entry_price = coin_info['entry']
-        qty = coin_info['qty']
-    if len(open_positions) < MAX_POSITIONS:
-        open_positions.append({
-            "side": side,
-            "qty": qty,
-            "entry": entry_price,
-            "time": time.time(),
-            "realized_pnl": 0,
-            "trailing_stop": None
-        })
-
-# ============================
-# PNL FUNCTIONS
-# ============================
-def update_real_pnl():
-    coin_info = get_coin_real_info()
-    bid, ask, mid = get_tick_data()
-    if mid is None: return
-    for pos in open_positions:
-        qty = pos['qty']
-        entry = pos['entry']
-        if coin_info and abs(coin_info['qty'] - qty)<0.0001:
-            entry = coin_info['entry']
-            qty = coin_info['qty']
-        if pos['side']=='buy':
-            current_price = bid if bid else mid
-            pos['realized_pnl'] = (current_price - entry)*qty - qty*FEE_RATE*current_price
-        else:
-            current_price = ask if ask else mid
-            pos['realized_pnl'] = (entry - current_price)*qty - qty*FEE_RATE*current_price
-        pos['qty']=qty
-        pos['entry']=entry
-
-def close_positions_if_profitable():
-    global open_positions, profit_history
-    keep=[]; cycle_pnl=0
-    update_real_pnl()
-    bid, ask, mid = get_tick_data()
-    if mid is None: return
-    wallet = get_wallet_balance()
-    for pos in open_positions:
-        pnl = pos.get('realized_pnl',0)
-        exit_side = 'sell' if pos['side']=='buy' else 'buy'
-        if pos['trailing_stop'] is None:
-            pos['trailing_stop'] = mid*(1-0.01 if pos['side']=='buy' else 1+0.01)
-        micro_target = pos['entry']*(1+MICRO_PROFIT_TARGET if pos['side']=='buy' else 1-MICRO_PROFIT_TARGET)
-        close_cond = (pos['side']=='buy' and mid >= micro_target) or (pos['side']=='sell' and mid <= micro_target)
-        if pos['side']=='buy':
-            pos['trailing_stop'] = max(pos['trailing_stop'], mid*(1-0.005))
-        else:
-            pos['trailing_stop'] = min(pos['trailing_stop'], mid*(1+0.005))
-        if close_cond or ((pos['side']=='buy' and mid < pos['trailing_stop']) or (pos['side']=='sell' and mid > pos['trailing_stop'])):
-            if execute_real_order(exit_side, pos['qty']):
-                cycle_pnl += pnl
-                wallet_learning["signal_history"].append((pos['side'], pnl, 1.0))
-        else:
-            keep.append(pos)
-    open_positions = keep
-    profit_history.append(cycle_pnl)
-    global starting_wallet
-    if starting_wallet is None: starting_wallet=wallet
-    wallet_learning['wallet_history'].append(wallet)
-    if len(wallet_learning['wallet_history'])>5: wallet_learning['wallet_history'].pop(0)
-    smoothed_wallet = sum(wallet_learning['wallet_history'])/len(wallet_learning['wallet_history'])
-    wallet_delta = smoothed_wallet - starting_wallet
-    # --- Learning from real and simulated trades ---
-    mid_price = mid or 0
-    real_feedback = sum(pnl for side,pnl,_ in wallet_learning["signal_history"][-5:])
-    sim_feedback = 0
-    if background_sim_positions:
-        sim_feedback = sum((mid_price - p['entry']) if p['side']=='buy' else (p['entry'] - mid_price) for p in background_sim_positions) / len(background_sim_positions)
-    factor = 1 + (real_feedback + SIM_PNL_WEIGHT * sim_feedback)/(starting_wallet if starting_wallet else 1)
-    if wallet_delta<0: factor *= max(0.6, 1 - abs(wallet_delta)/(starting_wallet if starting_wallet else 1))
-    wallet_learning['adjustment_factor'] = max(0.5, min(2.0, factor))
-
-# ============================
-# BACKGROUND SIMULATION
-# ============================
-def simulate_realistic_background(mid_price, n_trades=3):
-    global background_sim_positions
-    for _ in range(n_trades):
-        sim_side = random.choice(['buy','sell'])
-        background_sim_positions.append({"side": sim_side, "entry": mid_price, "realized_pnl": None})
-    if len(background_sim_positions) > MAX_SIM_POSITIONS:
-        background_sim_positions = background_sim_positions[-MAX_SIM_POSITIONS:]
-    background_sim_positions = [p for p in background_sim_positions if p.get('realized_pnl') is None]
-
-# ============================
-# DASHBOARD
-# ============================
-def render_dashboard(signal, pred, conf, bid, ask, mid, wallet, wallet_delta, wallet_delta_percent):
-    try:
-        graded_pnl = sum(pos.get('realized_pnl',0) for pos in open_positions)
-        positions_html = "".join([f"<div class='card'><h3>Pos {i+1} {p['side'].upper()}</h3><p>Qty:{p['qty']:.6f}</p><p>Entry:{p['entry']:.6f}</p><p>PnL:<span style='color:{'green' if p['realized_pnl']>0 else 'red'}'>{p['realized_pnl']:.8f}</span></p></div>" for i,p in enumerate(open_positions)])
-        sims_html = f"<p>Background Simulations: {len(background_sim_positions)}</p>"
-        wallet_color="green" if wallet_delta>0 else "red" if wallet_delta<0 else "grey"
-        wallet_sign="+" if wallet_delta>0 else "-" if wallet_delta<0 else ""
-        pred_text = f"↑ {pred:.8f}" if pred>0 else f"↓ {pred:.8f}" if pred<0 else f"→ {pred:.8f}"
-        metrics_html=f"<div class='metrics'><div class='card'><h3>Signal</h3><p>{signal}</p></div><div class='card'><h3>Prediction</h3><p>{pred_text}</p></div><div class='card'><h3>Confidence</h3><p>{conf:.2f}</p></div><div class='card'><h3>Bid</h3><p>{bid:.8f}</p></div><div class='card'><h3>Ask</h3><p>{ask:.8f}</p></div><div class='card'><h3>Mid</h3><p>{mid:.8f}</p></div><div class='card'><h3>Wallet</h3><p style='color:{wallet_color};'>{wallet:.8f} ({wallet_sign}{abs(wallet_delta):.8f}, {wallet_sign}{abs(wallet_delta_percent):.2f}%)</p></div><div class='card'><h3>Open Positions</h3><p>{len(open_positions)}</p></div><div class='card'><h3>Graded PnL</h3><p>{graded_pnl:.8f}</p></div></div>"
-        profit_html="<div class='card'><h3>Profit History</h3><ul>"+ "".join([f"<li style='color:{'green' if pnl>=0 else 'red'}'>Cycle {len(profit_history)-10+i+1}: {pnl:.8f}</li>" for i,pnl in enumerate(profit_history[-10:])]) + "</ul></div>"
-        html_content=f"<html><head><meta charset='utf-8'><meta http-equiv='refresh' content='1'><style>body{{font-family:Roboto;background:#f5f5f5}}.metrics{{display:flex;flex-wrap:wrap;}}.card{{background:#fff;border-radius:8px;padding:15px;margin:10px;min-width:150px;box-shadow:0 4px 6px rgba(0,0,0,0.1);}} ul{{padding-left:20px}}</style></head><body><h1>ATOM Bot Dashboard</h1>{metrics_html}{profit_html}<div class='positions'>{positions_html}</div><div class='footer' style='text-align:center;margin:20px'>{sims_html}</div></body></html>"
-        with open(HTML_DASHBOARD_FILE,"w") as f: f.write(html_content)
-        table = Table(title="ATOM Bot")
-        table.add_column("Metric"); table.add_column("Value")
-        table.add_row("Signal",signal); table.add_row("Prediction Δ",f"{pred:.8f}"); table.add_row("Confidence",f"{conf:.2f}")
-        table.add_row("Bid",f"{bid:.8f}"); table.add_row("Ask",f"{ask:.8f}"); table.add_row("Mid",f"{mid:.8f}")
-        table.add_row("Wallet",f"{wallet:.8f} ({wallet_sign}{abs(wallet_delta):.8f}, {wallet_sign}{abs(wallet_delta_percent):.2f}%)")
-        table.add_row("Graded PnL", f"{graded_pnl:.8f}")
-        table.add_row("Open Positions",str(len(open_positions)))
-        for idx, pos in enumerate(open_positions): table.add_row(f"Pos{idx+1} {pos['side']}", f"Qty={pos['qty']:.6f} Entry={pos['entry']:.6f} PnL={pos.get('realized_pnl',0):.8f}")
-        for idx, pnl in enumerate(profit_history[-10:]): table.add_row(f"Profit Cycle {len(profit_history)-10+idx+1}", f"{pnl:.8f}")
-        return Panel(table, title="Status")
-    except:
-        return Panel("[red]Dashboard Error[/red]")
-
-# ============================
-# CLOSE POSITIONS AT START
-# ============================
-def close_opposite_positions():
-    try:
-        if os.path.exists("/closepositions.sh"):
-            subprocess.run(["bash","/closepositions.sh"])
-    except:
-        pass
-
-# ============================
-# MAIN LOOP
-# ============================
-def main():
-    global tick_history, starting_wallet, current_direction
-    console.print("[green]Starting ATOM/USDT ultra-fast bot...[/green]")
-    close_opposite_positions()
-    with Live(refresh_per_second=4) as live:
-        while True:
-            try:
-                df=get_ohlcv()
-                if df is None or len(df)<MODEL_WINDOW: time.sleep(1); continue
-                train_model_incremental(df)
-                tick_bid, tick_ask, tick_mid=get_tick_data()
-                if tick_mid is not None: tick_history.append(tick_mid)
-                if len(tick_history)>10: tick_history=tick_history[-10:]
-                signal_fast=get_ultra_fast_signal()
-                pred, conf=predict_pnl_direction(df)
-                wallet=get_wallet_balance()
-                wallet_delta = wallet - (starting_wallet if starting_wallet else wallet)
-                wallet_delta_percent = (wallet_delta/(starting_wallet if starting_wallet else 1))*100 if starting_wallet else 0
-                render_dashboard(signal_fast, pred, conf, tick_bid, tick_ask, tick_mid or 0, wallet, wallet_delta, wallet_delta_percent)
-                simulate_realistic_background(tick_mid or 0, n_trades=2)
-                close_positions_if_profitable()
-                # --- Decide to enter ---
-                if signal_fast in ['buy','sell']:
-                    qty=calc_order_qty(wallet, tick_mid or 1, pred)
-                    add_position(signal_fast, qty, tick_mid)
-                live.update(render_dashboard(signal_fast, pred, conf, tick_bid, tick_ask, tick_mid or 0, wallet, wallet_delta, wallet_delta_percent))
-                time.sleep(UPDATE_INTERVAL)
-            except Exception as e:
-                console.print(f"[red]{e}[/red]")
-                time.sleep(1)
-
-if __name__=="__main__":
-    main()
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-####UPGRADE BOT WITH ALL FEATURES####
-
-# Use coin minimum quantity for scaling and when increasing/decreasing positions
-# Do not open real positions smaller than the minimum coin quantity of 0.001 for ATOM
-# Continuously learn and adapt
-# Generate trading signals faster
-# Scale order positions for maximum profit
-# Increase wallet gains according to predicted profit
-# Achieve fast USDT wallet growth
-# Place order quantity based on wallet usage; justify amounts and adapt dynamically
-# Improve wallet learning for maximum profit
-# Get wallet balance from wallet.sh in USDT
-# Learn for stacked positions in one direction
-# Improve open trade (opentrade) learning
-# Use only a terminal rich dashboard
-# Output order results via placeorder.sh – show SUCCESS if orders successful, ERROR if not
-# Learn wallet amount according to profit and adapt
-# Simulate background positions to improve learning and adapt to real PnL and profit
-# Place orders faster with signal updates
-# Write output to HTML dashboard at /var/www/html/dashboard.html using a static Material Design clean layout (no charts)
-# Open trades based on wallet amount and calculate for maximum profit
-# Add confidence and accuracy to predictions
-# Check calculations to ensure order placement within 1 minute
-# Calculate wallet threshold before placing orders; use only enough quantity to increase profit
-# Calculate and learn profitable trades; adapt using background simulated trades
-# Use wallet amount to calculate open trades and quantity with PnL prediction for maximum profit
-# Never use Plotly
-# Place real orders via placeorder.sh
-# Improve PnL learning and open trade performance
-# Take profit when PnL covers fees or predicted profit can be made; close positions accordingly
-# Material Design dashboard must be static, updated with information only
-# Focus on ATOM only (no multi-symbol trading)
-# Direction mapping: buy = long = uptrend, sell = short = downtrend
-# Learn and adapt minimum open position (0.001 ATOM)
-# Use bid and ask for mid and real prices; adapt and learn
-# Fix issues:
-  # Module 'sklearn' has no attribute 'SGDRegressor'
-  # KeyErrors
-  # Background simulations
-  # Dashboard not writing HTML data
-  # Blank dashboard.html in browser
-  # Buy/sell loop not starting
-  # Library errors/exceptions/warnings for numpy, pandas, sklearn
-  # wallet change feature show increased or decreased profit or loss in percentage not cumulating or decumalating
-  # Coin info fetch error: could not convert string to float: coinrealinfo.sh
-  # bot not writing to html file
-  # also fix warning and errors and exceptions if found
-  # background simulation count not showing html dashboard
-# Make script ready to run
-# Always place real trades when profitable; never dry run
-# Enable multi-sizing and multi-positions
-# Increase learning to grow USDT wallet
-# When wallet usage is full, check where positions can be closed and opened for maximum profit; adapt accordingly
-# Continuously learn PnL
-# add real pnl for each entryprice trade
-# trade in smaller quantity but with more profitable predictions and profit
-# fix profit hitory trend make readable
-# make prediction human readable in dashboard
-# show signal accuracy in dashboard for prediction
-# close all trades with bash script closepositions.sh when start bot
-# calculate real accurate pnl for calculations
-# upgrade html dashboard make more advanced
-# upgrade bot make more advanced
-# quantity can only be in steps of 0.001 or minimum quantity of coin learn and adapt for increasing or decreasing positions
-# entryprice when order place is current bid or ask price calculate learn and adapt calculate according to direction
-# bid and ask should not be the same price ord mid price learn and adapt
-# when opening trade use current bid or ask for entryprice according to direction learn and adapt
-# display pnl in html dashboard in decimal stil use real prices and pnl and other real factors
-# while opening orders make the prices stil update while opening trades or orders
-#calculate learning and adaptiveness on the updated decimals and try to improve accuraccy and profit and wallet growth and pnl prediction stil use real prices and pnl and other real factors
-# if direction sell calculate pnl with bid price if direction buy calculate pnl with ask price learning accordingly and adapt
-# if open position direction sell entryprice should be ask price and if open position direction buy entryprice should be bid price calculate pnl according learn and adapt
-# use coinrealinfo.sh for accurate learning and accurate adapting real open trade can be calculated with quantity can also get real pnl and learn from that also the entryprice is in coinrealinfo.sh can run the bash script with bash /coinrealinfo.sh ATOMUSDT_PERP only need coin name to get info like ATOMUSDT_PERP use the info to adapt and learn to calculate accurate calculations fot profit and other metrics and factors learn and adapt acording all this is for all open position and almost like a summary
-# if coinrealinfo.sh pnl not available calculate with entryprice in coinrealinfo.sh should get accurate pnl then
-# use only coinrealinfo.sh entryprice for total pnl and profit calculate all other learning and adapt and all other profit methods and all other calculations according to making profit including everything else
-# display wins and losses in html dashboard and calculate pnl profit according to being in the positive total pnl must be average entryprice of positions entryprice calculated with prices adapt
-# get avg entryprice from and entryprice for positions from coinrealinfo.sh to show real pnl and accurrate reading for profit pnl calculate according adapt and learn
-# when bot opens real position positions then use coinrealinfo script do not change other logic adapt and learn
-# if real open position or positions coinrealinfo.sh output of real values if not output will show NO INFO to make more simpler do not change dashboard html only use in calculations and to learn and adapt
-# coinrealinfo.sh It only handles one position increment of quantity is the multiple positions adapt and learn accordingly
-# learn when to open and close new position or positions at wright price for improved and for gaining profit can open multiple quantity one quantity at a time if profit can be gained with higher pnl
-# improve pnl learning for more prove pnl indicates profit to be made
-# learn to increase real pnl by adapting and learning
-# calculate position or positions pnl according to coinrealinfo try to place order to increase pnl at the right price learn and adapt to positions pnl according to real total pnl
+/******************************************************************************************
+ * ⚡ ADAUSDT PHEMEX BOT — FULL DASHBOARD + ROI SCALE/CLOSE/REVERSE
+ * - Reverse exactly once when price crosses support/resistance
+ * - Scale if ROI between -0.2% and 0.2% at support/resistance
+ * - Close if ROI >= 0.2% at support/resistance
+ * - Only open/scale/reverse/close at exact support/resistance (with tolerance for scaling)
+ ******************************************************************************************/
+
+require('dotenv').config();
+const express = require('express');
+const http = require('http');
+const { Server } = require('socket.io');
+const ccxt = require('ccxt');
+const minimist = require('minimist');
+
+// ==================== PARSE ARGV ====================
+const args = minimist(process.argv.slice(2));
+
+const COIN = args.coin?.toUpperCase() || 'ADA';
+const TRADE_QTY = parseFloat(args.quantity) || 0.01;
+const PORT = parseInt(args.port) || 3000;
+
+const CONFIG = {
+    PRICE_SYMBOL: `${COIN}/USDT`,
+    ORDER_SYMBOL: `${COIN}/USDT:USDT`,
+    TRADE_QTY,
+    PRICE_RATE: 2000,
+    LOOKBACK_PERIOD: 50,
+    FREEZE_DURATION: 5000,
+    ROI_THRESHOLD: 0.2, // 0.2% threshold for scaling/closing
+    SR_TOLERANCE: 0.001 // only for scaling logic
+};
+
+const state = {
+    positions: { qty: 0, entry: 0, side: null, openSupport: 0, openResistance: 0 },
+    history: [],
+    support: 0,
+    resistance: 0,
+    frozenSupport: 0,
+    frozenResistance: 0,
+    price: 0,
+    bid: 0,
+    ask: 0,
+    realizedPnL: 0,
+    recentOrders: [],
+    freezeTimeout: null,
+    status: 'INIT',
+    lastAction: null
+};
+
+const exchange = new ccxt.phemex({
+    apiKey: process.env.PHEMEX_KEY,
+    secret: process.env.PHEMEX_SECRET,
+    enableRateLimit: true,
+    options: { defaultType: 'swap' }
+});
+
+// ==================== UTILS ====================
+function calcROI(pos, price) {
+    if (!pos.side || pos.qty <= 0) return 0;
+    if (pos.side === 'LONG') return ((price - pos.entry) / pos.entry) * 100;
+    if (pos.side === 'SHORT') return ((pos.entry - price) / pos.entry) * 100;
+    return 0;
+}
+
+async function fetchPrice() {
+    const t = await exchange.fetchTicker(CONFIG.PRICE_SYMBOL);
+    state.bid = t.bid;
+    state.ask = t.ask;
+    state.price = (t.bid + t.ask) / 2;
+}
+
+async function syncPositions(io) {
+    let positions = [];
+    try { positions = await exchange.fetchPositions([CONFIG.ORDER_SYMBOL]); }
+    catch { positions = await exchange.fetchPositions(); }
+
+    const pos = positions.find(p => p.symbol === CONFIG.ORDER_SYMBOL) || {};
+    let side = null;
+    let qty = Number(pos.contracts || 0);
+    let entry = Number(pos.entryPrice || 0);
+
+    if (pos.side) {
+        const s = pos.side.toLowerCase();
+        if (s === 'buy' || s === 'long') side = 'LONG';
+        if (s === 'sell' || s === 'short') side = 'SHORT';
+    }
+
+    if (!side || qty <= 0) state.positions = { qty: 0, entry: 0, side: null, openSupport: 0, openResistance: 0 };
+    else {
+        state.positions.side = side;
+        state.positions.qty = qty;
+        state.positions.entry = entry;
+    }
+
+    io.emit('log', `[SYNC] pos=${state.positions.side || 'NONE'} qty=${state.positions.qty}`);
+}
+
+async function placeOrder(side, qty, io) {
+    io.emit('log', `[ORDER] ${side.toUpperCase()} ${qty}`);
+    await exchange.createOrder(CONFIG.ORDER_SYMBOL, 'market', side, qty);
+
+    state.recentOrders.unshift({ side, qty, price: state.price, time: new Date().toLocaleTimeString() });
+    if (state.recentOrders.length > 50) state.recentOrders.pop();
+
+    await new Promise(r => setTimeout(r, 400));
+    await syncPositions(io);
+}
+
+async function closePosition(io) {
+    const pos = state.positions;
+    if (!pos.side) return;
+    const side = pos.side === 'LONG' ? 'sell' : 'buy';
+    if (pos.side === 'LONG') state.realizedPnL += (state.price - pos.entry) * pos.qty;
+    if (pos.side === 'SHORT') state.realizedPnL += (pos.entry - state.price) * pos.qty;
+    await exchange.createOrder(CONFIG.ORDER_SYMBOL, 'market', side, pos.qty);
+    state.positions = { qty: 0, entry: 0, side: null, openSupport: 0, openResistance: 0 };
+}
+
+function freezeLiveSR(s, r) {
+    if (state.freezeTimeout) clearTimeout(state.freezeTimeout);
+    state.frozenSupport = s;
+    state.frozenResistance = r;
+    state.freezeTimeout = setTimeout(() => {
+        state.frozenSupport = 0;
+        state.frozenResistance = 0;
+    }, CONFIG.FREEZE_DURATION);
+}
+
+function emitStats(io) {
+    const pos = state.positions;
+    let unrealizedPnL = 0;
+    let roi = 0;
+    if (pos.side === 'LONG') { unrealizedPnL = (state.price - pos.entry) * pos.qty; roi = calcROI(pos, state.price); }
+    if (pos.side === 'SHORT') { unrealizedPnL = (pos.entry - state.price) * pos.qty; roi = calcROI(pos, state.price); }
+
+    io.emit('stats', {
+        price: state.price,
+        bid: state.bid,
+        ask: state.ask,
+        support: state.support,
+        resistance: state.resistance,
+        frozenSupport: state.frozenSupport,
+        frozenResistance: state.frozenResistance,
+        posType: pos.side || 'NONE',
+        qty: pos.qty,
+        entry: pos.entry,
+        status: state.status,
+        realizedPnL: state.realizedPnL,
+        unrealizedPnL,
+        roi,
+        recentOrders: state.recentOrders,
+        entrySupport: pos.openSupport || state.support,
+        entryResistance: pos.openResistance || state.resistance
+    });
+}
+
+// ==================== STRATEGY ====================
+async function strategy(io) {
+    await fetchPrice();
+    await syncPositions(io);
+
+    const price = state.price;
+    state.history.push(price);
+    if (state.history.length > 300) state.history.shift();
+
+    const window = state.history.slice(-CONFIG.LOOKBACK_PERIOD);
+    const liveR = Math.max(...window);
+    const liveS = Math.min(...window);
+
+    freezeLiveSR(liveS, liveR);
+
+    const pos = state.positions;
+    const roi = calcROI(pos, price);
+
+    io.emit('log', `DEBUG | side=${pos.side} price=${price.toFixed(4)} ROI=${roi.toFixed(2)}%`);
+
+    // ===== REVERSAL LOGIC =====
+    if (pos.side) {
+        const crossedSupport = pos.side === 'LONG' && price <= liveS;
+        const crossedResistance = pos.side === 'SHORT' && price >= liveR;
+
+        if (crossedSupport || crossedResistance) {
+            io.emit('log', `🔄 REVERSE ${pos.side} | Price crossed S/R`);
+            await closePosition(io);
+            const newSide = pos.side === 'LONG' ? 'sell' : 'buy';
+            await placeOrder(newSide, CONFIG.TRADE_QTY, io);
+            state.status = 'REVERSED';
+            state.lastAction = 'REVERSED';
+            state.support = liveS;
+            state.resistance = liveR;
+            emitStats(io);
+            return; // exit this loop iteration
+        }
+
+        // ===== SCALE/CLOSE LOGIC =====
+        const atSR = Math.abs(price - liveS) < CONFIG.SR_TOLERANCE || Math.abs(price - liveR) < CONFIG.SR_TOLERANCE;
+        if (roi >= -CONFIG.ROI_THRESHOLD && roi < CONFIG.ROI_THRESHOLD && state.lastAction !== 'SCALING' && atSR) {
+            io.emit('log', `➕ SCALE ${pos.side} | ROI ${roi.toFixed(2)}%`);
+            await placeOrder(pos.side === 'LONG' ? 'buy' : 'sell', CONFIG.TRADE_QTY, io);
+            state.status = 'SCALING';
+            state.lastAction = 'SCALING';
+        } else if (roi >= CONFIG.ROI_THRESHOLD && state.lastAction !== 'CLOSED' && atSR) {
+            io.emit('log', `🛑 CLOSE ${pos.side} | ROI ${roi.toFixed(2)}%`);
+            await closePosition(io);
+            state.status = 'CLOSED';
+            state.lastAction = 'CLOSED';
+        } else {
+            io.emit('log', `⏸ HOLD ${pos.side} | Price not at S/R, ROI=${roi.toFixed(2)}%`);
+            state.status = 'HOLDING';
+            state.lastAction = null;
+        }
+
+        state.support = liveS;
+        state.resistance = liveR;
+        emitStats(io);
+        return;
+    }
+
+    // ===== OPEN NEW POSITION IF NONE =====
+    if (price >= liveR) {
+        await placeOrder('buy', CONFIG.TRADE_QTY, io);
+        state.positions.openResistance = liveR;
+        state.positions.openSupport = liveS;
+        state.status = 'OPEN LONG';
+        state.lastAction = 'OPEN LONG';
+    } else if (price <= liveS) {
+        await placeOrder('sell', CONFIG.TRADE_QTY, io);
+        state.positions.openSupport = liveS;
+        state.positions.openResistance = liveR;
+        state.status = 'OPEN SHORT';
+        state.lastAction = 'OPEN SHORT';
+    } else {
+        state.status = 'RANGING';
+        io.emit('log', `⏸ NO ACTION | Price in-between S/R`);
+        state.lastAction = null;
+    }
+
+    state.support = liveS;
+    state.resistance = liveR;
+    emitStats(io);
+}
+
+// ==================== RUN BOT ====================
+async function runBot(io) {
+    while (true) {
+        try { await strategy(io); } 
+        catch (e) { io.emit('log', e.message); }
+        await new Promise(r => setTimeout(r, CONFIG.PRICE_RATE));
+    }
+}
+
+// ============================ SERVER ============================
+const app = express();
+const server = http.createServer(app);
+const io = new Server(server);
+
+app.get('/', (_, res) => res.send(DASHBOARD_HTML));
+
+server.listen(PORT, () => {
+    console.log(`🌐 Dashboard running on http://localhost:${PORT}`);
+    runBot(io);
+});
+
+// ============================ DASHBOARD ============================
+const DASHBOARD_HTML = `
+<html>
+<head>
+<title>ADAUSDT Phemex Swap Bot</title>
+<script src="https://cdn.jsdelivr.net/npm/socket.io-client@4/dist/socket.io.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+<style>
+body{background:#0b0e11;color:#eaeaea;font-family:sans-serif;padding:20px}
+.header{display:grid;grid-template-columns:repeat(10,1fr);gap:10px;background:#181a20;padding:15px;border-radius:8px;}
+.stat{text-align:center;background:#2b3139;padding:10px;border-radius:5px}
+.label{font-size:11px;color:#848e9c}
+.val{font-size:15px;font-weight:bold;font-family:monospace}
+.pos-LONG{color:#0ecb81} .pos-SHORT{color:#f6465d}
+#chart-box{height:400px;background:#181a20;margin-top:15px}
+#log-box{height:150px;overflow:auto;background:#000;margin-top:15px;font-family:monospace;font-size:12px}
+</style>
+</head>
+<body>
+<h2>⚡ GENIUS BOT</h2>
+<div class="header">
+<div class="stat"><div class="label">PRICE</div><div class="val" id="p">--</div></div>
+<div class="stat"><div class="label">BID</div><div class="val" id="b">--</div></div>
+<div class="stat"><div class="label">ASK</div><div class="val" id="a">--</div></div>
+<div class="stat"><div class="label">POSITION</div><div class="val" id="pos">NONE</div></div>
+<div class="stat"><div class="label">QTY</div><div class="val" id="q">0</div></div>
+<div class="stat"><div class="label">ENTRY</div><div class="val" id="e">0</div></div>
+<div class="stat"><div class="label">ROI%</div><div class="val" id="roi">0</div></div>
+<div class="stat"><div class="label">UPNL</div><div class="val" id="u">0</div></div>
+<div class="stat"><div class="label">RPNL</div><div class="val" id="r">0</div></div>
+<div class="stat"><div class="label">STATUS</div><div class="val" id="s">--</div></div>
+</div>
+<div id="chart-box"><canvas id="c"></canvas></div>
+<div id="log-box"></div>
+<script>
+const socket = io();
+const logBox = document.getElementById('log-box');
+const ctx = document.getElementById('c');
+const MAX_POINTS = 300;
+const chart = new Chart(ctx,{
+    type:'line',
+    data:{labels:[],datasets:[
+        {label:'Price',data:[],borderColor:'#fcd535',pointRadius:0},
+        {label:'Resistance',data:[],borderColor:'#f6465d',pointRadius:0,stepped:true},
+        {label:'Support',data:[],borderColor:'#0ecb81',pointRadius:0,stepped:true},
+        {label:'Entry Resistance',data:[],borderColor:'rgba(246,70,93,0.5)',borderDash:[2,2],borderWidth:1.5,pointRadius:0,stepped:true},
+        {label:'Entry Support',data:[],borderColor:'rgba(14,203,129,0.5)',borderDash:[2,2],borderWidth:1.5,pointRadius:0,stepped:true}
+    ]},
+    options:{responsive:true,animation:false,scales:{y:{position:'right',grid:{color:'#2b3139'}}}}
+});
+
+socket.on('stats', d=>{
+    p.innerText = d.price?.toFixed(4) ?? '--';
+    b.innerText = d.bid?.toFixed(4) ?? '--';
+    a.innerText = d.ask?.toFixed(4) ?? '--';
+    pos.innerText = d.posType || 'NONE';
+    pos.className = d.posType==='LONG'?'val pos-LONG':d.posType==='SHORT'?'val pos-SHORT':'val';
+    q.innerText = d.qty ?? 0;
+    e.innerText = d.entry?.toFixed(4) ?? 0;
+    roi.innerText = d.roi?.toFixed(3) ?? 0;
+    s.innerText = d.status || '--';
+    u.innerText = (d.unrealizedPnL ?? 0).toFixed(6);
+    r.innerText = (d.realizedPnL ?? 0).toFixed(6);
+
+    if(chart.data.labels.length >= MAX_POINTS){
+        chart.data.labels.shift();
+        chart.data.datasets.forEach(ds=>ds.data.shift());
+    }
+
+    chart.data.labels.push(new Date().toLocaleTimeString());
+    chart.data.datasets[0].data.push(d.price ?? d.price);
+    chart.data.datasets[1].data.push(d.resistance ?? d.price);
+    chart.data.datasets[2].data.push(d.support ?? d.price);
+    chart.data.datasets[3].data.push(d.entryResistance || d.resistance);
+    chart.data.datasets[4].data.push(d.entrySupport || d.support);
+    chart.update('none');
+});
+
+socket.on('log', m=>{
+    const d = document.createElement('div');
+    d.innerText = new Date().toLocaleTimeString()+' '+m;
+    logBox.prepend(d);
+    if(logBox.children.length>200) logBox.removeChild(logBox.lastChild);
+});
+</script>
+</body>
+</html>
+`;
