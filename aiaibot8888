@@ -1,5 +1,5 @@
 /******************************************************************************************
- * ⚡ Phemex Ultra-Low Value Multi-Coin Bot — DRY-RUN / LIVE with precise PnL/ROI
+ * ⚡ Phemex Ultra-Low Value Multi-Coin Bot — FINAL FIXED VERSION
  ******************************************************************************************/
 
 require('dotenv').config();
@@ -8,17 +8,19 @@ const express = require('express');
 const http = require('http');
 const { Server } = require('socket.io');
 
+/* ===================== CONFIG ===================== */
 const CONFIG = {
     PORT: 3000,
     PRICE_RATE: 2000,
     LOOKBACK: 50,
-    ROI_THRESHOLD: 0.2,
-    TARGET_USDT_VALUE: 0.05,  // increased slightly for ultra-low coins
+    ROI_THRESHOLD: 0.2,          // close anytime >= 0.2%
+    TARGET_USDT_VALUE: 0.05,     // margin target
     LEVERAGE: 20,
-    TOUCH_TOL: 1, // 1% tolerance
+    TOUCH_TOL: 1,                // % distance from S/R
     DRY_RUN: process.env.DRY_RUN === 'true'
 };
 
+/* ===================== EXCHANGE ===================== */
 const exchange = new ccxt.phemex({
     apiKey: process.env.PHEMEX_KEY,
     secret: process.env.PHEMEX_SECRET,
@@ -26,220 +28,217 @@ const exchange = new ccxt.phemex({
     options: { defaultType: 'swap' }
 });
 
+/* ===================== STATE ===================== */
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 const states = [];
-let activeCoins = new Set();
+const activeCoins = new Set();
 
-// -------------------- Helpers --------------------
-function resolvePrice(ticker){ 
-    return ticker.bid && ticker.ask ? (ticker.bid + ticker.ask)/2 : ticker.mark || ticker.last || 0; 
+/* ===================== HELPERS ===================== */
+function resolvePrice(t){
+    return t.bid && t.ask ? (t.bid + t.ask) / 2 : t.mark || t.last || 0;
 }
 
-function isTouch(price, level){ 
-    return Math.abs(price - level)/level * 100 <= CONFIG.TOUCH_TOL; 
+function isTouch(price, level){
+    if (!level) return false;
+    return Math.abs(price - level) / level * 100 <= CONFIG.TOUCH_TOL;
 }
 
-function calcROI(upnl_usdt, pos){ 
-    if(!pos.side || pos.qty === 0) return 0;
-    return (upnl_usdt / (pos.entry * pos.qty) * 100); 
+function calcROI(upnl, pos){
+    if (!pos.side || pos.qty === 0) return 0;
+    const margin = (pos.entry * pos.qty) / CONFIG.LEVERAGE;
+    return (upnl / margin) * 100;
 }
 
-function initState(market){
-    return { 
-        market, 
-        history: [], 
-        support: 0, 
-        resistance: 0, 
-        position: {side: null, qty: 0, entry: 0}, 
-        realizedPnL: 0, 
+function initState(m){
+    return {
+        market: m,
+        history: [],
+        support: 0,
+        resistance: 0,
+        position: { side:null, qty:0, entry:0 },
+        realizedPnL: 0,
         status: 'INIT',
-        scaledTouch: false
+        scaled: false
     };
 }
 
-// -------------------- Load Eligible Markets --------------------
+/* ===================== MARKETS ===================== */
 async function loadEligibleMarkets(){
     await exchange.loadMarkets();
-    const all = Object.values(exchange.markets).filter(m => m.swap && m.quote === 'USDT' && m.active);
-    const eligible = [];
+    const all = Object.values(exchange.markets)
+        .filter(m => m.swap && m.quote === 'USDT' && m.active);
 
-    for(const m of all){
+    const list = [];
+    for (const m of all){
         try{
-            const ticker = await exchange.fetchTicker(m.symbol);
-            const price = resolvePrice(ticker);
-            if(price <= 0) continue;
+            const t = await exchange.fetchTicker(m.symbol);
+            const price = resolvePrice(t);
+            if (price <= 0) continue;
+
             const minQty = m.limits?.amount?.min || 1;
-            const valuePerCoin = price * CONFIG.LEVERAGE;
-
-            if(valuePerCoin <= CONFIG.TARGET_USDT_VALUE){
-                eligible.push({symbol: m.symbol, minQty, price, valuePerCoin});
-            }
-        } catch(e){ console.error(`Skip ${m.symbol}: ${e.message}`);}
-        await sleep(50);
+            list.push({ symbol:m.symbol, price, minQty });
+        } catch {}
+        await sleep(40);
     }
-    return eligible;
+    return list;
 }
 
-// -------------------- Place Order --------------------
+/* ===================== ORDERS ===================== */
 async function placeOrder(symbol, side, qty){
-    if(CONFIG.DRY_RUN){ 
-        console.log(`[DRY-RUN] ${symbol} ${side} ${qty.toFixed(12)}`); 
-        return {simulated:true, symbol, side, qty}; 
+    if (CONFIG.DRY_RUN){
+        console.log(`[DRY] ${symbol} ${side} ${qty}`);
+        return true;
     }
-    try{ 
-        const order = await exchange.createOrder(symbol,'market',side,qty); 
-        console.log(`Order placed: ${symbol} ${side} ${qty} → ${order.id || 'ok'}`);
-        return order;
-    } catch(e){ 
-        console.error(`Order error ${symbol} ${side} ${qty}: ${e.message}`); 
-        return null; 
+    try{
+        await exchange.createOrder(symbol, 'market', side, qty);
+        return true;
+    } catch(e){
+        console.error(`Order error ${symbol}`, e.message);
+        return false;
     }
 }
 
-// -------------------- Strategy --------------------
+/* ===================== STRATEGY ===================== */
 async function strategy(state, io){
     try{
-        const ticker = await exchange.fetchTicker(state.market.symbol);
-        const price = resolvePrice(ticker);
-        const markPrice = ticker.mark || price;
+        const t = await exchange.fetchTicker(state.market.symbol);
+        const price = resolvePrice(t);
+        const mark = t.mark || price;
 
         state.history.push(price);
-        if(state.history.length > 300) state.history.shift();
-        const w = state.history.slice(-CONFIG.LOOKBACK);
-        state.support = Math.min(...w);
-        state.resistance = Math.max(...w);
+        if (state.history.length > 300) state.history.shift();
+
+        const win = state.history.slice(-CONFIG.LOOKBACK);
+        state.support = Math.min(...win);
+        state.resistance = Math.max(...win);
 
         const pos = state.position;
         const atSupport = isTouch(price, state.support);
         const atResistance = isTouch(price, state.resistance);
         const atLevel = atSupport || atResistance;
 
-        // ---------------- Calculate quantity ----------------
-        let qty = CONFIG.TARGET_USDT_VALUE / (price * CONFIG.LEVERAGE);
-        if(qty < state.market.minQty) {
-            qty = state.market.minQty;
-        }
+        /* ---- CORRECT PHEMEX CONTRACT SIZE ---- */
+        const notional = CONFIG.TARGET_USDT_VALUE * CONFIG.LEVERAGE;
+        let qty = notional / price;
+        if (qty < state.market.minQty) qty = state.market.minQty;
 
-        // ---------------- OPEN ----------------
-        if(!pos.side && atLevel){
-            if(atResistance){ 
-                const o = await placeOrder(state.market.symbol, 'buy', qty); 
-                if(o){ pos.side='LONG'; pos.qty=qty; pos.entry=price; state.status='OPEN LONG'; state.scaledTouch=false; } 
-            } else if(atSupport){ 
-                const o = await placeOrder(state.market.symbol, 'sell', qty); 
-                if(o){ pos.side='SHORT'; pos.qty=qty; pos.entry=price; state.status='OPEN SHORT'; state.scaledTouch=false; } 
+        /* -------- OPEN (CORRECT DIRECTION) -------- */
+        if (!pos.side && atLevel){
+            // LONG at support
+            if (atSupport && await placeOrder(state.market.symbol,'buy',qty)){
+                pos.side = 'LONG';
+                pos.qty = qty;
+                pos.entry = price;
+                state.scaled = false;
+                state.status = 'OPEN LONG';
+            }
+            // SHORT at resistance
+            if (atResistance && await placeOrder(state.market.symbol,'sell',qty)){
+                pos.side = 'SHORT';
+                pos.qty = qty;
+                pos.entry = price;
+                state.scaled = false;
+                state.status = 'OPEN SHORT';
             }
         }
 
-        // ---------------- SCALE ONCE ----------------
-        if(pos.side && atLevel && !state.scaledTouch){
-            const o = await placeOrder(state.market.symbol, pos.side==='LONG'?'buy':'sell', qty);
-            if(o){ 
-                pos.qty += qty; 
-                state.status='SCALING'; 
-                state.scaledTouch = true; 
+        /* -------- SCALE ONCE -------- */
+        if (pos.side && atLevel && !state.scaled){
+            const side = pos.side === 'LONG' ? 'buy' : 'sell';
+            if (await placeOrder(state.market.symbol, side, qty)){
+                const newQty = pos.qty + qty;
+                pos.entry = ((pos.entry * pos.qty) + (price * qty)) / newQty;
+                pos.qty = newQty;
+                state.scaled = true;
+                state.status = 'SCALING';
             }
         }
 
-        // ---------------- CLOSE ----------------
-        const upnl_usdt = pos.side==='LONG' ? (markPrice - pos.entry) * pos.qty : pos.side==='SHORT' ? (pos.entry - markPrice) * pos.qty : 0;
-        if(pos.side && atLevel && calcROI(upnl_usdt,pos) >= CONFIG.ROI_THRESHOLD){
-            const o = await placeOrder(state.market.symbol, pos.side==='LONG'?'sell':'buy', pos.qty);
-            if(o){
-                state.realizedPnL += upnl_usdt;
-                state.position = {side: null, qty: 0, entry: 0};
-                state.status='CLOSED';
-                state.scaledTouch = false;
+        /* -------- PNL + ROI -------- */
+        const upnl =
+            pos.side === 'LONG'  ? (mark - pos.entry) * pos.qty :
+            pos.side === 'SHORT' ? (pos.entry - mark) * pos.qty : 0;
+
+        const roi = calcROI(upnl, pos);
+
+        /* -------- CLOSE ANYTIME ROI >= 0.2% -------- */
+        if (pos.side && roi >= CONFIG.ROI_THRESHOLD){
+            const closeSide = pos.side === 'LONG' ? 'sell' : 'buy';
+            if (await placeOrder(state.market.symbol, closeSide, pos.qty)){
+                state.realizedPnL += upnl;
+                state.position = { side:null, qty:0, entry:0 };
+                state.scaled = false;
+                state.status = 'CLOSED';
             }
         }
 
         io.emit('stats',{
             symbol: state.market.symbol,
             price,
-            side: pos.side||'NONE',
+            side: pos.side || 'NONE',
             qty: pos.qty,
-            entry: pos.entry,
-            roi: calcROI(upnl_usdt,pos).toFixed(4),
-            valuePerCoin: price,
-            unrealizedPnL: upnl_usdt.toExponential(6),
-            realizedPnL: state.realizedPnL.toExponential(6),
+            roi: roi.toFixed(6),
+            unrealizedPnL: upnl.toFixed(6),
+            realizedPnL: state.realizedPnL.toFixed(6),
             status: state.status,
             history: state.history.slice(-CONFIG.LOOKBACK)
         });
 
-    } catch(e){ console.error(`Strategy error ${state.market.symbol}: ${e.message}`);}
+    } catch(e){
+        console.error('Strategy error', e.message);
+    }
 }
 
-// -------------------- Run Bot --------------------
+/* ===================== RUN ===================== */
 async function run(io){
-    while(true){
-        const eligibleMarkets = await loadEligibleMarkets();
-
-        for(const m of eligibleMarkets){
-            let state = states.find(s => s.market.symbol === m.symbol);
-
-            if(!state){
-                state = initState(m);
-                states.push(state);
+    while (true){
+        const mkts = await loadEligibleMarkets();
+        for (const m of mkts){
+            if (!states.find(s => s.market.symbol === m.symbol)){
+                states.push(initState(m));
                 activeCoins.add(m.symbol);
-
                 io.emit('coins', Array.from(activeCoins));
-
-                io.emit('stats',{
-                    symbol: m.symbol, price:0, side:'NONE', qty:0, entry:0,
-                    roi:0, valuePerCoin:0, unrealizedPnL:0, realizedPnL:0, status:'INIT', history:[]
-                });
-
-                console.log(`🚀 New eligible coin detected: ${m.symbol} | price=${m.price.toFixed(12)}`);
-            } else {
-                state.market.price = m.price;
-                state.market.minQty = m.minQty;
+                console.log('NEW COIN', m.symbol);
             }
         }
-
-        for(const s of states) await strategy(s, io);
-
+        for (const s of states) await strategy(s, io);
         await sleep(CONFIG.PRICE_RATE);
     }
 }
 
-// -------------------- Server --------------------
+/* ===================== SERVER ===================== */
 const app = express();
 const server = http.createServer(app);
 const io = new Server(server);
 
-io.on('connection', socket => {
-    socket.emit('coins', Array.from(activeCoins));
-});
+app.get('/', (_,res)=>res.send(DASHBOARD_HTML));
 
-app.get('/',(_,res)=>res.send(DASHBOARD_HTML));
-
-server.listen(CONFIG.PORT,()=>{
-    console.log(`Dashboard → http://localhost:${CONFIG.PORT} | DRY-RUN=${CONFIG.DRY_RUN}`);
+server.listen(CONFIG.PORT, ()=>{
+    console.log(`Dashboard → http://localhost:${CONFIG.PORT}`);
     run(io);
 });
 
-// -------------------- Dashboard --------------------
+/* ===================== DASHBOARD ===================== */
 const DASHBOARD_HTML = `
 <!DOCTYPE html>
 <html>
 <head>
-<title>Phemex Ultra-Low Value Bot</title>
+<title>Phemex Ultra-Low Bot</title>
 <script src="https://cdn.jsdelivr.net/npm/socket.io-client@4/dist/socket.io.min.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
 <style>
 body{background:#0b0e11;color:#eaeaea;font-family:sans-serif;padding:20px}
 #grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(260px,1fr));gap:14px}
-.card{background:#181a20;border-radius:8px;padding:12px;margin-bottom:6px;border:2px solid transparent;transition:border 0.3s;}
-.symbol{font-weight:bold;margin-bottom:4px}
-.row{display:flex;justify-content:space-between;font-size:13px;margin:2px 0}
+.card{background:#181a20;border-radius:8px;padding:12px;border:2px solid transparent}
+.symbol{font-weight:bold}
+.row{display:flex;justify-content:space-between;font-size:13px}
 .long{color:#0ecb81}.short{color:#f6465d}.none{color:#888}
-.status{text-align:center;margin-top:6px;background:#2b3139;padding:4px;border-radius:4px}
-canvas{width:100%;height:60px;margin-top:4px;background:#0b0e11;border-radius:4px}
+.status{text-align:center;background:#2b3139;margin-top:6px;padding:4px;border-radius:4px}
+canvas{width:100%;height:60px;margin-top:6px}
 </style>
 </head>
 <body>
-<h2>⚡ Phemex Ultra-Low Value Futures Bot — ${CONFIG.DRY_RUN?'DRY-RUN':'LIVE'}</h2>
+<h2>⚡ Phemex Ultra-Low Futures Bot</h2>
 <div id="grid"></div>
 <script>
 const socket = io();
@@ -247,66 +246,52 @@ const grid = document.getElementById('grid');
 const cards = {};
 
 function card(symbol){
-  const d = document.createElement('div');
+  const d=document.createElement('div');
   d.className='card';
   d.innerHTML=\`
     <div class="symbol">\${symbol}</div>
-    <div class="row"><span>Price</span><span class="p">0</span></div>
-    <div class="row"><span>Value/1 Coin</span><span class="v">0</span></div>
-    <div class="row"><span>Pos</span><span class="pos">NONE</span></div>
-    <div class="row"><span>Qty</span><span class="q">0</span></div>
-    <div class="row"><span>ROI%</span><span class="r">0</span></div>
-    <div class="row"><span>UPnL</span><span class="u">0</span></div>
-    <div class="row"><span>RPnL</span><span class="rp">0</span></div>
-    <canvas id="chart-\${symbol.replace('/','')}"></canvas>
-    <div class="status s">INIT</div>\`;
+    <div class="row"><span>Price</span><span class="p"></span></div>
+    <div class="row"><span>Pos</span><span class="pos"></span></div>
+    <div class="row"><span>Qty</span><span class="q"></span></div>
+    <div class="row"><span>ROI%</span><span class="r"></span></div>
+    <div class="row"><span>UPnL</span><span class="u"></span></div>
+    <div class="row"><span>RPnL</span><span class="rp"></span></div>
+    <canvas></canvas>
+    <div class="status s"></div>\`;
   grid.appendChild(d);
-  return {element:d, chart:null, data:[]};
+
+  const ctx=d.querySelector('canvas').getContext('2d');
+  const chart=new Chart(ctx,{
+    type:'line',
+    data:{labels:[],datasets:[{data:[],borderColor:'#fcd535',pointRadius:0}]},
+    options:{animation:false,plugins:{legend:{display:false}}}
+  });
+
+  return {el:d,chart};
 }
 
-socket.on('coins', coinList=>{
-  coinList.forEach(symbol=>{
-    if(!cards[symbol]) cards[symbol]=card(symbol);
+socket.on('coins',list=>{
+  list.forEach(s=>{
+    if(!cards[s]) cards[s]=card(s);
   });
 });
 
-socket.on('stats', d=>{
+socket.on('stats',d=>{
   if(!cards[d.symbol]) cards[d.symbol]=card(d.symbol);
-  const c = cards[d.symbol];
+  const c=cards[d.symbol];
 
-  c.element.querySelector('.p').innerText = d.price?.toFixed(12);
-  c.element.querySelector('.v').innerText = d.valuePerCoin?.toFixed(12);
-  const pe = c.element.querySelector('.pos');
-  pe.innerText = d.side;
-  pe.className = d.side==='LONG'?'long':d.side==='SHORT'?'short':'none';
-  c.element.querySelector('.q').innerText = d.qty?.toFixed(12);
-  c.element.querySelector('.r').innerText = d.roi;
-  c.element.querySelector('.u').innerText = d.unrealizedPnL;
-  c.element.querySelector('.rp').innerText = d.realizedPnL;
-  c.element.querySelector('.s').innerText = d.status;
+  c.el.querySelector('.p').innerText=d.price?.toFixed(8);
+  const pe=c.el.querySelector('.pos');
+  pe.innerText=d.side;
+  pe.className=d.side==='LONG'?'long':d.side==='SHORT'?'short':'none';
+  c.el.querySelector('.q').innerText=d.qty?.toFixed(6);
+  c.el.querySelector('.r').innerText=d.roi+'%';
+  c.el.querySelector('.u').innerText=d.unrealizedPnL;
+  c.el.querySelector('.rp').innerText=d.realizedPnL;
+  c.el.querySelector('.s').innerText=d.status;
 
-  let highlightColor = '';
-  if(d.status.includes('OPEN LONG')) highlightColor = '#0ecb81';
-  else if(d.status.includes('OPEN SHORT')) highlightColor = '#f6465d';
-  else if(d.status.includes('SCALING')) highlightColor = '#fcd535';
-  else if(d.status.includes('CLOSED')) highlightColor = '#3399ff';
-
-  if(highlightColor){
-    c.element.style.border = \`2px solid \${highlightColor}\`;
-    setTimeout(()=>{ c.element.style.border='2px solid transparent'; }, 1000);
-  }
-
-  if(!c.chart){
-    const ctx = document.getElementById('chart-'+d.symbol.replace('/','')).getContext('2d');
-    c.chart = new Chart(ctx,{
-      type:'line',
-      data:{labels:[], datasets:[{label:'Price', data:[], borderColor:'#fcd535', pointRadius:0}]},
-      options:{animation:false,responsive:true,scales:{y:{position:'right',grid:{color:'#2b3139'}}}}
-    });
-  }
-  const hist = d.history||[];
-  c.chart.data.labels = hist.map((_,i)=>i);
-  c.chart.data.datasets[0].data = hist;
+  c.chart.data.labels=d.history.map((_,i)=>i);
+  c.chart.data.datasets[0].data=d.history;
   c.chart.update('none');
 });
 </script>
