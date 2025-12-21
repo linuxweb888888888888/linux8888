@@ -131,19 +131,8 @@ function freezeLiveSR(s, r) {
 }
 
 // ==================== DASHBOARD STATS ====================
-function emitStats(io) {
+function emitStats(io, roi = 0, unrealizedPnL = 0) {
     const pos = state.positions;
-    let unrealizedPnL = 0;
-    let roi = 0;
-
-    if (pos.side === 'LONG') {
-        unrealizedPnL = (state.bid - pos.entry) * pos.qty;
-        roi = calcRealROI(pos, state.bid, LEVERAGE) / LEVERAGE; // divide by leverage
-    }
-    if (pos.side === 'SHORT') {
-        unrealizedPnL = (pos.entry - state.ask) * pos.qty;
-        roi = calcRealROI(pos, state.ask, LEVERAGE) / LEVERAGE; // divide by leverage
-    }
 
     io.emit('stats', {
         price: state.price,
@@ -182,7 +171,19 @@ async function strategy(io) {
     freezeLiveSR(liveS, liveR);
 
     const pos = state.positions;
-    const roi = calcRealROI(pos, price, LEVERAGE) / LEVERAGE;
+
+    // ===== CALCULATE ROI & UNREALIZED PNL ONCE =====
+    let roi = 0;
+    let unrealizedPnL = 0;
+
+    if (pos.side === 'LONG') {
+        unrealizedPnL = (state.bid - pos.entry) * pos.qty;
+        roi = calcRealROI(pos, state.bid, LEVERAGE) / LEVERAGE; // dashboard ROI per 1x leverage
+    } else if (pos.side === 'SHORT') {
+        unrealizedPnL = (pos.entry - state.ask) * pos.qty;
+        roi = calcRealROI(pos, state.ask, LEVERAGE) / LEVERAGE;
+    }
+
     const priceDecimals = getDecimals(price);
     io.emit('log', `DEBUG | side=${pos.side} price=${price.toFixed(priceDecimals)} ROI=${roi.toFixed(8)}%`);
 
@@ -206,7 +207,7 @@ async function strategy(io) {
 
         state.support = liveS;
         state.resistance = liveR;
-        emitStats(io);
+        emitStats(io, roi, unrealizedPnL);
         return;
     }
 
@@ -229,7 +230,7 @@ async function strategy(io) {
 
     state.support = liveS;
     state.resistance = liveR;
-    emitStats(io);
+    emitStats(io, roi, unrealizedPnL);
 }
 
 // ==================== RUN BOT ====================
