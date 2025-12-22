@@ -1,1 +1,290 @@
-hitbtc ccxt python bot, make profit and with 0.001 atom with cci signal and use subprocess.run(['bash','/placeorder.sh'] for long and short orders with arguments of this code arguments = ["ATOM", "0.001",side] and display all code do not use api keys implement take profit and stop loss algo with steps do not use talib and show icons with signal and orders and make bot profitable and include long and short signal algo for order and Add logic to close position or reduce size here, update price fast, short long implement algo again and logic and Add logic to close fast buy for order and again fast price update while in position check oversold overbought all code fast and if trading indicates profit use close step with long and short algo and then close order and fast price code update do not use api key one direction buy or sell until all sell for profit then open other drection ai leaning with most accurate ai library use wallet.sh for balance and learn from wallet to maximize profit increase positions if can make profit gain learn from open positions create simulated open positions in background for faster profit gains while opening positions inthe foreground only buy and sell values for placeorder.sh calculate and wallet.sh in usdt only one direction at a time orders can be place use bid ask and mid prices for prices increase positions with learning and adapt use pnl learning simulation background trades for gaining profit use sklearn for learning library also add multi sizing and multi positions take profit if profit or pnl covers fee close positions if profit gain can be made or predicted further add rich dashboard and show all metrics and most factors use coin minimum quantity for scaling and when increasing and decreasing positions do not open real positions in smaller than minimum coin quantity of 0.001 for atom learn and adapt make bot fully adaptive, multi-position, profit-maximizing learning bot and Error: sequence index must be integer, not 'slice' fix update dashboard with all metrics and info and show and fully multi-position, fully adaptive, and with simulated trades that improve ML learning in real time, including multi-step PnL evaluation and profit prediction fix Error: 'DataFrame' object has no attribute 'append' add full bot, profit-maximizing, adaptive HitBTC automatic multi-step position increase UserWarning: X does not have valid feature names, but RandomForestRegressor and fix eceptions errors and warnings simulate in background while real trading in foreground to predict and maximize profit use place order.sh for real trades i have my own api keys always give real bot code The behavior of DataFrame concatenation with empty or all-NA entries is deprecated local variable 'DIRECTION' referenced before assignment
+/******************************************************************************************
+ * ⚡ LUNC PHEMEX BOT — FULL DASHBOARD + SMART ROI ADAPTIVE SCALING
+ * ✅ Frontend independent
+ * ✅ 30s ticker interval
+ * ✅ Adaptive scale 1–10
+ * ✅ ROI-based far-away sensitivity
+ * ✅ Original dashboard preserved
+ ******************************************************************************************/
+
+require('dotenv').config();
+const express = require('express');
+const http = require('http');
+const { Server } = require('socket.io');
+const ccxt = require('ccxt');
+const minimist = require('minimist');
+
+// ==================== PARSE ARGS ====================
+const args = minimist(process.argv.slice(2));
+const COIN = (args.coin || 'LUNC').toUpperCase();
+const PORT = args.port || 3000;
+const LEVERAGE = args.leverage || 20;
+
+// ==================== CONFIG ====================
+const CONFIG = {
+    PRICE_SYMBOL: `${COIN}/USDT`,
+    ORDER_SYMBOL: `${COIN}/USDT:USDT`,
+    LOOKBACK: 50,
+    PRICE_RATE: 30000,          // 30 seconds
+    ROI_MIN_TO_SCALE: 0.15,     // % minimum ROI before scaling
+    ROI_CLOSE: 6.0,             // % close position
+    MIN_SCALE: 1,
+    MAX_SCALE: 10
+};
+
+// ==================== STATE ====================
+const state = {
+    price: 0,
+    bid: 0,
+    ask: 0,
+    history: [],
+    support: 0,
+    resistance: 0,
+    realizedPnL: 0,
+    positions: { side: null, qty: 0, entry: 0 },
+    status: 'INIT',
+    recentOrders: [],
+    lastScale: 0
+};
+
+// ==================== EXCHANGE ====================
+const exchange = new ccxt.phemex({
+    apiKey: process.env.PHEMEX_KEY,
+    secret: process.env.PHEMEX_SECRET,
+    enableRateLimit: true,
+    options: { defaultType: 'swap' }
+});
+
+// ==================== HELPERS ====================
+const sleep = ms => new Promise(r => setTimeout(r, ms));
+
+function calcROI(pos, price) {
+    if (!pos.side || pos.qty <= 0) return 0;
+    const pnl = pos.side === 'LONG'
+        ? (price - pos.entry) * pos.qty
+        : (pos.entry - price) * pos.qty;
+    const margin = (pos.entry * pos.qty) / LEVERAGE;
+    return margin > 0 ? (pnl / margin) * 100 : 0;
+}
+
+// ROI-sensitive adaptive scaling (1–10)
+function adaptiveScale(pos, price, roi) {
+    const distance = Math.abs(price - pos.entry) / pos.entry;
+    const roiBoost = Math.min(3, Math.max(1, Math.abs(roi) * 4));
+    let scale = Math.round(distance * roiBoost * 10);
+    scale = Math.min(CONFIG.MAX_SCALE, Math.max(CONFIG.MIN_SCALE, scale));
+    return scale;
+}
+
+// ==================== PRICE ====================
+async function fetchPrice() {
+    const t = await exchange.fetchTicker(CONFIG.PRICE_SYMBOL);
+    state.bid = t.bid;
+    state.ask = t.ask;
+    state.price = (t.bid + t.ask) / 2;
+}
+
+// ==================== POSITION SYNC ====================
+async function syncPosition() {
+    const positions = await exchange.fetchPositions([CONFIG.ORDER_SYMBOL]);
+    const p = positions.find(x => x.symbol === CONFIG.ORDER_SYMBOL);
+
+    if (!p || !p.contracts) {
+        state.positions = { side: null, qty: 0, entry: 0 };
+        return;
+    }
+
+    state.positions.qty = Math.abs(Number(p.contracts));
+    state.positions.entry = Number(p.entryPrice);
+    state.positions.side =
+        p.side.toLowerCase().includes('long') ? 'LONG' : 'SHORT';
+}
+
+// ==================== ORDERS ====================
+async function market(side, qty) {
+    qty = Number(qty.toFixed(8));
+    await exchange.createOrder(CONFIG.ORDER_SYMBOL, 'market', side, qty);
+
+    state.recentOrders.unshift({
+        side, qty, time: new Date().toLocaleTimeString()
+    });
+    if (state.recentOrders.length > 20) state.recentOrders.pop();
+
+    await sleep(500);
+    await syncPosition();
+}
+
+// ==================== STRATEGY ====================
+async function strategy(io) {
+    await fetchPrice();
+    await syncPosition();
+
+    state.history.push(state.price);
+    if (state.history.length > 300) state.history.shift();
+
+    const window = state.history.slice(-CONFIG.LOOKBACK);
+    state.support = Math.min(...window);
+    state.resistance = Math.max(...window);
+
+    const pos = state.positions;
+    const priceUsed = pos.side === 'LONG' ? state.bid : state.ask;
+    const roi = calcROI(pos, priceUsed);
+
+    // ===== CLOSE ON HIGH ROI =====
+    if (pos.side && roi >= CONFIG.ROI_CLOSE) {
+        io.emit('log', `🛑 CLOSE ${pos.side} ROI=${roi.toFixed(4)}%`);
+        await market(pos.side === 'LONG' ? 'sell' : 'buy', pos.qty);
+        state.status = 'CLOSED';
+        return;
+    }
+
+    // ===== SCALE =====
+    if (pos.side && Math.abs(roi) >= CONFIG.ROI_MIN_TO_SCALE) {
+        const scaleQty = adaptiveScale(pos, state.price, roi);
+        state.lastScale = scaleQty;
+
+        io.emit('log', `➕ SCALE ${pos.side} ${scaleQty} | ROI=${roi.toFixed(4)}%`);
+        await market(pos.side === 'LONG' ? 'buy' : 'sell', scaleQty);
+        state.status = 'SCALING';
+    }
+
+    // ===== OPEN =====
+    if (!pos.side) {
+        if (state.price >= state.resistance) {
+            await market('buy', CONFIG.MIN_SCALE);
+            state.status = 'OPEN LONG';
+        } else if (state.price <= state.support) {
+            await market('sell', CONFIG.MIN_SCALE);
+            state.status = 'OPEN SHORT';
+        } else {
+            state.status = 'RANGING';
+        }
+    }
+
+    io.emit('stats', {
+        price: state.price,
+        bid: state.bid,
+        ask: state.ask,
+        support: state.support,
+        resistance: state.resistance,
+        posType: pos.side || 'NONE',
+        qty: pos.qty,
+        entry: pos.entry,
+        roi,
+        unrealizedPnL: roi,
+        realizedPnL: state.realizedPnL,
+        status: state.status,
+        recentOrders: state.recentOrders
+    });
+}
+
+// ==================== BOT LOOP ====================
+async function runBot(io) {
+    console.log('🤖 Bot running (frontend independent)');
+    while (true) {
+        try { await strategy(io); }
+        catch (e) {
+            console.error(e.message);
+            io.emit('log', e.message);
+        }
+        await sleep(CONFIG.PRICE_RATE);
+    }
+}
+
+// ==================== SERVER ====================
+const app = express();
+const server = http.createServer(app);
+const io = new Server(server);
+
+app.get('/', (_, res) => res.send(DASHBOARD_HTML));
+io.on('connection', () => console.log('📊 Frontend connected'));
+
+server.listen(PORT, () => {
+    console.log(`🌐 Dashboard http://localhost:${PORT}`);
+    runBot(io);
+});
+
+// ==================== ORIGINAL DASHBOARD ====================
+const DASHBOARD_HTML = `
+<!DOCTYPE html>
+<html>
+<head>
+<title>${COIN} Phemex Bot</title>
+<script src="https://cdn.jsdelivr.net/npm/socket.io-client@4/dist/socket.io.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+<style>
+body{background:#0b0e11;color:#eaeaea;font-family:sans-serif;padding:20px}
+.header{display:grid;grid-template-columns:repeat(10,1fr);gap:10px;background:#181a20;padding:15px;border-radius:8px;}
+.stat{text-align:center;background:#2b3139;padding:10px;border-radius:5px}
+.label{font-size:11px;color:#848e9c}
+.val{font-size:15px;font-weight:bold;font-family:monospace}
+.pos-LONG{color:#0ecb81} .pos-SHORT{color:#f6465d}
+#chart-box{height:400px;background:#181a20;margin-top:15px}
+#log-box{height:150px;overflow:auto;background:#000;margin-top:15px;font-family:monospace;font-size:12px}
+</style>
+</head>
+<body>
+<h2>⚡ GENIUS BOT</h2>
+<div class="header">
+<div class="stat"><div class="label">PRICE</div><div class="val" id="p">--</div></div>
+<div class="stat"><div class="label">BID</div><div class="val" id="b">--</div></div>
+<div class="stat"><div class="label">ASK</div><div class="val" id="a">--</div></div>
+<div class="stat"><div class="label">POSITION</div><div class="val" id="pos">NONE</div></div>
+<div class="stat"><div class="label">QTY</div><div class="val" id="q">0</div></div>
+<div class="stat"><div class="label">ENTRY</div><div class="val" id="e">0</div></div>
+<div class="stat"><div class="label">ROI%</div><div class="val" id="roi">0</div></div>
+<div class="stat"><div class="label">UPNL</div><div class="val" id="u">0</div></div>
+<div class="stat"><div class="label">RPNL</div><div class="val" id="r">0</div></div>
+<div class="stat"><div class="label">STATUS</div><div class="val" id="s">--</div></div>
+</div>
+<div id="chart-box"><canvas id="c"></canvas></div>
+<div id="log-box"></div>
+<script>
+const socket = io();
+const ctx = document.getElementById('c');
+const logBox = document.getElementById('log-box');
+const MAX_POINTS = 300;
+
+const chart = new Chart(ctx,{
+type:'line',
+data:{labels:[],datasets:[
+{label:'Price',data:[],borderColor:'#fcd535',pointRadius:0},
+{label:'Resistance',data:[],borderColor:'#f6465d',pointRadius:0,stepped:true},
+{label:'Support',data:[],borderColor:'#0ecb81',pointRadius:0,stepped:true}
+]},
+options:{responsive:true,animation:false,scales:{y:{position:'right'}}}
+});
+
+socket.on('stats',d=>{
+p.innerText=d.price?.toFixed(8);
+b.innerText=d.bid?.toFixed(8);
+a.innerText=d.ask?.toFixed(8);
+pos.innerText=d.posType;
+pos.className=d.posType==='LONG'?'val pos-LONG':d.posType==='SHORT'?'val pos-SHORT':'val';
+q.innerText=d.qty;
+e.innerText=d.entry?.toFixed(8);
+roi.innerText=d.roi?.toFixed(6);
+u.innerText=d.unrealizedPnL?.toFixed(6);
+r.innerText=d.realizedPnL?.toFixed(6);
+s.innerText=d.status;
+
+if(chart.data.labels.length>MAX_POINTS){
+chart.data.labels.shift();
+chart.data.datasets.forEach(ds=>ds.data.shift());
+}
+chart.data.labels.push(new Date().toLocaleTimeString());
+chart.data.datasets[0].data.push(d.price);
+chart.data.datasets[1].data.push(d.resistance);
+chart.data.datasets[2].data.push(d.support);
+chart.update('none');
+});
+
+socket.on('log',m=>{
+const d=document.createElement('div');
+d.innerText=new Date().toLocaleTimeString()+" "+m;
+logBox.prepend(d);
+});
+</script>
+</body>
+</html>
+`;
