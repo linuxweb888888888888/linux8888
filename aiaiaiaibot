@@ -1,0 +1,392 @@
+/******************************************************************************************
+ * ⚡ LUNC PHEMEX BOT — SINGLE ENTRY + LIQUIDATION-DEFENSE SCALING (MULTI-EXCHANGE FALLBACK)
+ * ✅ Opens ONLY 1 unit
+ * ✅ Scales ONLY near liquidation price
+ * ✅ Uses mark price from multiple exchanges (Phemex → Binance Futures → Bybit → OKX)
+ * ✅ Direction forced by argv --position=long|short
+ * ✅ Frontend independent
+ * ✅ 30s ticker interval
+ * ✅ Original dashboard preserved
+ ******************************************************************************************/
+
+require('dotenv').config();
+const express = require('express');
+const http = require('http');
+const { Server } = require('socket.io');
+const ccxt = require('ccxt');
+const minimist = require('minimist');
+
+// ==================== PARSE ARGS ====================
+const args = minimist(process.argv.slice(2));
+const COIN = (args.coin || 'LUNC').toUpperCase();
+const PORT = args.port || 3000;
+const LEVERAGE = Number(args.leverage || 20);
+const POSITION_MODE = (args.position || '').toLowerCase(); // long | short
+
+if (!['long', 'short'].includes(POSITION_MODE)) {
+    console.log('⛔ Bot idle: start with --position=long or --position=short');
+}
+
+// ==================== CONFIG ====================
+const CONFIG = {
+    PRICE_SYMBOL: `${COIN}/USDT`,
+    ORDER_SYMBOL: `${COIN}/USDT:USDT`,
+    LOOKBACK: 50,
+    PRICE_RATE: 30000,
+    ROI_CLOSE: 4.0,
+    MIN_SCALE: 1,
+    MAX_SCALE: 10,
+    LIQ_DISTANCE: 0.015 // 1.5%
+};
+
+// ==================== STATE ====================
+const state = {
+    price: 0,
+    bid: 0,
+    ask: 0,
+    source: '',
+    history: [],
+    support: 0,
+    resistance: 0,
+    realizedPnL: 0,
+    positions: { side: null, qty: 0, entry: 0 },
+    status: 'INIT',
+    recentOrders: [],
+    lastScaleTime: 0,
+    liqPrice: 0
+};
+
+// ==================== EXCHANGES ====================
+const phemex = new ccxt.phemex({
+    apiKey: process.env.PHEMEX_KEY,
+    secret: process.env.PHEMEX_SECRET,
+    enableRateLimit: true,
+    options: { defaultType: 'swap' }
+});
+
+let binanceFut, bybitFut, okxFut; // lazy init for fallback
+
+const EXCHANGES = [
+    { name: 'Phemex', instance: phemex, type: 'swap' },
+    { name: 'Binance Futures', instance: binanceFut, type: 'futures' },
+    { name: 'Bybit Futures', instance: bybitFut, type: 'futures' },
+    { name: 'OKX Futures', instance: okxFut, type: 'futures' }
+];
+
+// ==================== HELPERS ====================
+const sleep = ms => new Promise(r => setTimeout(r, ms));
+
+function calcROI(pos, price) {
+    if (!pos.side || pos.qty <= 0 || !price || price === 0) return 0;
+    const pnl = pos.side === 'LONG'
+        ? (price - pos.entry) * pos.qty
+        : (pos.entry - price) * pos.qty;
+    const margin = (pos.entry * pos.qty) / LEVERAGE;
+    return margin > 0 ? (pnl / margin) * 100 : 0;
+}
+
+function adaptiveScale(pos, price) {
+    const distance = Math.abs(price - pos.entry) / pos.entry;
+    let scale = Math.round(distance * 10);
+    return Math.min(CONFIG.MAX_SCALE, Math.max(CONFIG.MIN_SCALE, scale));
+}
+
+function calcLiqPrice(pos) {
+    if (!pos.side || !pos.entry) return 0;
+    const mmr = 0.005; // maintenance margin
+    if (pos.side === 'LONG') {
+        return pos.entry * (1 - (1 / LEVERAGE) + mmr);
+    } else {
+        return pos.entry * (1 + (1 / LEVERAGE) - mmr);
+    }
+}
+
+// ==================== MARK PRICE WITH MULTI-EXCHANGE FALLBACK ====================
+async function fetchMarkPrice() {
+    let markPrice = 0, bid = 0, ask = 0, source = '';
+
+    for (let ex of EXCHANGES) {
+        try {
+            if (!ex.instance) {
+                switch (ex.name) {
+                    case 'Binance Futures':
+                        binanceFut = new ccxt.binance({ options: { defaultType: 'future' }, enableRateLimit: true });
+                        await binanceFut.loadMarkets();
+                        ex.instance = binanceFut;
+                        break;
+                    case 'Bybit Futures':
+                        bybitFut = new ccxt.bybit({ enableRateLimit: true });
+                        await bybitFut.loadMarkets();
+                        ex.instance = bybitFut;
+                        break;
+                    case 'OKX Futures':
+                        okxFut = new ccxt.okx({ enableRateLimit: true });
+                        await okxFut.loadMarkets();
+                        ex.instance = okxFut;
+                        break;
+                }
+            }
+
+            if (!ex.instance.symbols.includes(CONFIG.PRICE_SYMBOL)) continue;
+
+            const ticker = await ex.instance.fetchTicker(CONFIG.PRICE_SYMBOL);
+            const candidatePrice = ticker.info?.markPrice || (ticker.bid && ticker.ask ? (ticker.bid + ticker.ask) / 2 : ticker.last);
+            if (candidatePrice && candidatePrice > 0) {
+                markPrice = candidatePrice;
+                bid = ticker.bid || markPrice;
+                ask = ticker.ask || markPrice;
+                source = ex.name;
+                break;
+            }
+
+        } catch (err) {
+            console.log(`⚠️ ${ex.name} price fetch failed: ${err.message}`);
+        }
+    }
+
+    state.price = markPrice;
+    state.bid = bid;
+    state.ask = ask;
+    state.source = source || 'NO PRICE';
+}
+
+// ==================== POSITION SYNC ====================
+async function syncPosition() {
+    try {
+        const positions = await phemex.fetchPositions([CONFIG.ORDER_SYMBOL]);
+        const p = positions.find(x => x.symbol === CONFIG.ORDER_SYMBOL);
+        if (!p || !Number(p.contracts)) {
+            state.positions = { side: null, qty: 0, entry: 0 };
+            return;
+        }
+        state.positions.qty = Math.abs(Number(p.contracts));
+        state.positions.entry = Number(p.entryPrice);
+        state.positions.side = p.side.toLowerCase().includes('long') ? 'LONG' : 'SHORT';
+    } catch (e) {
+        console.error('⚠️ Failed to sync position:', e.message);
+        state.positions = { side: null, qty: 0, entry: 0 };
+    }
+}
+
+// ==================== ORDERS ====================
+async function market(side, qty, reduceOnly = false) {
+    qty = Number(qty.toFixed(8));
+    try {
+        await phemex.createOrder(
+            CONFIG.ORDER_SYMBOL,
+            'market',
+            side,
+            qty,
+            undefined,
+            reduceOnly ? { reduceOnly: true } : {}
+        );
+        state.recentOrders.unshift({
+            side, qty, time: new Date().toLocaleTimeString()
+        });
+        if (state.recentOrders.length > 20) state.recentOrders.pop();
+        await sleep(500);
+        await syncPosition();
+    } catch (e) {
+        console.error(`⚠️ Failed to create order: ${e.message}`);
+    }
+}
+
+// ==================== STRATEGY ====================
+async function strategy(io) {
+    await fetchMarkPrice();
+    if (!state.price) {
+        console.log('⚠️ Waiting for valid mark price...');
+        return;
+    }
+
+    await syncPosition();
+
+    state.history.push(state.price);
+    if (state.history.length > 300) state.history.shift();
+
+    const window = state.history.slice(-CONFIG.LOOKBACK);
+    state.support = Math.min(...window);
+    state.resistance = Math.max(...window);
+
+    const pos = state.positions;
+    const priceUsed = pos.side ? state.price : 0;
+    const roi = calcROI(pos, priceUsed);
+
+    console.log(`[ROI] Side=${pos.side || 'NONE'}, ROI=${roi.toFixed(6)}%, PriceUsed=${priceUsed}, Source=${state.source}`);
+
+    state.liqPrice = calcLiqPrice(pos);
+
+    // ===== CLOSE =====
+    if (pos.side && roi >= CONFIG.ROI_CLOSE) {
+        console.log(`📈 Closing position! ROI=${roi.toFixed(6)}%`);
+        await market(pos.side === 'LONG' ? 'sell' : 'buy', pos.qty, true);
+        state.realizedPnL += roi;
+        state.status = 'CLOSED';
+        return;
+    }
+
+    // ===== SCALE NEAR LIQUIDATION =====
+    if (pos.side && state.liqPrice) {
+        const distance = Math.abs(state.price - state.liqPrice) / state.liqPrice;
+        if (distance <= CONFIG.LIQ_DISTANCE &&
+            Date.now() - state.lastScaleTime > 60000) {
+
+            const balance = await phemex.fetchBalance();
+            const freeUSDT = balance.USDT?.free || 0;
+            if (freeUSDT > 2) {
+                const scaleQty = adaptiveScale(pos, state.price);
+                state.lastScaleTime = Date.now();
+                console.log(`⚡ Scaling near liquidation: Qty=${scaleQty}`);
+                await market(pos.side === 'LONG' ? 'buy' : 'sell', scaleQty);
+                state.status = 'SCALING (LIQ DEFENSE)';
+            }
+        }
+    }
+
+    // ===== SINGLE ENTRY =====
+    if (!pos.side && ['long', 'short'].includes(POSITION_MODE)) {
+        if (POSITION_MODE === 'long') {
+            await market('buy', 1);
+            state.status = 'OPEN LONG (1)';
+            console.log('🟢 Opened LONG 1 unit');
+        }
+        if (POSITION_MODE === 'short') {
+            await market('sell', 1);
+            state.status = 'OPEN SHORT (1)';
+            console.log('🔴 Opened SHORT 1 unit');
+        }
+    }
+
+    io.emit('stats', {
+        price: state.price,
+        bid: state.bid,
+        ask: state.ask,
+        source: state.source,
+        support: state.support,
+        resistance: state.resistance,
+        posType: pos.side || 'NONE',
+        qty: pos.qty,
+        entry: pos.entry,
+        roi,
+        unrealizedPnL: roi,
+        realizedPnL: state.realizedPnL,
+        liqPrice: state.liqPrice,
+        status: state.status,
+        recentOrders: state.recentOrders
+    });
+}
+
+// ==================== BOT LOOP ====================
+async function runBot(io) {
+    console.log('🤖 Bot running (single-entry + liq defense, multi-exchange fallback)');
+    while (true) {
+        try { await strategy(io); }
+        catch (e) {
+            console.error(e.message);
+            io.emit('log', e.message);
+        }
+        await sleep(CONFIG.PRICE_RATE);
+    }
+}
+
+// ==================== SERVER ====================
+const app = express();
+const server = http.createServer(app);
+const io = new Server(server);
+
+app.get('/', (_, res) => res.send(DASHBOARD_HTML));
+io.on('connection', () => console.log('📊 Frontend connected'));
+
+server.listen(PORT, () => {
+    console.log(`🌐 Dashboard http://localhost:${PORT}`);
+    runBot(io);
+});
+
+// ==================== ORIGINAL DASHBOARD ====================
+const DASHBOARD_HTML = `<!DOCTYPE html>
+<html>
+<head>
+<title>${COIN} Phemex Bot</title>
+<script src="https://cdn.jsdelivr.net/npm/socket.io-client@4/dist/socket.io.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+<style>
+body{background:#0b0e11;color:#eaeaea;font-family:sans-serif;padding:20px}
+.header{display:grid;grid-template-columns:repeat(11,1fr);gap:10px;background:#181a20;padding:15px;border-radius:8px;}
+.stat{text-align:center;background:#2b3139;padding:10px;border-radius:5px}
+.label{font-size:11px;color:#848e9c}
+.val{font-size:15px;font-weight:bold;font-family:monospace}
+.pos-LONG{color:#0ecb81} .pos-SHORT{color:#f6465d}
+#chart-box{height:400px;background:#181a20;margin-top:15px}
+#log-box{height:150px;overflow:auto;background:#000;margin-top:15px;font-family:monospace;font-size:12px}
+</style>
+</head>
+<body>
+<h2>⚡ GENIUS BOT</h2>
+<div class="header">
+<div class="stat"><div class="label">PRICE</div><div class="val" id="p">--</div></div>
+<div class="stat"><div class="label">BID</div><div class="val" id="b">--</div></div>
+<div class="stat"><div class="label">ASK</div><div class="val" id="a">--</div></div>
+<div class="stat"><div class="label">POSITION</div><div class="val" id="pos">NONE</div></div>
+<div class="stat"><div class="label">QTY</div><div class="val" id="q">0</div></div>
+<div class="stat"><div class="label">ENTRY</div><div class="val" id="e">0</div></div>
+<div class="stat"><div class="label">ROI%</div><div class="val" id="roi">0</div></div>
+<div class="stat"><div class="label">UPNL</div><div class="val" id="u">0</div></div>
+<div class="stat"><div class="label">RPNL</div><div class="val" id="r">0</div></div>
+<div class="stat"><div class="label">LIQ</div><div class="val" id="liq">0</div></div>
+<div class="stat"><div class="label">STATUS</div><div class="val" id="s">--</div></div>
+<div class="stat"><div class="label">SOURCE</div><div class="val" id="src">--</div></div>
+</div>
+<div id="chart-box"><canvas id="c"></canvas></div>
+<div id="log-box"></div>
+<script>
+const socket = io();
+const ctx = document.getElementById('c');
+const logBox = document.getElementById('log-box');
+const MAX_POINTS = 300;
+
+const chart = new Chart(ctx,{
+type:'line',
+data:{labels:[],datasets:[
+{label:'Price',data:[],borderColor:'#fcd535',pointRadius:0},
+{label:'Resistance',data:[],borderColor:'#f6465d',pointRadius:0,stepped:true},
+{label:'Support',data:[],borderColor:'#0ecb81',pointRadius:0,stepped:true}
+]},
+options:{responsive:true,animation:false,scales:{y:{position:'right'}}}
+});
+
+socket.on('stats',d=>{
+if(!d.price)return;
+p.innerText=d.price.toFixed(8);
+b.innerText=d.bid.toFixed(8);
+a.innerText=d.ask.toFixed(8);
+pos.innerText=d.posType;
+pos.className=d.posType==='LONG'?'val pos-LONG':d.posType==='SHORT'?'val pos-SHORT':'val';
+q.innerText=d.qty;
+e.innerText=d.entry.toFixed(8);
+roi.innerText=d.roi.toFixed(6);
+u.innerText=d.unrealizedPnL.toFixed(6);
+r.innerText=d.realizedPnL.toFixed(6);
+liq.innerText=d.liqPrice.toFixed(8);
+s.innerText=d.status;
+src.innerText=d.source || '--';
+
+if(chart.data.labels.length>MAX_POINTS){
+chart.data.labels.shift();
+chart.data.datasets.forEach(ds=>ds.data.shift());
+}
+chart.data.labels.push(new Date().toLocaleTimeString());
+chart.data.datasets[0].data.push(d.price);
+chart.data.datasets[1].data.push(d.resistance);
+chart.data.datasets[2].data.push(d.support);
+chart.update('none');
+});
+
+socket.on('log',m=>{
+const d=document.createElement('div');
+d.innerText=new Date().toLocaleTimeString()+" "+m;
+logBox.prepend(d);
+});
+</script>
+</body>
+</html>
+`;
