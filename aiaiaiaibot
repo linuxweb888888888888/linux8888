@@ -18,7 +18,7 @@ const LEVERAGE = 20;
 const PRICE_RATE = 30_000;
 const COIN_DELAY = 2_000;
 const LIQ_DISTANCE = 0.015;
-const ROI_CLOSE = 4.0; // only closes profitable trades
+const ROI_CLOSE = 5.2; // only closes profitable trades
 const SCALE_COOLDOWN = 120_000;
 const PORT = 3000;
 
