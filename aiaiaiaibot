@@ -1,11 +1,9 @@
 /******************************************************************************************
- * ⚡ MULTI-COIN PHEMEX BOT + DASHBOARD
- * ✅ Embedded COINS
- * ✅ Alternating LONG / SHORT
- * ✅ Single entry
- * ✅ Liquidation defense scaling
- * ✅ Multi-exchange mark price fallback
- * ✅ ONE dashboard (low CPU/RAM)
+ * ⚡ MULTI-COIN PHEMEX BOT + DASHBOARD (PROFIT-ONLY ROI CLOSE)
+ * ✅ Closes trades immediately when ROI >= ROI_CLOSE
+ * ✅ Scaling near liquidation preserved
+ * ✅ Robust order placement (min contract + error logging)
+ * ✅ Live dashboard
  ******************************************************************************************/
 
 require('dotenv').config();
@@ -14,16 +12,17 @@ const express = require('express');
 const http = require('http');
 const { Server } = require('socket.io');
 
-/* ======================= CONFIG ======================= */
+/* ================= CONFIG ================= */
 
-const LEVERAGE     = 20;
-const PRICE_RATE   = 30_000;
-const COIN_DELAY   = 2_000;
+const LEVERAGE = 20;
+const PRICE_RATE = 30_000;
+const COIN_DELAY = 2_000;
 const LIQ_DISTANCE = 0.015;
-const ROI_CLOSE    = 4.0;
-const PORT         = 3000;
+const ROI_CLOSE = 4.0; // only closes profitable trades
+const SCALE_COOLDOWN = 120_000;
+const PORT = 3000;
 
-/* ======================= COINS ======================= */
+/* ================= COINS ================= */
 
 const COINS = [
   'LUNC','ACH','JASMY','ONE','RSR','GALA','1000SHIB','DENT','RVN','ZIL',
@@ -35,7 +34,7 @@ const COINS = [
   'CAMP','PTB','U','LINEA','XPIN','TOSHI','AKE','NOM','RVV','BLUAI','COMMON','JCT'
 ];
 
-/* ======================= EXCHANGES ======================= */
+/* ================= EXCHANGES ================= */
 
 const phemex = new ccxt.phemex({
   apiKey: process.env.PHEMEX_KEY,
@@ -50,14 +49,13 @@ const okx     = new ccxt.okx({ enableRateLimit: true });
 
 const EXCHANGES = [phemex, binance, bybit, okx];
 
-/* ======================= STATE ======================= */
+/* ================= STATE ================= */
 
-const state = {};   // per-coin state sent to dashboard
-
-/* ======================= UTILS ======================= */
-
+const state = {};
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 const sideFromIndex = i => i % 2 === 0 ? 'short' : 'long';
+
+/* ================= CORE MATH ================= */
 
 function calcROI(pos, price) {
   if (!pos.side || !price) return 0;
@@ -69,29 +67,27 @@ function calcROI(pos, price) {
 }
 
 function calcLiqPrice(pos) {
-  if (!pos.side) return 0;
   const mmr = 0.005;
   return pos.side === 'LONG'
     ? pos.entry * (1 - (1 / LEVERAGE) + mmr)
     : pos.entry * (1 + (1 / LEVERAGE) - mmr);
 }
 
-/* ======================= PRICE ======================= */
+/* ================= PRICE ================= */
 
-async function fetchMarkPrice(symbol) {
+async function fetchPrices(symbol) {
   for (const ex of EXCHANGES) {
     try {
       if (!ex.markets) await ex.loadMarkets();
       if (!ex.symbols.includes(symbol)) continue;
       const t = await ex.fetchTicker(symbol);
-      const p = t.info?.markPrice || t.last;
-      if (p && p > 0) return p;
+      if (t.bid && t.ask) return { bid: t.bid, ask: t.ask };
     } catch {}
   }
-  return 0;
+  return { bid: 0, ask: 0 };
 }
 
-/* ======================= POSITION ======================= */
+/* ================= POSITION ================= */
 
 async function syncPosition(symbol) {
   try {
@@ -108,45 +104,63 @@ async function syncPosition(symbol) {
   }
 }
 
-/* ======================= ORDER ======================= */
+/* ================= ORDER ================= */
 
 async function market(symbol, side, qty, reduceOnly=false) {
-  await phemex.createOrder(
-    symbol,
-    'market',
-    side,
-    qty,
-    undefined,
-    reduceOnly ? { reduceOnly:true } : {}
-  );
-  await sleep(500);
+  try {
+    await phemex.loadMarkets();
+    const minQty = phemex.markets[symbol]?.limits?.amount?.min || 1;
+    const orderQty = Math.max(qty, minQty);
+
+    await phemex.createOrder(
+      symbol,
+      'market',
+      side,
+      orderQty,
+      undefined,
+      reduceOnly ? { reduceOnly: true } : {}
+    );
+
+    console.log(`✅ ORDER SENT: ${side} ${orderQty} ${symbol}`);
+    await sleep(500);
+  } catch (e) {
+    console.error(`⚠️ ORDER FAILED: ${side} ${qty} ${symbol} → ${e.message}`);
+  }
 }
 
-/* ======================= STRATEGY ======================= */
+/* ================= STRATEGY ================= */
 
 async function tradeCoin(coin, index, io) {
   const PRICE_SYMBOL = `${coin}/USDT`;
   const ORDER_SYMBOL = `${coin}/USDT:USDT`;
   const MODE = sideFromIndex(index);
 
-  if (!state[coin]) state[coin] = { coin, mode: MODE };
+  if (!state[coin]) state[coin] = { lastScale:0 };
 
-  const price = await fetchMarkPrice(PRICE_SYMBOL);
-  if (!price) return;
+  const { bid, ask } = await fetchPrices(PRICE_SYMBOL);
+  if (!bid || !ask) return;
 
   const pos = await syncPosition(ORDER_SYMBOL);
-  const roi = calcROI(pos, price);
-  const liq = calcLiqPrice(pos);
+  const execPrice = pos.side === 'LONG' ? bid : ask;
+  const roi = calcROI(pos, execPrice);
+  const liq = pos.side ? calcLiqPrice(pos) : 0;
 
-  /* ===== CLOSE ===== */
-  if (pos.side && roi >= ROI_CLOSE) {
-    await market(ORDER_SYMBOL, pos.side === 'LONG' ? 'sell' : 'buy', pos.qty, true);
+  /* ===== ROI CLOSE (PROFIT ONLY) ===== */
+  if (pos.side && pos.qty > 0 && roi >= ROI_CLOSE) {
+    console.log(`💰 PROFIT ROI ${roi.toFixed(2)}% reached, closing ${ORDER_SYMBOL}`);
+    await market(
+      ORDER_SYMBOL,
+      pos.side === 'LONG' ? 'sell' : 'buy',
+      pos.qty,
+      true
+    );
+    return; // exit after closing
   }
 
-  /* ===== SCALE ===== */
+  /* ===== LIQ DEFENSE (scaling only) ===== */
   if (pos.side && liq) {
-    const d = Math.abs(price - liq) / liq;
-    if (d <= LIQ_DISTANCE && (!state[coin].lastScale || Date.now() - state[coin].lastScale > 60_000)) {
+    const d = Math.abs(execPrice - liq) / liq;
+    if (d <= LIQ_DISTANCE && Date.now() - state[coin].lastScale > SCALE_COOLDOWN) {
       await market(ORDER_SYMBOL, pos.side === 'LONG' ? 'buy' : 'sell', 1);
       state[coin].lastScale = Date.now();
     }
@@ -157,58 +171,52 @@ async function tradeCoin(coin, index, io) {
     await market(ORDER_SYMBOL, MODE === 'long' ? 'buy' : 'sell', 1);
   }
 
-  /* ===== DASHBOARD STATE ===== */
-  state[coin] = {
+  /* ===== DASHBOARD ===== */
+  io.emit('update', {
     coin,
     mode: MODE.toUpperCase(),
-    price,
+    price: execPrice,
     side: pos.side || 'NONE',
     qty: pos.qty || 0,
     entry: pos.entry || 0,
     roi,
     liq,
     updated: new Date().toLocaleTimeString()
-  };
-
-  io.emit('update', state[coin]);
+  });
 }
 
-/* ======================= SERVER ======================= */
+/* ================= SERVER ================= */
 
 const app = express();
 const server = http.createServer(app);
 const io = new Server(server);
-
 app.get('/', (_, res) => res.send(DASHBOARD_HTML));
+server.listen(PORT, () => console.log(`🌐 Dashboard http://localhost:${PORT}`));
 
-server.listen(PORT, () =>
-  console.log(`🌐 Dashboard http://localhost:${PORT}`)
-);
-
-/* ======================= LOOP ======================= */
+/* ================= LOOP ================= */
 
 (async () => {
-  console.log('🤖 Multi-coin bot started');
+  console.log('🤖 BOT STARTED (PROFIT-ONLY ROI CLOSE)');
   while (true) {
     for (let i = 0; i < COINS.length; i++) {
       try {
         await tradeCoin(COINS[i], i, io);
         await sleep(COIN_DELAY);
       } catch (e) {
-        console.error(`⚠️ ${COINS[i]} ${e.message}`);
+        console.error(`⚠️ ${COINS[i]} error → ${e.message}`);
       }
     }
     await sleep(PRICE_RATE);
   }
 })();
 
-/* ======================= DASHBOARD HTML ======================= */
+/* ================= DASHBOARD ================= */
 
 const DASHBOARD_HTML = `
 <!DOCTYPE html>
 <html>
 <head>
-<title>Multi-Coin Phemex Bot</title>
+<title>Phemex Multi-Coin Bot</title>
 <script src="https://cdn.socket.io/4.7.5/socket.io.min.js"></script>
 <style>
 body{background:#0b0e11;color:#eaeaea;font-family:monospace;padding:20px}
@@ -220,35 +228,35 @@ th{background:#181a20}
 </style>
 </head>
 <body>
-<h2>⚡ Multi-Coin Phemex Bot</h2>
-<table id="t">
+<h2>⚡ PROFIT-ONLY ROI Multi-Coin Phemex Bot</h2>
+<table>
 <tr>
 <th>COIN</th><th>MODE</th><th>PRICE</th><th>SIDE</th>
 <th>QTY</th><th>ENTRY</th><th>ROI%</th><th>LIQ</th><th>UPDATED</th>
 </tr>
+<tbody id="t"></tbody>
 </table>
 
 <script>
 const socket = io();
-const table = document.getElementById('t');
+const t = document.getElementById('t');
 const rows = {};
 
 socket.on('update', d => {
   if(!rows[d.coin]){
-    const r = table.insertRow();
-    rows[d.coin] = r;
-    for(let i=0;i<9;i++) r.insertCell();
+    rows[d.coin] = t.insertRow();
+    for(let i=0;i<9;i++) rows[d.coin].insertCell();
   }
   const c = rows[d.coin].cells;
-  c[0].innerText = d.coin;
-  c[1].innerText = d.mode;
-  c[2].innerText = d.price?.toFixed(8);
-  c[3].innerHTML = '<span class="'+d.side+'">'+d.side+'</span>';
-  c[4].innerText = d.qty;
-  c[5].innerText = d.entry?.toFixed(8);
-  c[6].innerText = d.roi?.toFixed(4);
-  c[7].innerText = d.liq?.toFixed(8);
-  c[8].innerText = d.updated;
+  c[0].innerText=d.coin;
+  c[1].innerText=d.mode;
+  c[2].innerText=d.price?.toFixed(8);
+  c[3].innerHTML='<span class="'+d.side+'">'+d.side+'</span>';
+  c[4].innerText=d.qty;
+  c[5].innerText=d.entry?.toFixed(8);
+  c[6].innerText=d.roi?.toFixed(4);
+  c[7].innerText=d.liq?.toFixed(8);
+  c[8].innerText=d.updated;
 });
 </script>
 </body>
