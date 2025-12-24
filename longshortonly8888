@@ -1,0 +1,295 @@
+/******************************************************************************************
+ * ⚡ ADAUSDT PHEMEX BOT — FULL DASHBOARD
+ * - Reverse & open LONG if price ≥ resistance
+ * - Reverse & open SHORT if price ≤ support
+ * - No scaling, no ROI-based closing
+ ******************************************************************************************/
+
+require('dotenv').config();
+const express = require('express');
+const http = require('http');
+const { Server } = require('socket.io');
+const ccxt = require('ccxt');
+const minimist = require('minimist');
+
+// ==================== PARSE ARGV ====================
+const args = minimist(process.argv.slice(2));
+
+const COIN = args.coin?.toUpperCase() || 'ADA';
+const TRADE_QTY = parseFloat(args.quantity) || 0.01;
+const PORT = parseInt(args.port) || 3000;
+
+const CONFIG = {
+    PRICE_SYMBOL: `${COIN}/USDT`,
+    ORDER_SYMBOL: `${COIN}/USDT:USDT`,
+    TRADE_QTY,
+    PRICE_RATE: 2000,
+    LOOKBACK_PERIOD: 50,
+    FREEZE_DURATION: 5000
+};
+
+const state = {
+    positions: { qty: 0, entry: 0, side: null, openSupport: 0, openResistance: 0 },
+    history: [],
+    support: 0,
+    resistance: 0,
+    frozenSupport: 0,
+    frozenResistance: 0,
+    price: 0,
+    bid: 0,
+    ask: 0,
+    realizedPnL: 0,
+    recentOrders: [],
+    freezeTimeout: null,
+    status: 'INIT'
+};
+
+const exchange = new ccxt.phemex({
+    apiKey: process.env.PHEMEX_KEY,
+    secret: process.env.PHEMEX_SECRET,
+    enableRateLimit: true,
+    options: { defaultType: 'swap' }
+});
+
+async function fetchPrice() {
+    const t = await exchange.fetchTicker(CONFIG.PRICE_SYMBOL);
+    state.bid = t.bid;
+    state.ask = t.ask;
+    state.price = (t.bid + t.ask) / 2;
+}
+
+async function syncPositions(io) {
+    let positions = [];
+    try { positions = await exchange.fetchPositions([CONFIG.ORDER_SYMBOL]); }
+    catch { positions = await exchange.fetchPositions(); }
+
+    const pos = positions.find(p => p.symbol === CONFIG.ORDER_SYMBOL) || {};
+    let side = null;
+    let qty = Number(pos.contracts || 0);
+    let entry = Number(pos.entryPrice || 0);
+
+    if (pos.side) {
+        const s = pos.side.toLowerCase();
+        if (s === 'buy' || s === 'long') side = 'LONG';
+        if (s === 'sell' || s === 'short') side = 'SHORT';
+    }
+
+    if (!side || qty <= 0) state.positions = { qty: 0, entry: 0, side: null, openSupport: 0, openResistance: 0 };
+    else {
+        state.positions.side = side;
+        state.positions.qty = qty;
+        state.positions.entry = entry;
+    }
+
+    io.emit('log', `[SYNC] pos=${state.positions.side || 'NONE'} qty=${state.positions.qty}`);
+}
+
+async function placeOrder(side, qty, io) {
+    io.emit('log', `[ORDER] ${side.toUpperCase()} ${qty}`);
+    await exchange.createOrder(CONFIG.ORDER_SYMBOL, 'market', side, qty);
+    await new Promise(r => setTimeout(r, 400));
+    await syncPositions(io);
+}
+
+async function closePosition(io) {
+    const pos = state.positions;
+    if (!pos.side) return;
+    const side = pos.side === 'LONG' ? 'sell' : 'buy';
+    if (pos.side === 'LONG') state.realizedPnL += (state.price - pos.entry) * pos.qty;
+    if (pos.side === 'SHORT') state.realizedPnL += (pos.entry - state.price) * pos.qty;
+    await exchange.createOrder(CONFIG.ORDER_SYMBOL, 'market', side, pos.qty);
+    state.positions = { qty: 0, entry: 0, side: null, openSupport: 0, openResistance: 0 };
+}
+
+function freezeLiveSR(s, r) {
+    if (state.freezeTimeout) clearTimeout(state.freezeTimeout);
+    state.frozenSupport = s;
+    state.frozenResistance = r;
+    state.freezeTimeout = setTimeout(() => {
+        state.frozenSupport = 0;
+        state.frozenResistance = 0;
+    }, CONFIG.FREEZE_DURATION);
+}
+
+function emitStats(io) {
+    const pos = state.positions;
+    let unrealizedPnL = 0;
+    if (pos.side === 'LONG') unrealizedPnL = (state.price - pos.entry) * pos.qty;
+    if (pos.side === 'SHORT') unrealizedPnL = (pos.entry - state.price) * pos.qty;
+
+    io.emit('stats', {
+        price: state.price,
+        bid: state.bid,
+        ask: state.ask,
+        support: state.support,
+        resistance: state.resistance,
+        frozenSupport: state.frozenSupport,
+        frozenResistance: state.frozenResistance,
+        posType: pos.side || 'NONE',
+        qty: pos.qty,
+        entry: pos.entry,
+        status: state.status,
+        realizedPnL: state.realizedPnL,
+        unrealizedPnL,
+        recentOrders: state.recentOrders,
+        entrySupport: pos.openSupport || state.support,
+        entryResistance: pos.openResistance || state.resistance
+    });
+}
+
+async function strategy(io) {
+    await fetchPrice();
+    await syncPositions(io);
+
+    const price = state.price;
+    state.history.push(price);
+    if (state.history.length > 300) state.history.shift();
+
+    const window = state.history.slice(-CONFIG.LOOKBACK_PERIOD);
+    const liveR = Math.max(...window);
+    const liveS = Math.min(...window);
+
+    freezeLiveSR(liveS, liveR);
+
+    const pos = state.positions;
+    io.emit('log', `DEBUG | side=${pos.side} price=${price.toFixed(6)}`);
+
+    // ===== REVERSE LOGIC =====
+    if (price >= liveR) {
+        // Reverse SHORT -> close short & open LONG
+        if (pos.side === 'SHORT') {
+            io.emit('log', `🔄 REVERSE SHORT -> LONG | Price ≥ Resistance`);
+            await closePosition(io);
+            await placeOrder('buy', CONFIG.TRADE_QTY, io);
+            state.status = 'REVERSED LONG';
+        } else if (!pos.side) {
+            await placeOrder('buy', CONFIG.TRADE_QTY, io);
+            state.status = 'OPEN LONG';
+        }
+    } else if (price <= liveS) {
+        // Reverse LONG -> close long & open SHORT
+        if (pos.side === 'LONG') {
+            io.emit('log', `🔄 REVERSE LONG -> SHORT | Price ≤ Support`);
+            await closePosition(io);
+            await placeOrder('sell', CONFIG.TRADE_QTY, io);
+            state.status = 'REVERSED SHORT';
+        } else if (!pos.side) {
+            await placeOrder('sell', CONFIG.TRADE_QTY, io);
+            state.status = 'OPEN SHORT';
+        }
+    } else {
+        state.status = pos.side ? 'HOLDING' : 'RANGING';
+        io.emit('log', `⏸ NO ACTION | Price in-between S/R`);
+    }
+
+    state.support = liveS;
+    state.resistance = liveR;
+    emitStats(io);
+}
+
+async function runBot(io) {
+    while (true) {
+        try { await strategy(io); } 
+        catch (e) { io.emit('log', e.message); }
+        await new Promise(r => setTimeout(r, CONFIG.PRICE_RATE));
+    }
+}
+
+// ============================ SERVER ============================
+const app = express();
+const server = http.createServer(app);
+const io = new Server(server);
+
+app.get('/', (_, res) => res.send(DASHBOARD_HTML));
+
+server.listen(PORT, () => {
+    console.log(`🌐 Dashboard running on http://localhost:${PORT}`);
+    runBot(io);
+});
+
+// ============================ DASHBOARD ============================
+const DASHBOARD_HTML = `
+<html>
+<head>
+<title>${COIN}/USDT Phemex Swap Bot</title>
+<script src="https://cdn.jsdelivr.net/npm/socket.io-client@4/dist/socket.io.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+<style>
+body{background:#0b0e11;color:#eaeaea;font-family:sans-serif;padding:20px}
+.header{display:grid;grid-template-columns:repeat(10,1fr);gap:10px;background:#181a20;padding:15px;border-radius:8px;}
+.stat{text-align:center;background:#2b3139;padding:10px;border-radius:5px}
+.label{font-size:11px;color:#848e9c}
+.val{font-size:15px;font-weight:bold;font-family:monospace}
+.pos-LONG{color:#0ecb81} .pos-SHORT{color:#f6465d}
+#chart-box{height:400px;background:#181a20;margin-top:15px}
+#log-box{height:150px;overflow:auto;background:#000;margin-top:15px;font-family:monospace;font-size:12px}
+</style>
+</head>
+<body>
+<h2>⚡ GENIUS BOT — ${COIN}/USDT</h2>
+<div class="header">
+<div class="stat"><div class="label">PRICE</div><div class="val" id="p">--</div></div>
+<div class="stat"><div class="label">BID</div><div class="val" id="b">--</div></div>
+<div class="stat"><div class="label">ASK</div><div class="val" id="a">--</div></div>
+<div class="stat"><div class="label">POSITION</div><div class="val" id="pos">NONE</div></div>
+<div class="stat"><div class="label">QTY</div><div class="val" id="q">0</div></div>
+<div class="stat"><div class="label">ENTRY</div><div class="val" id="e">0</div></div>
+<div class="stat"><div class="label">UPNL</div><div class="val" id="u">0</div></div>
+<div class="stat"><div class="label">RPNL</div><div class="val" id="r">0</div></div>
+<div class="stat"><div class="label">STATUS</div><div class="val" id="s">--</div></div>
+</div>
+<div id="chart-box"><canvas id="c"></canvas></div>
+<div id="log-box"></div>
+<script>
+const socket = io();
+const logBox = document.getElementById('log-box');
+const ctx = document.getElementById('c');
+const MAX_POINTS = 300;
+const chart = new Chart(ctx,{
+    type:'line',
+    data:{labels:[],datasets:[
+        {label:'Price',data:[],borderColor:'#fcd535',pointRadius:0},
+        {label:'Resistance',data:[],borderColor:'#f6465d',pointRadius:0,stepped:true},
+        {label:'Support',data:[],borderColor:'#0ecb81',pointRadius:0,stepped:true},
+        {label:'Entry Resistance',data:[],borderColor:'rgba(246,70,93,0.5)',borderDash:[2,2],borderWidth:1.5,pointRadius:0,stepped:true},
+        {label:'Entry Support',data:[],borderColor:'rgba(14,203,129,0.5)',borderDash:[2,2],borderWidth:1.5,pointRadius:0,stepped:true}
+    ]},
+    options:{responsive:true,animation:false,scales:{y:{position:'right',grid:{color:'#2b3139'}}}}
+});
+
+socket.on('stats', d=>{
+    p.innerText = d.price?.toFixed(6) ?? '--';
+    b.innerText = d.bid?.toFixed(6) ?? '--';
+    a.innerText = d.ask?.toFixed(6) ?? '--';
+    pos.innerText = d.posType || 'NONE';
+    pos.className = d.posType==='LONG'?'val pos-LONG':d.posType==='SHORT'?'val pos-SHORT':'val';
+    q.innerText = d.qty ?? 0;
+    e.innerText = d.entry?.toFixed(6) ?? 0;
+    s.innerText = d.status || '--';
+    u.innerText = (d.unrealizedPnL ?? 0).toFixed(6);
+    r.innerText = (d.realizedPnL ?? 0).toFixed(6);
+
+    if(chart.data.labels.length >= MAX_POINTS){
+        chart.data.labels.shift();
+        chart.data.datasets.forEach(ds=>ds.data.shift());
+    }
+
+    chart.data.labels.push(new Date().toLocaleTimeString());
+    chart.data.datasets[0].data.push(d.price ?? d.price);
+    chart.data.datasets[1].data.push(d.resistance ?? d.price);
+    chart.data.datasets[2].data.push(d.support ?? d.price);
+    chart.data.datasets[3].data.push(d.entryResistance || d.resistance);
+    chart.data.datasets[4].data.push(d.entrySupport || d.support);
+    chart.update('none');
+});
+
+socket.on('log', m=>{
+    const d = document.createElement('div');
+    d.innerText = new Date().toLocaleTimeString()+' '+m;
+    logBox.prepend(d);
+    if(logBox.children.length>200) logBox.removeChild(logBox.lastChild);
+});
+</script>
+</body>
+</html>
+`;
