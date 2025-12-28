@@ -1,0 +1,289 @@
+// genius-bot.js
+const express = require('express');
+const axios = require('axios');
+const ccxt = require('ccxt');
+require('dotenv').config();
+
+const app = express();
+const PORT = 3000;
+
+// Symbols
+const BINANCE_SYMBOL = 'LUNCUSDT';
+const PHEMEX_SYMBOL = 'LUNC/USDT:USDT';
+
+// Phemex client
+const phemex = new ccxt.phemex({
+  apiKey: process.env.PHEMEX_API_KEY,
+  secret: process.env.PHEMEX_SECRET,
+  enableRateLimit: true,
+});
+
+// Dashboard timeframe
+let dashboardTimeframe = '1m';
+
+// Track last processed closed candle
+let lastClosedCandleTime = 0;
+
+// Store live trade logs
+let tradeLogs = [];
+
+// ---------------- Node.js smoothed Heikin Ashi ----------------
+function heikinAshi(data){
+  const ha = [];
+  data.forEach((c,i)=>{
+    const o = parseFloat(c[1]), h = parseFloat(c[2]), l = parseFloat(c[3]), cl = parseFloat(c[4]);
+    if(i===0){
+      ha.push({o:(o+cl)/2, h:h, l:l, c:(o+h+l+cl)/4});
+    } else {
+      const prev = ha[i-1];
+      const haOpen = prev.o*0.7 + prev.c*0.3;
+      const haClose = ((o+h+l+cl)/4)*0.7 + prev.c*0.3;
+      const haHigh = Math.max(h, haOpen, haClose);
+      const haLow  = Math.min(l, haOpen, haClose);
+      ha.push({o: haOpen, h: haHigh, l: haLow, c: haClose});
+    }
+  });
+  return ha;
+}
+
+// ---------------- SSE endpoint for live logs ----------------
+app.get('/api/logs', (req, res) => {
+  res.set({
+    'Content-Type': 'text/event-stream',
+    'Cache-Control': 'no-cache',
+    'Connection': 'keep-alive',
+  });
+  res.flushHeaders();
+
+  // Send existing logs on connect
+  tradeLogs.forEach(log => res.write(`data: ${JSON.stringify(log)}\n\n`));
+
+  const interval = setInterval(() => {
+    if(tradeLogs.length > 0){
+      tradeLogs.forEach(log => res.write(`data: ${JSON.stringify(log)}\n\n`));
+      tradeLogs = [];
+    }
+  }, 1000);
+
+  req.on('close', () => clearInterval(interval));
+});
+
+// ---------------- Serve dashboard ----------------
+app.get('/', (req, res) => {
+  res.send(`<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>LUNCUSDT HA Dashboard + Bot</title>
+<script src="https://cdn.plot.ly/plotly-latest.min.js"></script>
+<style>
+body { margin:0; font-family:sans-serif; background:#fff; }
+header { padding:1rem; display:flex; justify-content:space-between; align-items:center; background:#f5f5f5; }
+header h1 { margin:0; }
+.selector button { margin-left:0.5rem; padding:0.5rem 1rem; cursor:pointer; }
+.selector button.active { background:#6200ea; color:white; }
+#chart { width:100%; height:60vh; }
+#info { padding:0.5rem; background:#f0f0f0; border-bottom:1px solid #ddd; font-size:0.9rem; }
+#logs { height:30vh; overflow-y:auto; padding:0.5rem; background:#f9f9f9; border-top:1px solid #ddd; font-size:0.9rem; }
+.buy { color:green; }
+.sell { color:red; }
+</style>
+</head>
+<body>
+<header>
+<h1>LUNCUSDT HA Dashboard + Bot</h1>
+<div class="selector">
+<button data-timeframe="1m" class="active">1m</button>
+<button data-timeframe="5m">5m</button>
+<button data-timeframe="15m">15m</button>
+<button data-timeframe="30m">30m</button>
+<button data-timeframe="1h">1h</button>
+<button data-timeframe="4h">4h</button>
+<button data-timeframe="1d">1d</button>
+</div>
+</header>
+<div id="info">Loading position info...</div>
+<div id="chart"></div>
+<div id="logs"></div>
+
+<script>
+let timeframe = '${dashboardTimeframe}';
+const logs = document.getElementById('logs');
+const info = document.getElementById('info');
+
+function heikinAshi(data){
+  const ha = [];
+  data.forEach((c,i)=>{
+    const o=parseFloat(c[1]), h=parseFloat(c[2]), l=parseFloat(c[3]), cl=parseFloat(c[4]);
+    if(i===0){
+      ha.push({o:(o+cl)/2, h:h, l:l, c:(o+h+l+cl)/4});
+    } else {
+      const prev = ha[i-1];
+      const haOpen = prev.o*0.7 + prev.c*0.3;
+      const haClose = ((o+h+l+cl)/4)*0.7 + prev.c*0.3;
+      const haHigh = Math.max(h, haOpen, haClose);
+      const haLow  = Math.min(l, haOpen, haClose);
+      ha.push({o: haOpen, h: haHigh, l: haLow, c: haClose});
+    }
+  });
+  return ha;
+}
+
+async function fetchOHLC(){
+  try{
+    const res = await fetch('/api/ohlc?interval='+timeframe);
+    const data = await res.json();
+    return data.map(c=>[Number(c[0]), Number(c[1]), Number(c[2]), Number(c[3]), Number(c[4])]);
+  }catch(e){ console.error(e); return []; }
+}
+
+async function plotChart(){
+  const raw = await fetchOHLC();
+  if(raw.length===0) return;
+  const ha = heikinAshi(raw);
+  const x = raw.map(c=>new Date(c[0]));
+  const trace = {
+    x,
+    open: ha.map(c=>c.o),
+    high: ha.map(c=>c.h),
+    low: ha.map(c=>c.l),
+    close: ha.map(c=>c.c),
+    type:'candlestick',
+    increasing:{line:{color:'#00b894'}},
+    decreasing:{line:{color:'#d63031'}}
+  };
+  Plotly.newPlot('chart',[trace],{margin:{t:10,b:40}});
+}
+
+async function fetchBotInfo(){
+  try{
+    const res = await fetch('/api/position');
+    const data = await res.json();
+    info.innerHTML = [
+      '<strong>Side:</strong> ' + (data.side || 'None'),
+      '<strong>Contracts:</strong> ' + (data.contracts || 0),
+      '<strong>EntryPrice:</strong> ' + (data.entryPrice ? data.entryPrice.toFixed(6) : '-'),
+      '<strong>MarkPrice:</strong> ' + (data.markPrice ? data.markPrice.toFixed(6) : '-'),
+      '<strong>PNL:</strong> ' + (data.pnl ? data.pnl.toFixed(6) : '-'),
+      '<strong>ROI:</strong> ' + (data.roi ? (data.roi*100).toFixed(2)+'%' : '-')
+    ].join(' &nbsp; | &nbsp; ');
+  }catch(e){ console.error(e); }
+}
+
+document.querySelectorAll('.selector button').forEach(btn=>{
+  btn.addEventListener('click',()=>{
+    document.querySelectorAll('.selector button').forEach(b=>b.classList.remove('active'));
+    btn.classList.add('active');
+    timeframe = btn.dataset.timeframe;
+    plotChart();
+  });
+});
+
+plotChart();
+fetchBotInfo();
+setInterval(plotChart,60000);
+setInterval(fetchBotInfo,10000);
+
+const eventSource = new EventSource('/api/logs');
+eventSource.onmessage = function(event){
+  const data = JSON.parse(event.data);
+  const div = document.createElement('div');
+  div.innerHTML = "<strong>"+data.time+"</strong> - <span class='"+data.action+"'>"+data.action.toUpperCase()+"</span> @ "+data.price.toFixed(6);
+  logs.prepend(div);
+};
+</script>
+</body>
+</html>`);
+});
+
+// ---------------- OHLC API ----------------
+app.get('/api/ohlc', async (req,res)=>{
+  const interval = req.query.interval || dashboardTimeframe;
+  try{
+    const r = await axios.get(`https://api.binance.com/api/v3/klines?symbol=${BINANCE_SYMBOL}&interval=${interval}&limit=200`);
+    res.json(r.data.map(c=>[Number(c[0]), parseFloat(c[1]), parseFloat(c[2]), parseFloat(c[3]), parseFloat(c[4])]));
+  }catch(e){ res.json([]); }
+});
+
+// ---------------- Position API ----------------
+app.get('/api/position', async (req,res)=>{
+  try{
+    const positions = await phemex.fetchPositions([PHEMEX_SYMBOL]);
+    const pos = positions.find(p=>p.symbol===PHEMEX_SYMBOL);
+    if(!pos || Number(pos.contracts) === 0) return res.json({});
+
+    const markPrice = Number(pos.markPrice);
+    const pnl = pos.side.toLowerCase() === 'buy' ? (markPrice - pos.entryPrice)*pos.contracts : (pos.entryPrice - markPrice)*pos.contracts;
+    const roi = pnl / (pos.entryPrice*pos.contracts);
+
+    res.json({
+      side: pos.side,
+      contracts: pos.contracts,
+      entryPrice: pos.entryPrice,
+      markPrice,
+      pnl,
+      roi
+    });
+  }catch(e){ res.json({}); }
+});
+
+// ---------------- Bot logic ----------------
+const EPS = 1e-12;
+const CONTRACTS = 1; // your trade size
+
+function addTradeLog(action, price){
+  const log = {time: new Date().toLocaleTimeString(), action, price};
+  tradeLogs.push(log);
+  console.log(`${action.toUpperCase()} ${CONTRACTS} contract @ ${price}`);
+}
+
+async function botLogic(){
+  try{
+    const r = await axios.get(`https://api.binance.com/api/v3/klines?symbol=${BINANCE_SYMBOL}&interval=${dashboardTimeframe}&limit=200`);
+    const raw = r.data.map(c=>[Number(c[0]), parseFloat(c[1]), parseFloat(c[2]), parseFloat(c[3]), parseFloat(c[4])]);
+    if(raw.length < 2) return;
+
+    const ha = heikinAshi(raw);
+    const lastClosed = ha[ha.length-2];
+    const lastClosedTime = raw[raw.length-2][0];
+    if(lastClosedTime === lastClosedCandleTime) return;
+    lastClosedCandleTime = lastClosedTime;
+
+    const positions = await phemex.fetchPositions([PHEMEX_SYMBOL]);
+    const pos = positions.find(p=>p.symbol===PHEMEX_SYMBOL);
+    let currentSide = null;
+    if(pos && Number(pos.contracts) > 0){
+      currentSide = pos.side.toLowerCase() === 'buy' ? 'Buy' :
+                    pos.side.toLowerCase() === 'sell' ? 'Sell' : null;
+    }
+
+    // Green → Buy
+    if(lastClosed.c > lastClosed.o + EPS){
+      if(currentSide !== 'Buy'){
+        if(currentSide === 'Sell' && Number(pos.contracts) > 0){
+          await phemex.createOrder(PHEMEX_SYMBOL,'market','Buy',Number(pos.contracts),null);
+          addTradeLog('close sell', lastClosed.c);
+        }
+        await phemex.createOrder(PHEMEX_SYMBOL,'market','Buy',CONTRACTS,null);
+        addTradeLog('buy', lastClosed.c);
+      }
+    }
+    // Red → Sell
+    else if(lastClosed.c < lastClosed.o - EPS){
+      if(currentSide !== 'Sell'){
+        if(currentSide === 'Buy' && Number(pos.contracts) > 0){
+          await phemex.createOrder(PHEMEX_SYMBOL,'market','Sell',Number(pos.contracts),null);
+          addTradeLog('close buy', lastClosed.c);
+        }
+        await phemex.createOrder(PHEMEX_SYMBOL,'market','Sell',CONTRACTS,null);
+        addTradeLog('sell', lastClosed.c);
+      }
+    }
+
+  }catch(e){ console.error('Bot error:', e.message); }
+}
+
+setInterval(botLogic,30000);
+
+// ---------------- Start server ----------------
+app.listen(PORT, ()=>console.log(`Server running at http://localhost:${PORT}`));
