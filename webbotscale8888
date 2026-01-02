@@ -1,0 +1,377 @@
+/******************************************************************************************
+ * ⚡ GENIUS BOT — FULL DASHBOARD
+ * AUTO ADJUST QTY TO TARGET ROI + TREND + CORRECT ROI
+ * INSTANT TREND REVERSAL
+ ******************************************************************************************/
+
+require('dotenv').config();
+const express = require('express');
+const http = require('http');
+const { Server } = require('socket.io');
+const ccxt = require('ccxt');
+const minimist = require('minimist');
+
+const args = minimist(process.argv.slice(2));
+const COIN = args.coin?.toUpperCase() || 'ADA';
+const PORT = parseInt(args.port) || 3000;
+
+const CONFIG = {
+    PRICE_SYMBOL: `${COIN}/USDT`,
+    ORDER_SYMBOL: `${COIN}/USDT:USDT`,
+    LOOKBACK_PERIOD: 50,
+    PRICE_RATE: 2000,
+    SCALE_QTY: 1,
+    TARGET_ROI: -2,
+    PARTIAL_CLOSE_ROI: 4,
+    PARTIAL_CLOSE_QTY: 1,
+    MIN_PARTIAL_TOTAL_QTY: 0,
+    MIN_MARGIN: 0
+};
+
+const state = {
+    positions: { qty: 0, entry: 0, side: null },
+    history: [],
+    price: 0,
+    bid: 0,
+    ask: 0,
+    support: 0,
+    resistance: 0,
+    status: 'INIT',
+    scaledSupport: false,
+    scaledResistance: false,
+    roiPercent: 0,
+    availableMargin: 0,
+    lastTradeTime: 0,
+    trend: 'SIDEWAYS',
+    prevTrend: 'SIDEWAYS'
+};
+
+const exchange = new ccxt.phemex({
+    apiKey: process.env.PHEMEX_KEY,
+    secret: process.env.PHEMEX_SECRET,
+    enableRateLimit: true,
+    options: { defaultType: 'swap' }
+});
+
+// ================= PRICE + TREND =================
+async function fetchPrice() {
+    const t = await exchange.fetchTicker(CONFIG.PRICE_SYMBOL);
+
+    state.bid = t.bid;
+    state.ask = t.ask;
+    state.price = (t.bid + t.ask) / 2;
+
+    const pct = Number(t.percentage ?? 0);
+
+    if (pct > 0.2) state.trend = 'UP';
+    else if (pct < -0.2) state.trend = 'DOWN';
+    else state.trend = 'SIDEWAYS';
+}
+
+// ================= MARGIN =================
+async function fetchMargin() {
+    try {
+        const bal = await exchange.fetchBalance();
+        state.availableMargin = bal.free?.USDT ?? 0;
+    } catch {
+        state.availableMargin = 0;
+    }
+}
+
+// ================= POSITION + ROI =================
+async function syncPositions() {
+    const pos = (await exchange.fetchPositions())
+        .find(p => p.symbol === CONFIG.ORDER_SYMBOL) || {};
+
+    const qty = Number(pos.contracts || 0);
+    const entry = Number(pos.entryPrice || 0);
+
+    let side = null;
+    if (pos.side === 'long') side = 'LONG';
+    if (pos.side === 'short') side = 'SHORT';
+
+    if (state.positions.qty > 0 && qty === 0) {
+        state.lastTradeTime = Date.now();
+    }
+
+    if (qty !== state.positions.qty) {
+        state.scaledSupport = false;
+        state.scaledResistance = false;
+    }
+
+    state.positions = qty > 0
+        ? { qty, entry, side }
+        : { qty: 0, entry: 0, side: null };
+
+    // ===== CORRECT ROI =====
+    let roi = 0;
+    if (pos.unrealizedPnl !== undefined && pos.initialMargin) {
+        roi = (Number(pos.unrealizedPnl) / Number(pos.initialMargin)) * 100;
+    } else if (qty > 0 && entry > 0) {
+        const leverage = Number(pos.leverage || 1);
+        const positionMargin = (qty * entry) / leverage;
+
+        if (positionMargin > 0) {
+            if (side === 'LONG') {
+                roi = ((state.bid - entry) * qty / positionMargin) * 100;
+            }
+            if (side === 'SHORT') {
+                roi = ((entry - state.ask) * qty / positionMargin) * 100;
+            }
+        }
+    }
+    state.roiPercent = roi;
+}
+
+// ================= AUTO QTY =================
+function calcAutoQty(pos) {
+    if (!pos.side || pos.qty <= 0) return 0;
+
+    const targetROI = CONFIG.TARGET_ROI;
+    const currentROI = state.roiPercent;
+    if (currentROI >= targetROI) return 0;
+
+    const leverage = 1;
+    const entry = pos.entry;
+    const price = pos.side === 'LONG' ? state.bid : state.ask;
+    const pnlPerUnit = pos.side === 'LONG' ? price - entry : entry - price;
+
+    if (pnlPerUnit === 0) return 0;
+
+    const requiredMarginChange =
+        Math.abs(targetROI - currentROI) / 100 *
+        (pos.qty * entry / leverage);
+
+    let qty = Math.ceil(requiredMarginChange * leverage / entry);
+    qty = Math.min(qty, Math.floor(state.availableMargin / (entry / leverage)));
+
+    return Math.max(qty, 0);
+}
+
+// ================= ORDERS =================
+async function placeOrder(side, qty, io) {
+    if (qty <= 0) return;
+    io.emit('log', `[ORDER] ${side.toUpperCase()} ${qty}`);
+    try {
+        await exchange.createOrder(CONFIG.ORDER_SYMBOL, 'market', side, qty);
+        state.lastTradeTime = Date.now();
+        await syncPositions();
+    } catch (e) {
+        io.emit('log', e.message);
+    }
+}
+
+async function closeAll(io) {
+    const pos = state.positions;
+    if (!pos.side || pos.qty === 0) return;
+
+    const side = pos.side === 'LONG' ? 'sell' : 'buy';
+    io.emit('log', `[CLOSE] Closing ${pos.qty} ${pos.side}`);
+
+    try {
+        await exchange.createOrder(CONFIG.ORDER_SYMBOL, 'market', side, pos.qty);
+        state.lastTradeTime = Date.now();
+        await syncPositions();
+    } catch (e) {
+        io.emit('log', e.message);
+    }
+}
+
+// ================= STRATEGY =================
+async function strategy(io) {
+    await fetchPrice();
+    await fetchMargin();
+    await syncPositions();
+
+    // ===== INSTANT TREND REVERSAL =====
+    if (
+        state.prevTrend !== state.trend &&
+        (state.trend === 'UP' || state.trend === 'DOWN')
+    ) {
+        const pos = state.positions;
+
+        if (state.prevTrend === 'UP' && state.trend === 'DOWN') {
+            if (pos.side === 'LONG') await closeAll(io);
+            await placeOrder('sell', CONFIG.SCALE_QTY, io);
+            state.status = 'TREND FLIP → SHORT';
+        }
+
+        if (state.prevTrend === 'DOWN' && state.trend === 'UP') {
+            if (pos.side === 'SHORT') await closeAll(io);
+            await placeOrder('buy', CONFIG.SCALE_QTY, io);
+            state.status = 'TREND FLIP → LONG';
+        }
+    }
+
+    state.prevTrend = state.trend;
+
+    if (state.availableMargin > 0 && state.availableMargin < CONFIG.MIN_MARGIN) {
+        await closeAll(io);
+        return;
+    }
+
+    const price = state.price;
+    const pos = state.positions;
+
+    state.history.push(price);
+    if (state.history.length > 300) state.history.shift();
+
+    const win = state.history.slice(-CONFIG.LOOKBACK_PERIOD);
+    state.support = Math.min(...win);
+    state.resistance = Math.max(...win);
+
+    // ===== PARTIAL CLOSE (QTY ≥ 15) =====
+    if (
+        state.roiPercent >= CONFIG.PARTIAL_CLOSE_ROI &&
+        pos.qty >= CONFIG.MIN_PARTIAL_TOTAL_QTY &&
+        pos.qty >= CONFIG.PARTIAL_CLOSE_QTY
+    ) {
+        await placeOrder(
+            pos.side === 'LONG' ? 'sell' : 'buy',
+            CONFIG.PARTIAL_CLOSE_QTY,
+            io
+        );
+        state.status = 'PARTIAL CLOSE';
+    }
+
+    if (pos.side) {
+        const qty = calcAutoQty(pos);
+
+        if (pos.side === 'LONG' && price <= state.support && !state.scaledSupport) {
+            await placeOrder('buy', qty, io);
+            state.scaledSupport = true;
+        }
+
+        if (pos.side === 'SHORT' && price >= state.resistance && !state.scaledResistance) {
+            await placeOrder('sell', qty, io);
+            state.scaledResistance = true;
+        }
+    }
+
+    if (price > state.support && price < state.resistance) {
+        state.scaledSupport = false;
+        state.scaledResistance = false;
+    }
+
+    // ===== FIRST TRADE =====
+    if (!pos.side && Date.now() - state.lastTradeTime > 5000) {
+        if (state.trend === 'UP' && price <= state.support) {
+            await placeOrder('buy', CONFIG.SCALE_QTY, io);
+            state.status = 'AUTO LONG';
+        } else if (state.trend === 'DOWN' && price >= state.resistance) {
+            await placeOrder('sell', CONFIG.SCALE_QTY, io);
+            state.status = 'AUTO SHORT';
+        } else {
+            state.status = `WAIT (${state.trend})`;
+        }
+    }
+
+    io.emit('stats', {
+        price,
+        bid: state.bid,
+        ask: state.ask,
+        support: state.support,
+        resistance: state.resistance,
+        posType: pos.side || 'NONE',
+        qty: pos.qty,
+        entry: pos.entry,
+        status: state.status,
+        roiPercent: state.roiPercent,
+        availableMargin: state.availableMargin
+    });
+}
+
+// ================= SERVER =================
+const app = express();
+const server = http.createServer(app);
+const io = new Server(server);
+
+app.get('/', (_, res) => res.send(DASHBOARD_HTML));
+
+server.listen(PORT, () => {
+    console.log(`Dashboard running http://localhost:${PORT}`);
+    setInterval(() => strategy(io), CONFIG.PRICE_RATE);
+});
+
+// ================= ORIGINAL DASHBOARD =================
+const DASHBOARD_HTML = `
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>GENIUS BOT — ${COIN}/USDT</title>
+<script src="https://cdn.jsdelivr.net/npm/socket.io-client@4/dist/socket.io.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+<style>
+:root{--bg:#f5f6fa;--card:#fff;--text:#1f2937;--muted:#6b7280;
+--green:#16a34a;--red:#dc2626;--shadow:0 8px 24px rgba(0,0,0,.08)}
+body{margin:0;background:var(--bg);font-family:Inter,sans-serif;color:var(--text)}
+.container{max-width:1200px;margin:auto;padding:16px}
+.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:12px}
+.card{background:var(--card);border-radius:14px;padding:12px;box-shadow:var(--shadow);text-align:center}
+.label{font-size:11px;color:var(--muted)}
+.value{font-family:monospace;font-size:14px;font-weight:600}
+.pos-LONG{color:var(--green)}.pos-SHORT{color:var(--red)}
+#chartWrap,#log{background:#fff;border-radius:14px;padding:10px;margin-top:16px;box-shadow:var(--shadow)}
+#log{background:#111827;color:#e5e7eb;font-size:12px;height:160px;overflow:auto}
+</style>
+</head>
+<body>
+<div class="container">
+<h1>GENIUS BOT — ${COIN}/USDT</h1>
+<div class="grid">
+<div class="card"><div class="label">PRICE</div><div class="value" id="p"></div></div>
+<div class="card"><div class="label">POSITION</div><div class="value" id="pos"></div></div>
+<div class="card"><div class="label">QTY</div><div class="value" id="q"></div></div>
+<div class="card"><div class="label">ENTRY</div><div class="value" id="e"></div></div>
+<div class="card"><div class="label">SUPPORT</div><div class="value" id="s"></div></div>
+<div class="card"><div class="label">RESISTANCE</div><div class="value" id="r"></div></div>
+<div class="card"><div class="label">ROI %</div><div class="value" id="roi"></div></div>
+<div class="card"><div class="label">AVAILABLE MARGIN</div><div class="value" id="m"></div></div>
+<div class="card"><div class="label">STATUS</div><div class="value" id="st"></div></div>
+</div>
+<div id="chartWrap"><canvas id="chart"></canvas></div>
+<div id="log"></div>
+</div>
+<script>
+const socket=io(),log=document.getElementById('log');
+const chart=new Chart(document.getElementById('chart'),{
+type:'line',
+data:{labels:[],datasets:[
+{label:'Price',data:[],borderColor:'#2563eb',pointRadius:0},
+{label:'Resistance',data:[],borderColor:'#dc2626',pointRadius:0,stepped:true},
+{label:'Support',data:[],borderColor:'#16a34a',pointRadius:0,stepped:true}
+]},options:{animation:false}
+});
+socket.on('stats',d=>{
+p.innerText=d.price?.toFixed(6);
+pos.innerText=d.posType;
+pos.className='value '+(d.posType==='LONG'?'pos-LONG':d.posType==='SHORT'?'pos-SHORT':'');
+q.innerText=d.qty;
+e.innerText=d.entry?.toFixed(6);
+s.innerText=d.support?.toFixed(6);
+r.innerText=d.resistance?.toFixed(6);
+roi.innerText=d.roiPercent?.toFixed(2)+'%';
+roi.className='value '+(d.roiPercent>=0?'pos-LONG':'pos-SHORT');
+m.innerText=d.availableMargin?.toFixed(6);
+st.innerText=d.status;
+chart.data.labels.push(new Date().toLocaleTimeString());
+chart.data.datasets[0].data.push(d.price);
+chart.data.datasets[1].data.push(d.resistance);
+chart.data.datasets[2].data.push(d.support);
+if(chart.data.labels.length>200){
+ chart.data.labels.shift();
+ chart.data.datasets.forEach(x=>x.data.shift());
+}
+chart.update('none');
+});
+socket.on('log',m=>{
+const d=document.createElement('div');
+d.textContent=new Date().toLocaleTimeString()+' '+m;
+log.prepend(d);
+});
+</script>
+</body>
+</html>
+`;
