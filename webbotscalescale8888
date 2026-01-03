@@ -1,0 +1,471 @@
+/******************************************************************************************
+ * ⚡ GENIUS BOT — FULL DASHBOARD
+ * AUTO ADJUST QTY TO TARGET ROI + TREND + CORRECT ROI
+ * SAFE SCALING QUANTITY (max % of total equity per trade, divided by 10)
+ * PARTIAL CLOSE TRIGGERS EVERY TICK (won't close on bot start)
+ * INSTANT TREND FLIP
+ * LEVERAGE = 50x
+ * + MONEY-ONLY ANALYTICS (USDT)
+ * + FETCH PRICE TIMEOUT HANDLING + RETRIES
+ * + ORIGINAL ROI % RESTORED
+ * + EXCHANGE-LIKE ROI % FOR DISPLAY
+ ******************************************************************************************/
+
+require('dotenv').config();
+const express = require('express');
+const http = require('http');
+const { Server } = require('socket.io');
+const ccxt = require('ccxt');
+const minimist = require('minimist');
+
+const args = minimist(process.argv.slice(2));
+const COIN = args.coin?.toUpperCase() || 'ADA';
+const PORT = parseInt(args.port) || 3000;
+
+/* ================= CONFIG ================= */
+const CONFIG = {
+    PRICE_SYMBOL: `${COIN}/USDT`,
+    ORDER_SYMBOL: `${COIN}/USDT:USDT`,
+    LOOKBACK_PERIOD: 50,
+    PRICE_RATE: 2000,
+    LEVERAGE: 50,
+    TARGET_ROI: -2,
+    PARTIAL_CLOSE_ROI: 10,
+    MIN_PARTIAL_TOTAL_QTY: 1,
+    MAX_TRADE_PERCENT: 0.05,
+    SCALE_QTY: 1,
+    PARTIAL_CLOSE_QTY: 1,
+    FETCH_RETRIES: 3
+};
+
+/* ================= STATE ================= */
+const state = {
+    positions: { qty: 0, entry: 0, side: null },
+    history: [],
+    price: 0,
+    bid: 0,
+    ask: 0,
+    support: 0,
+    resistance: 0,
+    status: 'INIT',
+    scaledSupport: false,
+    scaledResistance: false,
+    roiPercent: 0,
+    exchangeRoiPercent: 0,
+    availableMargin: 0,
+    totalEquity: 0,
+    lastTradeTime: 0,
+    trend: 'SIDEWAYS',
+    prevTrend: 'SIDEWAYS',
+    initialized: false,
+
+    // Money analytics
+    realizedProfitUSDT: 0,
+    equityCurve: [],
+    drawdownCurve: [],
+    equityHighUSDT: 0,
+    maxDrawdownUSDT: 0,
+    longProfitUSDT: 0,
+    shortProfitUSDT: 0,
+    firstTradeTime: null,
+    tradeCount: 0
+};
+
+/* ================= EXCHANGE ================= */
+const exchange = new ccxt.phemex({
+    apiKey: process.env.PHEMEX_KEY,
+    secret: process.env.PHEMEX_SECRET,
+    enableRateLimit: true,
+    timeout: 30000,
+    options: { defaultType: 'swap' }
+});
+
+/* ================= LEVERAGE ================= */
+async function setLeverage() {
+    try {
+        await exchange.setLeverage(CONFIG.LEVERAGE, CONFIG.ORDER_SYMBOL);
+        console.log(`[LEVERAGE] ${CONFIG.LEVERAGE}x`);
+    } catch (e) {
+        console.error('[LEVERAGE ERROR]', e.message);
+    }
+}
+
+/* ================= PRICE + TREND ================= */
+async function fetchPrice(retries = CONFIG.FETCH_RETRIES) {
+    try {
+        const t = await exchange.fetchTicker(CONFIG.PRICE_SYMBOL);
+        state.bid = t.bid;
+        state.ask = t.ask;
+        state.price = (t.bid + t.ask) / 2;
+        state.change24h = Number(t.percentage ?? 0);
+
+        if (state.change24h > 0) state.trend = 'UP';
+        else if (state.change24h < 0) state.trend = 'DOWN';
+        else state.trend = 'SIDEWAYS';
+    } catch (e) {
+        if (retries > 0) {
+            console.warn('[FETCH PRICE RETRY] remaining:', retries, e.message);
+            await new Promise(r => setTimeout(r, 1000));
+            return fetchPrice(retries - 1);
+        } else {
+            console.error('[FETCH PRICE ERROR]', e.message);
+            state.bid = state.ask = state.price = 0;
+            state.change24h = 0;
+            state.trend = 'SIDEWAYS';
+        }
+    }
+}
+
+/* ================= MARGIN ================= */
+async function fetchMargin() {
+    try {
+        const bal = await exchange.fetchBalance();
+        state.availableMargin = Number(bal.free?.USDT ?? 0);
+        state.totalEquity = Number(bal.total?.USDT ?? 0);
+
+        const maxQty = Math.floor((state.totalEquity * CONFIG.MAX_TRADE_PERCENT * CONFIG.LEVERAGE) / state.price);
+        CONFIG.SCALE_QTY = Math.max(1, Math.floor(maxQty / 10));
+        CONFIG.PARTIAL_CLOSE_QTY = Math.max(1, Math.floor(CONFIG.SCALE_QTY / 2));
+    } catch {
+        state.availableMargin = 0;
+        state.totalEquity = 0;
+        CONFIG.SCALE_QTY = 1;
+        CONFIG.PARTIAL_CLOSE_QTY = 1;
+    }
+}
+
+/* ================= POSITION + ROI ================= */
+async function syncPositions() {
+    const pos = (await exchange.fetchPositions())
+        .find(p => p.symbol === CONFIG.ORDER_SYMBOL) || {};
+
+    const qty = Number(pos.contracts || 0);
+    const entry = Number(pos.entryPrice || 0);
+
+    let side = null;
+    if (pos.side === 'long') side = 'LONG';
+    if (pos.side === 'short') side = 'SHORT';
+
+    if (qty !== state.positions.qty) {
+        state.scaledSupport = false;
+        state.scaledResistance = false;
+    }
+
+    state.positions = qty > 0 ? { qty, entry, side } : { qty: 0, entry: 0, side: null };
+
+    let roi = 0;
+    let exchangeRoi = 0;
+
+    if (pos.unrealizedPnl !== undefined && pos.initialMargin) {
+        roi = (Number(pos.unrealizedPnl) / Number(pos.initialMargin)) * 100;
+        exchangeRoi = roi;
+    } else if (qty > 0 && entry > 0) {
+        const leverage = CONFIG.LEVERAGE;
+        const margin = (qty * entry) / leverage;
+        if (margin > 0) {
+            roi = side === 'LONG'
+                ? ((state.bid - entry) * qty / margin) * 100
+                : ((entry - state.ask) * qty / margin) * 100;
+            exchangeRoi = roi;
+        }
+    }
+
+    state.roiPercent = roi;
+    state.exchangeRoiPercent = exchangeRoi;
+}
+
+/* ================= MONEY ANALYTICS ================= */
+function updateMoneyAnalytics(profit, side) {
+    if (!state.firstTradeTime) state.firstTradeTime = Date.now();
+    state.tradeCount++;
+    state.realizedProfitUSDT += profit;
+
+    if (profit > 0) {
+        if (side === 'LONG') state.longProfitUSDT += profit;
+        if (side === 'SHORT') state.shortProfitUSDT += profit;
+    }
+
+    state.equityCurve.push(state.totalEquity);
+    if (state.equityCurve.length > 300) state.equityCurve.shift();
+
+    if (state.equityHighUSDT === 0) state.equityHighUSDT = state.totalEquity;
+    if (state.totalEquity > state.equityHighUSDT)
+        state.equityHighUSDT = state.totalEquity;
+
+    const dd = state.equityHighUSDT - state.totalEquity;
+    if (dd > state.maxDrawdownUSDT) state.maxDrawdownUSDT = dd;
+
+    state.drawdownCurve.push(dd);
+    if (state.drawdownCurve.length > 300) state.drawdownCurve.shift();
+}
+
+function profitPerHourUSDT() {
+    if (!state.firstTradeTime) return 0;
+    const h = (Date.now() - state.firstTradeTime) / 3600000;
+    return h > 0 ? state.realizedProfitUSDT / h : 0;
+}
+function profitPerDayUSDT() { return profitPerHourUSDT() * 24; }
+
+/* ================= SAFE AUTO SCALE QTY ================= */
+function calcSafeQty(pos) {
+    if (!pos.side) return CONFIG.SCALE_QTY;
+
+    const price = pos.side === 'LONG' ? state.bid : state.ask;
+    const pnlPerUnit = pos.side === 'LONG' ? price - pos.entry : pos.entry - price;
+    if (pnlPerUnit === 0) return 0;
+
+    const leverage = CONFIG.LEVERAGE;
+    const positionMargin = (pos.qty * pos.entry) / leverage;
+    const requiredPnl = ((CONFIG.TARGET_ROI - state.roiPercent) / 100) * positionMargin;
+
+    let qty = Math.ceil(Math.abs(requiredPnl / pnlPerUnit));
+
+    const costPerUnit = price / leverage;
+    const maxByMargin = Math.floor(state.availableMargin / costPerUnit);
+    qty = Math.min(qty, maxByMargin);
+
+    qty = Math.min(qty, CONFIG.SCALE_QTY);
+    if (qty < 1) qty = 1;
+    return qty;
+}
+
+/* ================= ORDERS ================= */
+async function placeOrder(side, qty, io) {
+    if (qty <= 0) return;
+    io.emit('log', `[ORDER] ${side.toUpperCase()} ${qty}`);
+
+    const equityBefore = state.totalEquity;
+
+    try {
+        await exchange.createOrder(CONFIG.ORDER_SYMBOL, 'market', side, qty);
+        state.lastTradeTime = Date.now();
+        await syncPositions();
+        await fetchMargin();
+
+        const profit = state.totalEquity - equityBefore;
+        if (profit !== 0) updateMoneyAnalytics(profit, side === 'buy' ? 'LONG' : 'SHORT');
+    } catch (e) {
+        io.emit('log', `[ERROR] ${e.message}`);
+    }
+}
+
+async function closeAll(io) {
+    const pos = state.positions;
+    if (!pos.side || pos.qty === 0) return;
+
+    const side = pos.side === 'LONG' ? 'sell' : 'buy';
+    io.emit('log', `[CLOSE] ${pos.qty} ${pos.side}`);
+    await exchange.createOrder(CONFIG.ORDER_SYMBOL, 'market', side, pos.qty);
+    await new Promise(r => setTimeout(r, 500));
+    await syncPositions();
+}
+
+/* ================= STRATEGY ================= */
+async function strategy(io) {
+    await fetchPrice();
+    await fetchMargin();
+    await syncPositions();
+
+    const price = state.price;
+    const pos = state.positions;
+
+    // TREND FLIP
+    if (state.prevTrend !== state.trend && ['UP','DOWN'].includes(state.trend)) {
+        io.emit('log', `[TREND] ${state.prevTrend} → ${state.trend}`);
+        if (pos.side) await closeAll(io);
+        await placeOrder(state.trend === 'UP' ? 'buy' : 'sell', CONFIG.SCALE_QTY, io);
+        state.status = `TREND FLIP → ${state.trend}`;
+    }
+    state.prevTrend = state.trend;
+
+    state.history.push(price);
+    if (state.history.length > 300) state.history.shift();
+    const win = state.history.slice(-CONFIG.LOOKBACK_PERIOD);
+    state.support = Math.min(...win);
+    state.resistance = Math.max(...win);
+
+    // PARTIAL CLOSE
+    if (
+        state.initialized &&
+        pos.side &&
+        pos.qty >= CONFIG.MIN_PARTIAL_TOTAL_QTY &&
+        state.roiPercent >= CONFIG.PARTIAL_CLOSE_ROI
+    ) {
+        let partialQty = CONFIG.PARTIAL_CLOSE_QTY;
+        if (pos.qty < partialQty) partialQty = 1;
+        if (pos.qty >= 1) {
+            await placeOrder(pos.side === 'LONG' ? 'sell' : 'buy', partialQty, io);
+            state.status = 'PARTIAL CLOSE';
+            io.emit('log', `[PARTIAL CLOSE] ${partialQty} ${pos.side} at ROI ${state.roiPercent.toFixed(2)}%`);
+        }
+    }
+
+    // SCALING
+    const addQty = calcSafeQty(pos);
+    if (pos.side === 'LONG' && price <= state.support && !state.scaledSupport && addQty > 0) {
+        await placeOrder('buy', addQty, io);
+        state.scaledSupport = true;
+        io.emit('log', `[SCALE BUY] Added ${addQty}`);
+    }
+    if (pos.side === 'SHORT' && price >= state.resistance && !state.scaledResistance && addQty > 0) {
+        await placeOrder('sell', addQty, io);
+        state.scaledResistance = true;
+        io.emit('log', `[SCALE SELL] Added ${addQty}`);
+    }
+    if (price > state.support && price < state.resistance) {
+        state.scaledSupport = false;
+        state.scaledResistance = false;
+    }
+
+    // FIRST TRADE
+    if (!pos.side && Date.now() - state.lastTradeTime > 10000) {
+        if (state.trend === 'UP' && price <= state.support)
+            await placeOrder('buy', CONFIG.SCALE_QTY, io);
+        if (state.trend === 'DOWN' && price >= state.resistance)
+            await placeOrder('sell', CONFIG.SCALE_QTY, io);
+    }
+
+    // EMIT STATS
+    io.emit('stats', {
+        price,
+        bid: state.bid,
+        ask: state.ask,
+        support: state.support,
+        resistance: state.resistance,
+        posType: pos.side || 'NONE',
+        qty: pos.qty,
+        entry: pos.entry,
+        status: state.status,
+        roiPercent: state.roiPercent,
+        exchangeRoiPercent: state.exchangeRoiPercent,
+        availableMargin: state.availableMargin,
+        totalEquity: state.totalEquity,
+        scaleQty: CONFIG.SCALE_QTY,
+        partialCloseQty: CONFIG.PARTIAL_CLOSE_QTY,
+        change24h: state.change24h,
+
+        realizedProfitUSDT: state.realizedProfitUSDT,
+        profitPerDayUSDT: profitPerDayUSDT(),
+        maxDrawdownUSDT: state.maxDrawdownUSDT
+    });
+
+    if (!state.initialized) state.initialized = true;
+}
+
+/* ================= SERVER ================= */
+const app = express();
+const server = http.createServer(app);
+const io = new Server(server);
+
+app.get('/', (_, res) => res.send(DASHBOARD_HTML));
+
+server.listen(PORT, async () => {
+    console.log(`Dashboard running http://localhost:${PORT}`);
+    await setLeverage();
+    setInterval(() => strategy(io), CONFIG.PRICE_RATE);
+});
+
+/* ================= DASHBOARD ================= */
+const DASHBOARD_HTML = `<!DOCTYPE html>
+<html>
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>GENIUS BOT — ${COIN}/USDT</title>
+<script src="https://cdn.jsdelivr.net/npm/socket.io-client@4/dist/socket.io.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+<style>
+:root{--bg:#f5f6fa;--card:#fff;--text:#1f2937;--muted:#6b7280;
+--green:#16a34a;--red:#dc2626;--shadow:0 8px 24px rgba(0,0,0,.08)}
+body{margin:0;background:var(--bg);font-family:Inter,sans-serif;color:var(--text)}
+.container{max-width:1200px;margin:auto;padding:16px}
+.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:12px}
+.card{background:var(--card);border-radius:14px;padding:12px;box-shadow:var(--shadow);text-align:center}
+.label{font-size:11px;color:var(--muted)}
+.value{font-family:monospace;font-size:14px;font-weight:600}
+.pos-LONG{color:var(--green)}.pos-SHORT{color:var(--red)}
+#chartWrap,#log{background:#fff;border-radius:14px;padding:10px;margin-top:16px;box-shadow:var(--shadow)}
+#log{background:#111827;color:#e5e7eb;font-size:12px;height:160px;overflow:auto}
+</style>
+</head>
+<body>
+<div class="container">
+<h1>GENIUS BOT — ${COIN}/USDT</h1>
+<div class="grid">
+<div class="card"><div class="label">PRICE</div><div class="value" id="p"></div></div>
+<div class="card"><div class="label">POSITION</div><div class="value" id="pos"></div></div>
+<div class="card"><div class="label">QTY</div><div class="value" id="q"></div></div>
+<div class="card"><div class="label">ENTRY</div><div class="value" id="e"></div></div>
+<div class="card"><div class="label">SUPPORT</div><div class="value" id="s"></div></div>
+<div class="card"><div class="label">RESISTANCE</div><div class="value" id="r"></div></div>
+<div class="card"><div class="label">ROI %</div><div class="value" id="roi"></div></div>
+<div class="card"><div class="label">EXCHANGE ROI %</div><div class="value" id="exroi"></div></div>
+<div class="card"><div class="label">24H CHANGE</div><div class="value" id="c24"></div></div>
+<div class="card"><div class="label">FREE MARGIN</div><div class="value" id="m"></div></div>
+<div class="card"><div class="label">TOTAL EQUITY</div><div class="value" id="eq"></div></div>
+<div class="card"><div class="label">SCALE QTY</div><div class="value" id="sq"></div></div>
+<div class="card"><div class="label">PARTIAL CLOSE QTY</div><div class="value" id="pcq"></div></div>
+<div class="card"><div class="label">STATUS</div><div class="value" id="st"></div></div>
+<div class="card"><div class="label">REALIZED PROFIT USDT</div><div class="value" id="up"></div></div>
+<div class="card"><div class="label">PROFIT/DAY USDT</div><div class="value" id="upd"></div></div>
+<div class="card"><div class="label">MAX DRAWDOWN USDT</div><div class="value" id="dd"></div></div>
+</div>
+
+<div id="chartWrap"><canvas id="chart"></canvas></div>
+<div id="log"></div>
+</div>
+
+<script>
+const socket=io(),log=document.getElementById('log');
+const chart=new Chart(document.getElementById('chart'),{
+type:'line',
+data:{labels:[],datasets:[
+{label:'Price',data:[],borderColor:'#2563eb',pointRadius:0},
+{label:'Resistance',data:[],borderColor:'#dc2626',pointRadius:0,stepped:true},
+{label:'Support',data:[],borderColor:'#16a34a',pointRadius:0,stepped:true}
+]},options:{animation:false}
+});
+
+socket.on('stats',d=>{
+p.innerText=d.price?.toFixed(6);
+pos.innerText=d.posType;
+pos.className='value '+(d.posType==='LONG'?'pos-LONG':d.posType==='SHORT'?'pos-SHORT':'');
+q.innerText=d.qty;
+e.innerText=d.entry?.toFixed(6);
+s.innerText=d.support?.toFixed(6);
+r.innerText=d.resistance?.toFixed(6);
+roi.innerText=d.roiPercent?.toFixed(2)+'%';
+roi.className='value '+(d.roiPercent>=0?'pos-LONG':'pos-SHORT');
+exroi.innerText=d.exchangeRoiPercent?.toFixed(2)+'%';
+exroi.className='value '+(d.exchangeRoiPercent>=0?'pos-LONG':'pos-SHORT');
+c24.innerText=d.change24h?.toFixed(2)+'%';
+c24.className='value '+(d.change24h>=0?'pos-LONG':'pos-SHORT');
+m.innerText=d.availableMargin?.toFixed(2);
+eq.innerText=d.totalEquity?.toFixed(2);
+sq.innerText=d.scaleQty;
+pcq.innerText=d.partialCloseQty;
+st.innerText=d.status;
+
+up.innerText=d.realizedProfitUSDT?.toFixed(2);
+upd.innerText=d.profitPerDayUSDT?.toFixed(2);
+dd.innerText=d.maxDrawdownUSDT?.toFixed(2);
+
+chart.data.labels.push(new Date().toLocaleTimeString());
+chart.data.datasets[0].data.push(d.price);
+chart.data.datasets[1].data.push(d.resistance);
+chart.data.datasets[2].data.push(d.support);
+if(chart.data.labels.length>200){
+ chart.data.labels.shift();
+ chart.data.datasets.forEach(x=>x.data.shift());
+}
+chart.update('none');
+});
+
+socket.on('log',m=>{
+const d=document.createElement('div');
+d.textContent=new Date().toLocaleTimeString()+' '+m;
+log.prepend(d);
+});
+</script>
+</body>
+</html>`;
